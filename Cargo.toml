@@ -1,0 +1,18 @@
+[package]
+name = "warframe-damage-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[[bin]]
+name = "warframe-damage-engine"
+path = "engine.rs"
+
+[dependencies]
+wfsim-webapi = { path = ".build/wfsim/webapi" }
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
+
+[profile.release]
+codegen-units = 1
