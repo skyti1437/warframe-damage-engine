@@ -1,0 +1,165 @@
+"""Request-local search accounting; never shared across combat contexts."""
+from collections import OrderedDict
+from contextvars import ContextVar
+from functools import wraps
+import hashlib
+import math
+import os
+import pickle
+import time
+from dataclasses import replace
+from collections.abc import Mapping
+
+SESSION = ContextVar('riven_search_session', default=None)
+# A live request (the build page re-solves on every edit) that a newer one
+# from the same page has replaced: the HTTP layer sets this predicate, and the
+# search stops at its next heartbeat instead of finishing for nobody.
+CANCEL = ContextVar('search_cancel', default=None)
+
+
+class SearchCancelled(BaseException):
+    """A newer request superseded this one.
+
+    A BaseException, like asyncio's CancelledError, so the engine's
+    ``except Exception`` fallbacks cannot swallow it and carry on.
+    """
+
+
+def check_cancelled():
+    cancelled = CANCEL.get()
+    if cancelled is not None and cancelled():
+        raise SearchCancelled()
+
+
+# A long search (the riven analysis) that lets waiting build-page requests use
+# the engine between two evaluations: the HTTP layer sets the hook, which
+# hands the engine over and takes it back.
+YIELD = ContextVar('search_yield', default=None)
+
+
+def session_request(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        request = args[1] if len(args) > 1 else kwargs['request']
+        if not isinstance(request, Mapping):
+            return fn(*args, **kwargs)  # Preserve the engine's input error.
+        if request.get('_bakeStaticsOnly'):
+            # A bake has no interactive budget (its statics must not depend on
+            # the machine's load) but shares the request's search memo.
+            token = SESSION.set(dict(start=time.monotonic(), deadline=float('inf'), phaseSeconds=float('inf'),
+                                     stage='baseline', hook=None, evaluations=0, memoHits=0, memo=OrderedDict(),
+                                     searches=OrderedDict(), limited=0, lastBeat=0.))
+            try:
+                result = fn(*args, **kwargs)
+                state = SESSION.get()
+                result['searchWork'] = {key: state[key] for key in ('evaluations', 'memoHits', 'limited')}
+                result['searchWork']['negative'] = dict(state.get('negativeWork') or {})
+                result['searchWork']['elapsedSeconds'] = time.monotonic() - state['start']
+                return result
+            finally:
+                SESSION.reset(token)
+        profile = str(request.get('profile') or 'standard').strip().casefold()
+        budget = {'fast':45., 'standard':90., 'deep':240., 'ultra':35.}.get(profile,90.)
+        remaining = request.get('_searchBudgetSeconds')
+        if remaining is not None:
+            if (isinstance(remaining, bool) or not isinstance(remaining, (int, float))
+                    or not math.isfinite(remaining) or remaining <= 0.):
+                raise ValueError('_searchBudgetSeconds must be a finite positive number')
+            budget = min(budget, remaining)
+        start = time.monotonic()
+        state = dict(start=start, deadline=start + budget,
+                     phaseSeconds={'fast':8.,'standard':15.,'deep':45.,'ultra':5.}.get(profile,15.),
+                     stage='baseline', hook=kwargs.get('progress_hook'), evaluations=0,
+                     memoHits=0, memo=OrderedDict(), searches=OrderedDict(), limited=0,
+                     lastBeat=0.)
+        token = SESSION.set(state)
+        try:
+            result = fn(*args, **kwargs)
+            result['searchWork'] = {key: state[key] for key in ('evaluations','memoHits','limited')}
+            result['searchWork']['negative'] = dict(state.get('negativeWork') or {})
+            result['searchWork'].update(elapsedSeconds=time.monotonic()-state['start'],
+                budgetSeconds=state['deadline']-state['start'],
+                status='heuristic-budget-limited' if state['limited'] else 'heuristic-best-found')
+            result['searchStatus']['work'] = result['searchWork']
+            if state['limited']:
+                result['searchStatus']['status'] = 'heuristic-budget-limited'
+                result['skipped'].append('搜索达到交互预算，返回已找到的合法配装；未证明全局最优')
+            return result
+        finally:
+            SESSION.reset(token)
+    return run
+
+
+def heartbeat(count=0):
+    check_cancelled()
+    hand_over = YIELD.get()
+    if hand_over is not None:
+        hand_over()
+    state = SESSION.get()
+    if state is None:
+        return
+    state['evaluations'] += count
+    now = time.monotonic()
+    if state['hook'] and now - state['lastBeat'] > 1.:
+        state['lastBeat'] = now
+        try:
+            state['hook'](f"{state['stage']}|{state['evaluations']}")
+        except Exception:
+            pass  # Progress reporting is never part of numerical evaluation.
+
+
+_MISSING = object()
+
+
+def memoized_search(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        state = SESSION.get()
+        if state is None:
+            return fn(*args, **kwargs)
+        wire_kwargs = dict(kwargs)
+        scenario = wire_kwargs.get('scenario')
+        if scenario is not None:
+            wire_kwargs['scenario'] = replace(scenario, conditional_stacks=dict(scenario.conditional_stacks))
+        try:
+            key = hashlib.sha256(pickle.dumps((args, wire_kwargs), protocol=5)).digest()
+        except (TypeError, pickle.PicklingError):
+            return fn(*args, **kwargs)
+        memo = state['searches']
+        hit = memo.get(key, _MISSING)
+        if hit is not _MISSING:
+            state['memoHits'] += 1
+            return hit
+        result = fn(*args, **kwargs)
+        memo[key] = result
+        while len(memo) > 256:
+            try:
+                memo.popitem(last=False)
+            except KeyError:
+                break
+        return result
+    return run
+
+
+# Benchmarks and exact-output comparisons turn the interactive budget off: with
+# it, how far a search gets depends on the machine's speed and load.
+UNBOUNDED = os.environ.get('WF_SEARCH_NO_DEADLINE') == '1'
+
+
+def phase_deadline(phase_seconds=None):
+    state = SESSION.get()
+    if UNBOUNDED:
+        return float('inf')
+    if state is None:
+        return float('inf')
+    allowance = state['phaseSeconds'] if phase_seconds is None else phase_seconds
+    return min(state['deadline'], time.monotonic() + allowance)
+
+
+def expired(deadline):
+    if UNBOUNDED or time.monotonic() < deadline:
+        return False
+    state = SESSION.get()
+    if state is not None:
+        state['limited'] += 1
+    return True

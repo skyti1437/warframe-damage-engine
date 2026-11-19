@@ -1,34 +1,17 @@
-# Warframe Damage Engine
+# SDJKBOT 完整伤害模拟引擎
 
-面向同机插件的 Warframe 配装面板与战斗模拟服务。计算核心基于 [WFSim](https://github.com/magenie33/wfsim)，固定上游源码与数据版本，记录本项目对游戏机制的修订。
+AstrBot 插件的本机完整伤害模拟服务，提供固定配装复算、紫卡评级和配卡搜索。当前程序版本为 `portable-85ec9cdb3461c01c`，数据标记为 `2026.08.13.13.24`。
 
-## 构建和运行
+## 安装
 
-使用 Git、Bash、Rust 1.97 或更新版本，以及 Python 3.10 或更新版本。`UPSTREAM` 依次记录上游提交和对应的 Git 树。构建时在 `.build/wfsim` 取出锁定源码，应用 `violet-hcet.patch`，再按 `Cargo.lock` 编译。
+在插件运维面板的「伤害引擎」页选择「完整模拟」，填写空闲的本机端口（例如 8765）并保存，再点「下载并部署」。安装器按宿主平台选择包，校验程序包及 45 个数据文件，启动后核对引擎指纹。支持 CPython 3.12 的 Linux x86_64 和 macOS arm64。
 
-```sh
-bash build.sh
-python3 server.py
-```
+程序包与 SHA-256 见 [release.json](release.json)。维护者可以用 [BUILD.md](BUILD.md) 从此版本的 Python 和 Rust 源码构建。插件的内置估算模式使用插件本地资料。
 
-服务监听 `127.0.0.1:8788`，可用 `--port` 调整端口。设置 `WARFRAME_ENGINE_TOKEN` 后，计算请求需提供相同的 Bearer 令牌。`GET /healthz` 返回引擎版本、数据修订和源码地址。
+## 数据与许可证
 
-`POST /api/panel` 计算军械库面板，`POST /api/simulate` 执行战斗模拟。`POST /api/riven` 提供紫卡数值计算，`POST /api/candidates` 读取合法候选项。请求沿用冻结版本的结构化字段。
+- 本版本移植自 [warframe-weapon-loadout-build 固定提交](https://github.com/superexboom/warframe-weapon-loadout-build/tree/44096ddfbc50470656f5b13b6a0b45e9c24d93c7)，保留原作者及 WFSim 贡献者的声明。本机服务启动使用一个求解工位，加入配装候选复用和预算分配，并提供六组预计算工况。Python、Rust 及本机服务入口采用 [AGPL-3.0-only](LICENSE)。 [第三方声明](THIRD_PARTY_NOTICES.md)
+- 独立程序包包括服务、原生模块、预计算配置和得分。安装器从上述提交直接读取 `data/` 下的锁定文件。客户端导出表、官方文字和 Wiki 资料按各自来源及许可标注。Wiki 提供部分武器修正值和架势资料。 [上游数据与许可说明](https://github.com/superexboom/warframe-weapon-loadout-build/blob/44096ddfbc50470656f5b13b6a0b45e9c24d93c7/THIRD_PARTY_NOTICES.md)
+- 旧 WFSim 版和对应构建文件见 [固定提交 2419c5c](https://github.com/skyti1437/warframe-damage-engine/tree/2419c5c76a83aae34428fafc5da2eee21ec16093)。
 
-```sh
-curl -sS http://127.0.0.1:8788/api/panel \
-  -H 'Content-Type: application/json' \
-  -d '{"weapon":"tenet_glaxion","valence_element":"toxin","valence_bonus":0.56,"mods":["serration"],"wielder":{"frame":"wukong_prime","shards":[{"shard":"violet_archon_shard","effect":"primary_electricity_damage","tauforged":true}]}}'
-```
-
-本地也可直接执行 `target/release/warframe-damage-engine`。标准输入每行接收一个带 `path` 和 `body` 的 JSON 对象，每行返回 `response` 和原样回显的可选 `id`。
-
-## 紫晶电击的合成顺序
-
-来源为主武电击紫晶时，电击和武器自带、效价单元素一同按火、冰、电、毒排序。同属性 MOD 能把该元素提前到对应槽位。毒效价信条·冷冻光束步枪在无元素 MOD 时，自带冰冻与紫晶电击配成**磁力**，效价**毒素**保留。普通与 Tau 紫晶均走这条规则。这个组合的**实机面板待复核**。 [Wiki 合成说明](https://wiki.warframe.com/w/Violet_Archon_Shard#Primary_Electricity_Damage) · [U44 玩家报告](https://forums.warframe.com/topic/1529294-elements-on-the-weapons-combine-in-an-inconsistent-manner/)
-
-用 `python3 -m unittest -v test_engine` 检查同一毒效价的零石、普通紫晶、Tau 紫晶和 Tau 紫晶配火卡面板，也检查版本、鉴权与战斗模拟入口。
-
-## 许可和来源
-
-代码采用 [AGPL-3.0-or-later](LICENSE)。对应源码包括 `UPSTREAM` 指定的 [WFSim 源码](https://github.com/magenie33/wfsim/tree/cddfac4b10c71fd162be0ae7be32778aa5d2fd06)、此仓的补丁和构建文件。游戏数据的上游来源为 [Warframe Wiki](https://wiki.warframe.com/)。构建在本地读取上游资源，数据、测量记录和游戏素材沿用各自条款。 [WFSim 数据许可说明](https://github.com/magenie33/wfsim/blob/cddfac4b10c71fd162be0ae7be32778aa5d2fd06/LICENSE-DATA.md) · [WFSim 标识政策](https://github.com/magenie33/wfsim/blob/cddfac4b10c71fd162be0ae7be32778aa5d2fd06/TRADEMARK.md)
+本项目为非官方社区工具。Warframe 商标属于 Digital Extremes Ltd.

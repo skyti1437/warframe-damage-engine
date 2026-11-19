@@ -1,5 +1,6 @@
-/.build/
-/target/
+/data/
+/native/wfcore/target/
+/vendor/wfarsenal/wfcore.so
+/vendor/wfarsenal/wfcore.pyd
 __pycache__/
-._*
-/.DS_Store
+.DS_Store

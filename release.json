@@ -1,0 +1,18 @@
+{
+  "assets": {
+    "darwin-arm64": {
+      "name": "portable-runtime-mac-arm64.zip",
+      "python": "3.12",
+      "sha256": "740041313e02c6bb728c066c9a1a84a6c7d7697da766afab5f40adb783aa5e87",
+      "size": 1321736
+    },
+    "linux-x86_64": {
+      "name": "portable-runtime-linux-x86_64.zip",
+      "python": "3.12",
+      "sha256": "1a527d2bddf6f854112e8af49dc6b100504a3cb57ff908e4fdbf375b781c2bf4",
+      "size": 1390705
+    }
+  },
+  "tag": "portable-85ec9cdb3461c01c",
+  "upstream": "44096ddfbc50470656f5b13b6a0b45e9c24d93c7"
+}

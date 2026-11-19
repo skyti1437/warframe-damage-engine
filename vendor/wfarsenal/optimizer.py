@@ -1,0 +1,7078 @@
+"""Riven scoring and automatic weapon builds over one frozen export.
+
+Riven values on the wire are the max-rank numbers printed on the card.  This
+module converts them into :class:`ModEffect` objects and sends ordinary mods,
+the actual Riven, and the recommended Riven through the same damage reducer.
+The search is deliberately a bounded beam search: exports do not contain every
+mutual-exclusion rule needed for an exact combinatorial solver.
+"""
+
+from __future__ import annotations
+
+import itertools
+import hashlib
+import json
+import math
+import os
+import pickle
+from collections import OrderedDict, deque
+from dataclasses import dataclass, replace
+from pathlib import Path
+from statistics import median
+from typing import Any, Iterable, Iterator, Mapping, Sequence
+from .search_session import SESSION, session_request, memoized_search, heartbeat, phase_deadline, expired
+
+# Scored no-Riven baselines per exact inputs (see analyze_riven_request._reconstruct).
+_BASELINE_EVALUATIONS: OrderedDict = OrderedDict()
+
+from .damage import (
+    BASE_ELEMENTS,
+    MELEE_SLOTS,
+    ModEffect,
+    ModEffectList,
+    Scenario,
+    SUPPORTED_WEAPON_UPGRADE_TYPES,
+    apply_mods,
+    arcane_effects,
+    effective_hit_multiplier,
+    enemy_defenses,
+    expected_victim_status_count,
+    _qualifier_rejection,
+    sustained_status_damage,
+    windowed_status_damage,
+    mod_effects,
+    scenario_with,
+    with_value,
+)
+from .projectile_events import evaluate_projectile_events
+from . import status_native as _status_native
+from .simulator import (
+    SimulationError,
+    _buff_set_multiplier,
+    _mod_matches_weapon,
+    _set_key,
+    _set_shell_effects,
+    _set_shells,
+    _steady_state_scenario,
+    load_exports,
+    record_identity,
+    resolve_record,
+)
+
+
+RIVEN_TEMPLATE_BUILD = "2026.08.13.13.24"
+
+
+# 偏好复合元素映射（与 app.py ELEMENT_TARGETS 同口径）：elementTarget 键
+# → 最终配装必须包含的伤害类型。分析页的「偏好元素」选择器使用。
+_ELEMENT_TARGET_TYPES = {
+    "heat": "DT_FIRE",
+    "cold": "DT_FREEZE",
+    "electricity": "DT_ELECTRICITY",
+    "toxin": "DT_POISON",
+    "blast": "DT_EXPLOSION",
+    "radiation": "DT_RADIATION",
+    "gas": "DT_GAS",
+    "magnetic": "DT_MAGNETIC",
+    "viral": "DT_VIRAL",
+    "corrosive": "DT_CORROSIVE",
+}
+
+
+# Values are max-rank, disposition-1 card values recovered from the current
+# 2026.08.13.13.24 Randomized/*RandomModRare templates (raw Value * 90).
+# Flat stats (metres, seconds and initial combo) remain flat rather than percent.
+RIVEN_BASE_VALUES: dict[str, dict[str, float]] = {
+    "rifle": {
+        "0": 149.994, "1": 119.997, "2": 90.0, "3": 99.99,
+        "4": 90.0, "5": 90.0, "6": 90.0, "7": 90.0,
+        "8": 119.997, "9": 119.997, "A": 119.997,
+        "C": 45.0, "D": 164.9997, "F": 49.995, "G": 45.0,
+        "H": 59.994, "I": 45.0, "L": 49.995, "M": 49.95,
+        "P": 2.7, "R": 60.03, "S": 90.0, "V": 90.0, "Z": 90.0,
+        # 融合词条：见 FUSION_SERVER_BASES（服务器实际取值，_template_bases 合并）。
+    },
+    "shotgun": {
+        "0": 90.0, "1": 90.0, "2": 90.0, "3": 99.99,
+        "4": 90.0, "5": 90.0, "6": 90.0, "7": 90.0,
+        "8": 119.997, "9": 119.997, "A": 119.997,
+        "C": 45.0, "D": 164.7, "F": 49.995, "G": 45.0,
+        "I": 45.0, "L": 49.995, "M": 90.0, "P": 2.7,
+        "R": 90.0, "S": 119.7, "V": 90.0, "Z": 90.0,
+        # 融合词条：见 FUSION_SERVER_BASES（服务器实际取值，_template_bases 合并）。
+    },
+    "pistol": {
+        "0": 149.994, "1": 90.0, "2": 90.0, "3": 99.99,
+        "4": 90.0, "5": 90.0, "6": 90.0, "7": 90.0,
+        "8": 119.997, "9": 119.997, "A": 119.997,
+        "C": 45.0, "D": 219.6, "F": 49.995, "G": 45.0,
+        "H": 80.1, "I": 45.0, "L": 49.995, "M": 90.0,
+        "P": 2.7, "R": 74.7, "S": 119.7, "V": 90.0, "Z": 90.0,
+        # 融合词条：见 FUSION_SERVER_BASES（服务器实际取值，_template_bases 合并）。
+    },
+    "archgun": {
+        "0": 99.9, "1": 80.1, "2": 60.3, "3": 99.99,
+        "4": 119.7, "5": 119.7, "6": 119.7, "7": 119.7,
+        "8": 90.0, "9": 90.0, "A": 90.0,
+        "C": 45.0, "D": 99.9, "F": 99.9, "G": 45.0,
+        "H": 59.994, "I": 45.0, "L": 60.3, "M": 99.9, "P": 2.7,
+        "R": 60.03, "S": 60.3, "Z": 90.0,
+        # 融合词条：见 FUSION_SERVER_BASES（服务器实际取值，_template_bases 合并）。
+    },
+    "melee": {
+        "0": 180.0, "1": 90.0, "2": 90.0, "3": 99.99,
+        "4": 90.0, "5": 90.0, "6": 90.0, "7": 90.0,
+        "8": 119.7, "9": 119.7, "A": 119.7,
+        "B": 24.5016, "C": 45.0, "E": 120.006, "G": 45.0,
+        "I": 45.0, "J": 54.9, "K": 164.7, "N": 8.1,
+        "O": 58.77, "Q": 104.85, "T": 1.9422, "U": 73.44,
+        "X": 119.7,
+        # 近战融合词条（模板 base90：重击伤害/蓄力速度/震地 1.197，格挡角度 8.1；
+        # 2026.10.08 起近战也有状态伤害、复合元素 90 与新派系 45）。
+        "HC": 119.7, "PA": 8.1, "SL": 119.7, "HD": 119.7, "SD": 90.0,
+        "GA": 90.0, "CO": 90.0, "VI": 90.0, "RA": 90.0, "BL": 90.0, "MA": 90.0,
+        "FO": 45.0, "FT": 45.0, "FS": 45.0,
+    },
+}
+
+
+# code: (label, upgrade type, operation, damage type, symbol filter, unit,
+#        effect direction for a beneficial line, can buff, can curse)
+RIVEN_RULES: dict[str, tuple[str, str, str, str | None, str | None, str, float, bool, bool]] = {
+    "0": ("暴击几率", "WEAPON_CRIT_CHANCE", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "1": ("暴击伤害", "WEAPON_CRIT_DAMAGE", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "2": ("触发几率", "WEAPON_PROC_CHANCE", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "3": ("触发时间", "WEAPON_PROC_TIME", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "4": ("火焰伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "ADD", "DT_FIRE", None, "percent", 1, True, False),
+    "5": ("冰冻伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "ADD", "DT_FREEZE", None, "percent", 1, True, False),
+    "6": ("毒素伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "ADD", "DT_POISON", None, "percent", 1, True, False),
+    "7": ("电击伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "ADD", "DT_ELECTRICITY", None, "percent", 1, True, False),
+    "8": ("冲击伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "STACKING_MULTIPLY", "DT_IMPACT", None, "percent", 1, True, True),
+    "9": ("穿刺伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "STACKING_MULTIPLY", "DT_PUNCTURE", None, "percent", 1, True, True),
+    "A": ("切割伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "STACKING_MULTIPLY", "DT_SLASH", None, "percent", 1, True, True),
+    "B": ("初始连击", "WEAPON_MELEE_COMBO_INITIAL_BONUS", "ADD", None, None, "flat", 1, True, False),
+    "C": ("对Corpus伤害", "GAMEPLAY_FACTION_DAMAGE", "STACKING_MULTIPLY", None, "Corpus", "percent", 1, True, True),
+    "D": ("基础伤害", "WEAPON_DAMAGE_AMOUNT", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    # The current reducer cannot express the CC_SLIDING symbol condition, so E
+    # is accepted and diagnosed but never used as unconditional crit chance.
+    "E": ("滑行攻击时暴击率", "WEAPON_CRIT_CHANCE_SLIDE", "STACKING_MULTIPLY", None, "CC_SLIDING", "percent", 1, True, True),
+    "F": ("装填速度", "WEAPON_RELOAD_SPEED", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "G": ("对Grineer伤害", "GAMEPLAY_FACTION_DAMAGE", "STACKING_MULTIPLY", None, "Grineer", "percent", 1, True, True),
+    "H": ("变焦", "WEAPON_ZOOM", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "I": ("对Infested伤害", "GAMEPLAY_FACTION_DAMAGE", "STACKING_MULTIPLY", None, "Infestation", "percent", 1, True, True),
+    "J": ("攻击速度", "WEAPON_FIRE_RATE", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "K": ("近战伤害", "WEAPON_MELEE_DAMAGE", "STACKING_MULTIPLY", None, None, "percent", 1, True, False),
+    "L": ("弹匣容量", "WEAPON_CLIP_MAX", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "M": ("弹药最大值", "WEAPON_AMMO_MAX", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "N": ("连击持续时间", "WEAPON_MELEE_COMBO_DURATION_BONUS", "ADD", None, None, "flat", 1, True, True),
+    "O": ("额外连击数几率", "WEAPON_MELEE_COMBO_GAIN_EXTRA_CHANCE", "STACKING_MULTIPLY", None, None, "percent", 1, True, False),
+    "P": ("穿透", "WEAPON_PUNCTURE_DEPTH", "ADD", None, None, "flat", 1, True, False),
+    "Q": ("额外连击数", "WEAPON_MELEE_COMBO_GAIN_MISS_CHANCE", "ADD", None, None, "percent", -1, False, True),
+    "R": ("射速", "WEAPON_FIRE_RATE", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "S": ("多重射击", "WEAPON_FIRE_ITERATIONS", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "T": ("攻击范围", "WEAPON_RANGE", "ADD", None, None, "flat", 1, True, True),
+    "U": ("重击效率", "WEAPON_MELEE_COMBO_USAGE_EFFICIENCY", "ADD", None, None, "percent", 1, True, True),
+    "V": ("投射物速度", "WEAPON_PROJECTILE_SPEED", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    "X": ("处决伤害", "WEAPON_MELEE_FINISHER_DAMAGE", "STACKING_MULTIPLY", None, None, "percent", 1, True, True),
+    # A beneficial recoil line is printed as a negative percentage.
+    "Z": ("武器后坐力", "WEAPON_RECOIL", "STACKING_MULTIPLY", None, None, "percent", -1, True, True),
+    # ── 词条融合新词条（2026.09.22，Advanced Traits）─────────────────
+    # 数值来自 new_riven_stats.json（base90 = 0.9 倾向基准显示值）。
+    # 弱点家族乘区已引擎裁决：弱点伤害是独立乘区（弱命中 ×(1+bonus)）、
+    # 弱点暴击与基础暴击同链加算——见 weakpoint-multiplier-re.json。
+    # 融合词条游戏规则（用户确认 2026-09-24）：仅正面、每卡限 1 条——
+    # can_negative 一律 False（提取数据的 CanBeCurse 标志是融合原料的
+    # 旧口径，不适用于融合结果词条）。
+    "W": ("弱点伤害", "WEAPON_DAMAGE_WEAKPOINT", "STACKING_MULTIPLY", None, None, "percent", 1, True, False),
+    "Y": ("弱点暴击几率", "WEAPON_CRIT_CHANCE_WEAKPOINT", "STACKING_MULTIPLY", None, None, "percent", 1, True, False),
+    # 双字符码避免与既有单字母冲突（wire 上 code.upper() 去重）。
+    "GA": ("毒气伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "ADD", "DT_GAS", None, "percent", 1, True, False),
+    "CO": ("腐蚀伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "ADD", "DT_CORROSIVE", None, "percent", 1, True, False),
+    "VI": ("病毒伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "ADD", "DT_VIRAL", None, "percent", 1, True, False),
+    "RA": ("辐射伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "ADD", "DT_RADIATION", None, "percent", 1, True, False),
+    "BL": ("爆炸伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "ADD", "DT_EXPLOSION", None, "percent", 1, True, False),
+    "MA": ("磁力伤害", "WEAPON_PERCENT_BASE_DAMAGE_ADDED", "ADD", "DT_MAGNETIC", None, "percent", 1, True, False),
+    "SD": ("状态伤害", "WEAPON_PROC_DAMAGE", "STACKING_MULTIPLY", None, None, "percent", 1, True, False),
+    "AE": ("弹药效率", "WEAPON_AMMO_CONSUME_RATE", "STACKING_MULTIPLY", None, None, "percent", -1, True, False),
+    "HR": ("收枪自动装填", "WEAPON_AUTO_RELOAD_RATE", "ADD", None, None, "percent", 1, True, False),
+    "FO": ("对Orokin伤害", "GAMEPLAY_FACTION_DAMAGE", "STACKING_MULTIPLY", None, "Orokin", "percent", 1, True, False),
+    "FT": ("对Techrot伤害", "GAMEPLAY_FACTION_DAMAGE", "STACKING_MULTIPLY", None, "Techrot", "percent", 1, True, False),
+    "FS": ("对Scaldra伤害", "GAMEPLAY_FACTION_DAMAGE", "STACKING_MULTIPLY", None, "Scaldra", "percent", 1, True, False),
+    # 近战专属融合词条（base90: 蓄力速度 1.197、格挡角度 8.1、震地伤害 1.197）。
+    "HD": ("重击伤害", "WEAPON_MELEE_DAMAGE", "STACKING_MULTIPLY", None, None, "percent", 1, True, False),
+    "HC": ("重击蓄力速度", "WEAPON_MELEE_HEAVY_CHARGE_SPEED", "STACKING_MULTIPLY", None, None, "percent", 1, True, False),
+    "PA": ("格挡角度", "WEAPON_PARRY_ANGLE", "ADD", None, None, "flat", 1, True, False),
+    "SL": ("震地伤害", "WEAPON_MELEE_SLAM_DAMAGE_BONUS", "STACKING_MULTIPLY", None, None, "percent", 1, True, False),
+}
+
+# ── 融合词条码集合（仅正面、每卡限 1 条——游戏规则，2026-09-24 确认）──
+# 推荐器的组合枚举（_recommend_positive 头部组合、recommend_optimal_riven
+# 的 beam 组合）用它过滤：任何含 2+ 融合词条的组合非法，直接跳过。
+from .melee_sequence import build_schedule, route_note
+from .riven_fusion import FUSION_CODES as _FUSION_LINE_CODES, available_codes as _available_fusion_codes
+
+
+
+def _combo_allows_fusion(lines: Sequence[Any]) -> bool:
+    """组合是否满足「融合词条每卡限 1 条」（负融合词条已被候选层排除）。"""
+    return sum(
+        1
+        for line in lines
+        if str(getattr(line, "code", "")) in _FUSION_LINE_CODES
+    ) <= 1
+
+
+def _template_stats(
+    payload: Mapping[str, Any], weapon_type: str, *, lenient: bool = False
+) -> Iterator[tuple[str, str, Mapping[str, Any], Mapping[str, Any]]]:
+    """(code, unit, template stat, its single upgrade) for each stat of the
+    weapon type's canonical RandomModRare template that maps to one Riven code.
+
+    ``lenient`` (identity only, never values) reads a multi-upgrade stat by its
+    first upgrade and breaks shared rules (gun fire rate / melee attack speed)
+    by the codes this weapon type can roll."""
+    templates = payload.get("templates") if isinstance(payload, Mapping) else None
+    if not isinstance(templates, list):
+        return
+    candidates = [row for row in templates if isinstance(row, Mapping) and row.get("weaponType") == weapon_type]
+    if weapon_type == "melee":
+        candidates.sort(key=lambda row: str(row.get("id") or "") != "PlayerMeleeWeaponRandomModRare")
+    elif weapon_type == "pistol":
+        candidates.sort(key=lambda row: str(row.get("id") or "") != "LotusPistolRandomModRare")
+    if not candidates:
+        return
+    for stat in candidates[0].get("stats") or ():
+        if not isinstance(stat, Mapping):
+            continue
+        upgrades = stat.get("upgrades") or ()
+        if stat.get('tag') == 'WeaponCritChanceMod' and len(upgrades) == 2:
+            # Melee repeats the same scalar for its heavy-attack-only bonus.
+            # Read the unqualified normal value; the wire rule adds the heavy
+            # qualifier separately and must not lose melee crit candidates.
+            upgrades = [u for u in upgrades if isinstance(u, Mapping) and not u.get('validModifiers')]
+        if (len(upgrades) != 1 and not (lenient and upgrades)) or not isinstance(upgrades[0], Mapping):
+            continue
+        upgrade = upgrades[0]
+        matches = []
+        for code, rule in RIVEN_RULES.items():
+            _label, upgrade_type, operation, damage_type, symbol_filter, unit, *_rest = rule
+            if tuple(upgrade.get("validModifiers") or ()) != (("PM_HEAVY_MELEE",) if code == "HD" else ()):
+                continue
+            if upgrade_type != upgrade.get("upgradeType") or operation != upgrade.get("operation"):
+                continue
+            raw_damage = upgrade.get("damageType")
+            raw_symbol = upgrade.get("symbolFilter") or None
+            if damage_type and damage_type != raw_damage:
+                continue
+            if not damage_type and raw_damage not in (None, "", "DT_ANY"):
+                continue
+            if symbol_filter and symbol_filter != raw_symbol:
+                continue
+            if not symbol_filter and raw_symbol and not (code == 'HR' and raw_symbol == 'Holstered'):
+                continue
+            matches.append((code, unit))
+        if lenient and len(matches) > 1:
+            matches = [row for row in matches if row[0] in RIVEN_BASE_VALUES.get(weapon_type, {})]
+        if len(matches) == 1:
+            yield (*matches[0], stat, upgrade)
+
+
+def _template_bases(payload: Mapping[str, Any], weapon_type: str) -> dict[str, float]:
+    """Recover display-scale base values from the current RandomModRare export."""
+    result: dict[str, float] = {}
+    for code, unit, _stat, upgrade in _template_stats(payload, weapon_type):
+        raw_value = upgrade.get("rawValue")
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            continue
+        result[code] = abs(float(raw_value)) * (90.0 if unit == "flat" else 9000.0)
+    # Rivens are rolled by the server. Until 2026.10.08 the client template
+    # disagreed with observed rolls for some spliced traits (a Dual Toxocyst
+    # Weakpoint roll of 310% needs base 225, the old pistol template said 90);
+    # the 10.08 templates match. Server-observed bases still win.
+    result.update({code: value for code, value in FUSION_SERVER_BASES.get(weapon_type, {}).items()
+                   if code in result or code in RIVEN_BASE_VALUES.get(weapon_type, {})})
+    return result
+
+
+
+def riven_card_faces(payload: Mapping[str, Any], weapon_type: str) -> dict[str, dict[str, Any]]:
+    """Card art and name syllables per Riven code, from the template's UpgradeEntries.
+
+    In game the card face cycles through the ``Icon`` of every stat on the card;
+    the name is built from the ``LocalizePrefixTag`` / ``LocalizeSuffixTag``
+    syllables. The 2026.08.13 export lacks the spliced traits' syllables;
+    they come from the 09-22 templates (``riven_fusion.FUSION_SYLLABLES``).
+    """
+    faces = {
+        code: {"icon": stat.get("icon"), "prefix": stat.get("prefix"), "suffix": stat.get("suffix")}
+        for code, _unit, stat, _upgrade in _template_stats(payload, weapon_type, lenient=True)
+    }
+    # Template rows whose upgrade differs from the wire rule (slide crit is a
+    # filtered WEAPON_CRIT_CHANCE, parry angle multiplies) are matched by tag.
+    templates = payload.get("templates") if isinstance(payload, Mapping) else None
+    for template in templates if isinstance(templates, list) else ():
+        if not isinstance(template, Mapping) or template.get("weaponType") != weapon_type:
+            continue
+        for stat in template.get("stats") or ():
+            code = _FACE_TAG_CODES.get(str(stat.get("tag") or ""))
+            if code and code not in faces and code in RIVEN_BASE_VALUES.get(weapon_type, {}):
+                faces[code] = {"icon": stat.get("icon"), "prefix": stat.get("prefix"), "suffix": stat.get("suffix")}
+    from .riven_fusion import FUSION_SYLLABLES, TAG_CODES
+    for tag, (prefix, suffix) in FUSION_SYLLABLES.items():
+        face = faces.get(TAG_CODES.get(tag, ""))
+        if face is not None and not face.get("prefix"):
+            face.update(prefix=prefix, suffix=suffix)
+    return faces
+
+
+_FACE_TAG_CODES = {"SlideAttackCritChanceMod": "E", "WeaponMeleeParryAngleMod": "PA"}
+
+# Spliced (fusion) trait bases as rolled by the server, in display percent
+# (wiki Riven Mods; the 2026.10.08 client templates agree). Same for every gun
+# type; melee values come from the template and are not overridden.
+_GUN_FUSION_BASES = {
+    "W": 225.0, "Y": 247.5, "AE": 45.0, "HR": 90.0, "SD": 90.0,
+    "GA": 90.0, "CO": 90.0, "VI": 90.0, "RA": 90.0, "BL": 90.0, "MA": 90.0,
+    "FO": 45.0, "FT": 45.0, "FS": 45.0,
+}
+FUSION_SERVER_BASES: dict[str, dict[str, float]] = {
+    "rifle": dict(_GUN_FUSION_BASES),
+    "shotgun": dict(_GUN_FUSION_BASES),
+    "pistol": dict(_GUN_FUSION_BASES),
+    "archgun": {code: value for code, value in _GUN_FUSION_BASES.items() if code != "HR"},
+}
+for _type, _bases in FUSION_SERVER_BASES.items():
+    RIVEN_BASE_VALUES[_type].update(_bases)
+
+# Filled only with weapon-specific choices that have been verified against the
+# current export.  Missing entries are selected from static branches by the
+# requested objective, rather than inheriting a stale four-year-old table.
+DEFAULT_INCARNON_CHOICES: dict[str, dict[str, str]] = {}
+
+
+@dataclass(frozen=True)
+class _RivenLine:
+    code: str
+    label: str
+    value: float
+    low: float
+    high: float
+    negative: bool
+    unit: str
+    effect: ModEffect | None
+
+
+@dataclass(frozen=True)
+class _Card:
+    key: str
+    record: Mapping[str, Any] | None
+    rank: int
+    effects: tuple[ModEffect, ...]
+    skipped: tuple[str, ...]
+    drain: int
+    polarity: str | None
+    riven_lines: tuple[_RivenLine, ...] = ()
+    required: bool = False
+    set_shell: Mapping[str, Any] | None = None
+    # 灵化卡专属：条件 SubUpgrade 子词条的触发规格（事件化叠层语义）。
+    # 结构与 app 层 trigger_sources 一致：
+    # {id, label, kind, perEvent, maxStacks, duration, effects: [原始 effect 行]}。
+    trigger_specs: tuple[Mapping[str, Any], ...] = ()
+    event_arcanes: tuple[tuple[Mapping[str, Any], int, Mapping[str, Any]], ...] = ()
+    incarnon_choices: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass
+class _Evaluation:
+    score: float
+    cards: tuple[_Card, ...]
+    stats: Any
+    capacity: int
+    riven_index: int | None
+    scenario: Scenario
+
+
+def _number(label: str, value: Any, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SimulationError(f"{label} must be a finite number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise SimulationError(f"{label} must be a finite number")
+    return value
+
+
+_KITGUN_BASE_PREFIXES = ("/lotus/weapons/solarisunited/primary/lotusmodularprimary",
+                         "/lotus/weapons/solarisunited/secondary/lotusmodularsecondary")
+
+
+def _riven_type(requested: Any, weapon: Mapping[str, Any]) -> str:
+    """Riven family for stat bases, templates and fusion traits.
+
+    Every Kitgun, primary or secondary, takes the one Kitgun Riven
+    (LotusModularPistolRandomModRare: pistol stats; a primary Kitgun only
+    swaps in the chamber's alternate disposition). Mechanics keep
+    ``_weapon_type``.
+    """
+    path = str(weapon.get("path") or "").casefold()
+    if weapon.get("kitgunParts") or path.startswith(_KITGUN_BASE_PREFIXES):
+        return "pistol"
+    return _weapon_type(requested, weapon)
+
+
+def _weapon_type(requested: Any, weapon: Mapping[str, Any]) -> str:
+    value = str(requested or "").strip().casefold()
+    slot = str(weapon.get("slot") or "").casefold()
+    if value == "kitgun":
+        return "pistol" if slot == "secondary" else "rifle"
+    aliases = {
+        "zaw": "melee", "secondary": "pistol",
+        "primary": "rifle", "archwing": "archgun", "arch-gun": "archgun",
+        "archmelee": "melee", "arch-melee": "melee", "spacemelee": "melee",
+        "space-melee": "melee",
+    }
+    value = aliases.get(value, value)
+    if value in RIVEN_BASE_VALUES:
+        return value
+    ancestry = " ".join(map(str, weapon.get("ancestry") or ())).casefold()
+    if slot in {"melee", "arch_melee", "space_melee", "archmelee", "spacemelee"}:
+        return "melee"
+    if "shotgun" in ancestry:
+        return "shotgun"
+    if slot == "companion":
+        if "/lotus/weapons/tenno/melee/playermeleeweapon" in ancestry:
+            return "melee"
+        if "/lotus/weapons/tenno/pistol/lotuspistol" in ancestry:
+            return "pistol"
+    if slot == "secondary":
+        return "pistol"
+    if "archwing" in ancestry or "archgun" in ancestry:
+        return "archgun"
+    return "rifle"
+
+
+def _effect_from_code(
+    code: str,
+    value: float,
+    *,
+    negative: bool,
+    source: str,
+) -> ModEffect | None:
+    rule = RIVEN_RULES.get(code)
+    if rule is None:
+        return None
+    _, upgrade_type, operation, damage_type, symbol_filter, unit, direction, _, _ = rule
+    normalized = value / 100.0 if unit == "percent" else value
+    normalized *= direction * (-1.0 if negative else 1.0)
+    return ModEffect(
+        upgrade_type=upgrade_type,
+        operation=operation,
+        value=normalized,
+        damage_type=damage_type,
+        symbol_filter=symbol_filter,
+        supported=upgrade_type in SUPPORTED_WEAPON_UPGRADE_TYPES,
+        source_path=source,
+        valid_modifiers=("PM_HEAVY_MELEE",) if code == "HD" else (),
+    )
+
+
+def synthetic_riven_effects(
+    stats: Iterable[Mapping[str, Any] | ModEffect],
+) -> ModEffectList:
+    """Create effects from normalized records or card-display Riven code records.
+
+    A record with ``upgradeType`` supplies an already-normalized internal value.
+    A record with ``code`` supplies a max-rank card-display value (usually percent).
+    Unknown codes survive as a fail-closed ``skipped`` diagnostic.
+    """
+    effects = ModEffectList()
+    for index, stat in enumerate(stats):
+        if isinstance(stat, ModEffect):
+            effects.append(stat)
+            continue
+        if not isinstance(stat, Mapping):
+            raise SimulationError(f"riven stat {index} must be an object")
+        code = str(stat.get("code") or "").strip().upper()
+        if code:
+            value = abs(_number(f"riven stat {code} value", stat.get("value")))
+            effect = _effect_from_code(
+                code,
+                value,
+                negative=bool(stat.get("negative")),
+                source=f"riven:{code}",
+            )
+            if effect is None:
+                effects.skipped.append(f"riven:{code}: unsupported[unknown-code]")
+            else:
+                effects.append(effect)
+            continue
+        upgrade_type = str(
+            stat.get("upgradeType") or stat.get("upgrade_type") or ""
+        ).strip()
+        if not upgrade_type:
+            effects.skipped.append(f"riven:{index}: unsupported[missing-upgrade-type]")
+            continue
+        value = _number(f"riven stat {index} value", stat.get("value"))
+        effects.append(
+            ModEffect(
+                upgrade_type=upgrade_type,
+                operation=str(stat.get("operation") or "STACKING_MULTIPLY"),
+                value=value,
+                damage_type=stat.get("damageType") or stat.get("damage_type"),
+                symbol_filter=stat.get("symbolFilter") or stat.get("symbol_filter"),
+                supported=upgrade_type in SUPPORTED_WEAPON_UPGRADE_TYPES,
+                source_path=str(stat.get("sourcePath") or f"riven:{index}"),
+            )
+        )
+    return effects
+
+
+def _wire_lines(stats: Any, scale: float = 1.0) -> tuple[list[_RivenLine], list[str]]:
+    if not isinstance(stats, list):
+        raise SimulationError("riven request stats must be an array")
+    if not stats:
+        raise SimulationError("riven request stats must contain at least one stat")
+    if len(stats) > 4:
+        raise SimulationError("riven supports at most three positive stats and one negative stat")
+    lines: list[_RivenLine] = []
+    unsupported: list[str] = []
+    seen: set[str] = set()
+    negative_count = 0
+    for index, raw in enumerate(stats):
+        if not isinstance(raw, Mapping):
+            unsupported.append(f"riven-stat-{index}-not-an-object")
+            continue
+        code = str(raw.get("code") or "").strip().upper()
+        if not code:
+            unsupported.append(f"riven-stat-{index}-missing-code")
+            continue
+        if code in seen:
+            unsupported.append(f"riven-stat-{code}-duplicate")
+            continue
+        seen.add(code)
+        rule = RIVEN_RULES.get(code)
+        negative_raw = raw.get("negative", False)
+        if not isinstance(negative_raw, bool):
+            raise SimulationError(f"riven stat {code} negative must be boolean")
+        negative = negative_raw
+        if rule is not None:
+            can_roll = rule[8] if negative else rule[7]
+            if not can_roll:
+                role = "negative" if negative else "positive"
+                raise SimulationError(f"riven stat {code} cannot be rolled as {role}")
+        raw_value = _number(f"riven stat {code} value", raw.get("value"))
+        raw_low = _number(f"riven stat {code} low", raw.get("low"))
+        raw_high = _number(f"riven stat {code} high", raw.get("high"))
+        if raw_value < 0 or raw_low < 0 or raw_high < 0:
+            raise SimulationError(
+                f"riven stat {code} values must be finite and non-negative"
+            )
+        if raw_low and raw_high and raw_low > raw_high:
+            raise SimulationError(f"riven stat {code} low value exceeds high value")
+        value, low, high = (
+            raw_value * scale,
+            raw_low * scale,
+            raw_high * scale,
+        )
+        if not all(math.isfinite(item) for item in (value, low, high)):
+            raise SimulationError(
+                f"riven stat {code} projected values must be finite"
+            )
+        label = str(raw.get("label") or (rule[0] if rule else code))
+        if negative:
+            negative_count += 1
+        effect = _effect_from_code(
+            code, value, negative=negative, source=f"riven:{code}"
+        )
+        if effect is None:
+            unsupported.append(f"riven-stat-{code}-unknown")
+        elif not effect.supported:
+            unsupported.append(f"riven-stat-{code}-{effect.upgrade_type}-not-evaluated")
+        lines.append(
+            _RivenLine(
+                code, label, value, low, high, negative,
+                str(raw.get("unit") or (rule[5] if rule else "")), effect,
+            )
+        )
+    if negative_count > 1 or len(stats) - negative_count > 3:
+        raise SimulationError("riven supports at most three positive stats and one negative stat")
+    return lines, unsupported
+
+
+def _card_from_lines(lines: Sequence[_RivenLine], *, polarity: str = "AP_ATTACK") -> _Card:
+    effects = tuple(line.effect for line in lines if line.effect is not None)
+    skipped = tuple(
+        f"riven:{line.code}: unsupported[no-handler]"
+        for line in lines
+        if line.effect is None or not line.effect.supported
+    )
+    return _Card(
+        key="__riven__",
+        record=None,
+        rank=8,
+        effects=effects,
+        skipped=skipped,
+        drain=18,
+        polarity=polarity,
+        riven_lines=tuple(lines),
+    )
+
+
+def _combo_tier_card(mod: Mapping[str, Any]) -> bool:
+    """Blood Rush / Weeping Wounds: empty at a static combo tier, but the melee
+    hit schedule raises their stacks with the live combo counter."""
+    return any(
+        any(str(c).endswith("/OnComboTierCondition") for c in conditional.get("conditions") or ())
+        and any(e.get("upgradeType") in SUPPORTED_WEAPON_UPGRADE_TYPES for e in conditional.get("effects") or ())
+        for conditional in mod.get("conditionalEffects") or ()
+        if isinstance(conditional, Mapping)
+    )
+
+
+def _mod_card(
+    mod: Mapping[str, Any],
+    scenario: Scenario,
+    *,
+    required: bool = False,
+    allow_empty: bool = False,
+    set_shell: Mapping[str, Any] | None = None,
+    rank: int | None = None,
+) -> _Card | None:
+    rank = int(mod.get("maxRank") or 0) if rank is None else rank
+    effects = mod_effects(mod, rank, _steady_state_scenario((mod,), scenario))
+    active = tuple(
+        effect
+        for effect in effects
+        if effect.supported and effect.upgrade_type in SUPPORTED_WEAPON_UPGRADE_TYPES
+    )
+    if not active and not allow_empty and not _combo_tier_card(mod):
+        from .manual_combat import replay_only_card
+        if not replay_only_card(mod):
+            return None
+    drain = max(0, int(mod.get("baseDrain") or 0) + rank)
+    return _Card(
+        key=str(mod.get("path") or mod.get("nameInternal") or mod.get("nameEn")),
+        record=mod,
+        rank=rank,
+        effects=tuple(effects),
+        skipped=tuple(effects.skipped),
+        drain=drain,
+        polarity=mod.get("polarity") or None,
+        required=required,
+        set_shell=set_shell,
+    )
+
+
+def _candidate_mods(
+    exports: Mapping[str, Any], weapon: Mapping[str, Any], scenario: Scenario
+) -> tuple[list[_Card], int]:
+    cards: list[_Card] = []
+    rejected = 0
+    shells = _set_shells(exports["mods"])
+    reach: Mapping[str, Any] | None = None
+    from .runtime_adapters import double_tap_configuration
+    for mod in exports["mods"]:
+        path = str(mod.get("path") or "")
+        # 「蓄力装填 Prime」（SniperReloadDamageModExpert）与开发者版「压迫点」
+        # （WeaponMeleeDamageOnHeavyKillMod，记录级 supported=false、基础词条为空、
+        # 只有 0.5s 的蓄力击杀条件词条）都是 DE 数据里从未发布的 dev 残留，
+        # 不进候选池，与 app._manual_mod_rows 的收录口径一致；否则同名占位卡会
+        # 顶掉真正的压迫点，且前端素材库没有它的卡面/容量数据。
+        if path in {
+            "/Lotus/Upgrades/Mods/Rifle/Expert/SniperReloadDamageModExpert",
+            "/Lotus/Upgrades/Mods/Melee/WeaponMeleeDamageOnHeavyKillMod",
+        }:
+            continue
+        if (
+            mod.get("selectable") is not True
+            or not mod.get("compatibility")
+            or ("/PvPMods/" in path and not double_tap_configuration(mod,int(mod.get('maxRank') or 0)))
+            or not _mod_matches_weapon(mod, weapon)
+        ):
+            continue
+        if mod.get("nameEn") == "Primed Reach":
+            reach = mod
+        card = _mod_card(
+            mod,
+            scenario,
+            set_shell=shells.get(_set_key(mod.get("modSet"))),
+        )
+        if card is None:
+            rejected += 1
+        else:
+            cards.append(card)
+    # Reach is a comfort reservation for ordinary melee builds. Hammers
+    # normally use the slam route, whose radius Reach does not increase;
+    # they and glaive throws must leave all damage slots available.
+    from .melee_sequence import default_route, weapon_row
+    tags = {str(tag).upper() for tag in weapon.get("compatTags") or ()}
+    hammer = "HAMMERS_STANCE" in tags or str((weapon_row(weapon) or {}).get("tree", "")).endswith("/HammerMeleeTree")
+    route = (getattr(scenario, "combat_state", None) or {}).get("meleeRoute") or default_route(weapon)
+    if (
+        _weapon_type(None, weapon) == "melee"
+        and not weapon.get("isExalted")
+        and reach is not None
+        and route != "glaive"
+        and not hammer
+    ):
+        required_reach = _mod_card(
+            reach, scenario, required=True, allow_empty=True
+        )
+        if required_reach is not None:
+            cards.append(required_reach)
+    cards.sort(key=lambda card: card.key)
+    return cards, rejected
+
+
+def _tier_number(value: Any) -> int | None:
+    raw = str(value or "").strip().casefold()
+    if raw.startswith("tier"):
+        raw = raw[4:]
+    try:
+        number = int(raw)
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
+def _select_fire_mode(
+    weapon: Mapping[str, Any], requested: Any, *, weapon_type: str
+) -> tuple[Mapping[str, Any], int]:
+    modes = weapon.get("fireModes") or ()
+    if not isinstance(modes, (list, tuple)) or not modes:
+        raise SimulationError("weapon has no fire modes")
+    if requested is None:
+        index = 0
+    else:
+        if isinstance(requested, bool) or not isinstance(requested, int):
+            raise SimulationError("fireMode must be a non-negative integer")
+        index = requested
+    if index < 0 or index >= len(modes):
+        raise SimulationError(
+            f"fireMode {index} is out of range for {len(modes)} fire modes"
+        )
+    if (modes[index].get('behaviorKind') == 'auxiliary-melee'
+            and weapon.get('slot') in ('primary','secondary','arch_gun')):
+        raise SimulationError(f"fire mode {index} is auxiliary melee, outside nonmelee scope")
+    if modes[index].get("behaviorKind")=="ability-action":
+        raise SimulationError(modes[index].get("unavailableReason") or "non-damage ability action")
+    selected = {**weapon, "fireModes": [modes[index]], "__selectedFireMode__": index, "__baseFireModes__": list(modes)}
+    # 灵化循环口径（Scenario.incarnon_cycle）需要基础形态的装填时长折算
+    # 充能——保留完整模式列表供 apply_mods 读取。
+    if weapon.get("isIncarnon"):
+        selected["__baseFireModes__"] = list(modes)
+    from .event_profiles import is_incarnon_mode
+    selected['isIncarnonForm'] = is_incarnon_mode(weapon,index)
+    return selected, index
+
+
+def _path_basename(value: Any) -> str:
+    return str(value or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _branch_effects(branch: Mapping[str, Any]) -> tuple[list[ModEffect], list[str]]:
+    from .runtime_adapters import miter_charge_aoe
+    if miter_charge_aoe(branch):
+        return [ModEffect('RUNTIME_MITER_CHARGE_AOE','ADD',1.,source_path=branch['path'])], []
+    from .runtime_adapters import onos_crits_for_hits
+    if onos_crits_for_hits(branch):
+        return [ModEffect('RUNTIME_ONOS_CRITS_FOR_HITS','ADD',.05,source_path=branch['path'])], []
+    from .runtime_adapters import reserve_ammo_refund
+    if reserve_ammo_refund(branch):
+        return [ModEffect('RUNTIME_RESERVE_AMMO_REFUND','ADD',0.,source_path=branch['path'])], []
+    from .runtime_adapters import latron_puncture_strip
+    if latron_puncture_strip(branch):
+        return [ModEffect('RUNTIME_PUNCTURE_ARMOR_STRIP','ADD',.2,source_path=branch['path'])], []
+    from .runtime_adapters import ammo_restore_configuration
+    if ammo_restore_configuration(branch):
+        return [ModEffect('RUNTIME_MAGAZINE_RESTORE','ADD',1.,source_path=branch['path'])], []
+    if branch.get('path')=='/Lotus/Upgrades/Evolutions/Shotgun/EvoShotgunShellReloadToggle':
+        from .runtime_adapters import verified_incarnon_condition
+        if any(verified_incarnon_condition(branch,c) for c in branch.get('conditionalEffects') or []):
+            return [ModEffect('RUNTIME_RELOAD_PROJECTILE_TOGGLE','ADD',1.,source_path=branch['path'])], []
+    from .runtime_adapters import verified_torid_field_duration, incarnon_stat_conversion
+    if verified_torid_field_duration(branch):
+        # This perk is consumed by the shared event resolver, never as a stat buff.
+        return [], []
+    conversion = incarnon_stat_conversion(branch)
+    if conversion:
+        return [ModEffect('RUNTIME_INCARNON_STAT_CONVERSION', 'ADD', conversion['fraction'],
+                          source_path=branch.get('path'), runtime_kind=conversion['source'],
+                          runtime_damage_type=conversion['target'], runtime_threshold=conversion['maximum'])], []
+    source = str(branch.get("path") or branch.get("id") or "incarnon")
+    effects: list[ModEffect] = []
+    unsupported: list[str] = []
+    from .runtime_adapters import verified_incarnon_condition
+    from .manual_combat import condition_kind
+    modeled_sources = set()
+    for condition in branch.get('conditionalEffects') or ():
+        source_path = str(condition.get('sourcePath') or source)
+        if verified_incarnon_condition(branch, condition):
+            modeled_sources.add(source_path)
+            continue
+        kind = condition.get('eventKind') or condition_kind(condition)
+        terms = condition.get('effects') or ()
+        # Empty-condition terminal magazine gates are still event modeled by
+        # manual_combat.resolve (Final Fusillade). Do not report them as a
+        # missing conditional block merely because the export has no tag.
+        if (not kind and terms and any(e.get('upgradeType') == 'WEAPON_LAST_MULTISHOT'
+                                      for e in terms if isinstance(e, Mapping))):
+            modeled_sources.add(source_path)
+            continue
+        # Conditional evolution terms with an identified replay event are
+        # consumed by manual_combat.prepare; keep them out of the static
+        # panel without falsely reporting them as absent. Unknown/empty
+        # condition blocks remain fail-closed and visible.
+        if kind and terms and all(ModEffect.from_export(e, 0).supported for e in terms):
+            modeled_sources.add(source_path)
+    # Flattened child effects repeat the condition block. Never make them passive.
+    conditional_sources = {str(c.get('sourcePath') or source)
+                           for c in branch.get('conditionalEffects') or () if c.get('effects')}
+    for raw in branch.get("effects") or ():
+        if not isinstance(raw, Mapping):
+            continue
+        if raw.get('upgradeType')=='NONE' and any(verified_incarnon_condition(branch,c) for c in branch.get('conditionalEffects') or []):
+            continue
+        if str(raw.get('sourcePath') or source) in conditional_sources:
+            condition = next((c for c in branch.get('conditionalEffects') or () if str(c.get('sourcePath') or source)==str(raw.get('sourcePath') or source)),None)
+            from .runtime_adapters import passive_incarnon_condition
+            if condition and ((not condition.get('conditions') and not condition.get('runtimeScripts'))
+                              or passive_incarnon_condition(condition)):
+                effect = ModEffect.from_export(raw,0,source_path=source)
+                if effect.supported:
+                    effects.append(effect)
+                    modeled_sources.add(str(raw.get('sourcePath') or source))
+                    continue
+            if str(raw.get('sourcePath') or source) not in modeled_sources:
+                unsupported.append(f'incarnon-{branch.get("id")}-conditional-source-excluded')
+            continue
+        gate = _incarnon_expected_weight(str(raw.get("sourcePath") or source))
+        if gate == "headshot_only":
+            # Ammo efficiency that lands only on headshots earns nothing under
+            # the headshot=0 benchmark (and the sim's body-aim fights).
+            unsupported.append(
+                f"incarnon-{branch.get('id')}-headshot-gate-excluded-no-aim"
+            )
+            continue
+        if gate == "no_crit_no_proc":
+            # "+X% on hits that neither crit nor status" (Evolution V family).
+            # Under the optimistic panel/optimizer view the build is assumed to
+            # be critting, which this perk's gate excludes — mirroring wfsim's
+            # AssumedMax treatment of mutually-exclusive gates it contributes
+            # its expected value only in the emergent simulation, so the panel
+            # drops it (docs/MECHANICS.md §Incarnon evolutions).
+            unsupported.append(
+                f"incarnon-{branch.get('id')}-no-crit-no-proc-gate-excluded-from-panel"
+            )
+            continue
+        # ── 灵化进化 SubUpgrade（子词条）语义分层 ─────────────────────────
+        # 主进化文件的 SubUpgrades 子词条分两类（引擎语义按 gate 元数据区分）：
+        #   1) 无条件常驻（无 UpgradeDuration/MaxConditionalStacks，如
+        #      BoltorEvoTier1ASubMod 的穿透+4/散布-40%）——游戏内就是常驻
+        #      属性，直接进面板。
+        #   2) 条件叠层（带 UpgradeChance/UpgradeDuration/MaxConditionalStacks，
+        #      如 BoltorEvoTier1BSubMod 的「装填时每秒+2伤害，最多4层，
+        #      持续5s」）——事件/条件触发，绝不按常驻进面板（用户报告的
+        #      「触发类按常驻算」问题的通用防线）；条件语义由
+        #      trigger_specs 事件模拟承载（见 _incarnon_trigger_sources）。
+        if raw.get("isSubUpgrade"):
+            has_gate = (
+                raw.get("UpgradeDuration") is not None
+                or raw.get("MaxConditionalStacks") is not None
+                or (
+                    isinstance(raw.get("UpgradeChance"), (int, float))
+                    and not isinstance(raw.get("UpgradeChance"), bool)
+                    and float(raw.get("UpgradeChance")) < 1.0
+                )
+            )
+            if has_gate:
+                unsupported.append(
+                    f"incarnon-{branch.get('id')}-sub-upgrade-conditional-excluded"
+                    f"({'UpgradeChance' if raw.get('UpgradeChance') is not None else 'conditional'}"
+                    f":{str(raw.get('sourcePath') or '').rsplit('/', 1)[-1]})"
+                )
+                continue
+            # 无条件子词条：fall through 按常驻词条处理。
+        effect = ModEffect.from_export(raw, 0, source_path=source)
+        if effect.supported:
+            effects.append(effect)
+        else:
+            unsupported.append(
+                f"incarnon-{branch.get('id')}-{effect.upgrade_type}-not-evaluated"
+            )
+    if any(str(c.get('sourcePath') or source) not in modeled_sources
+           for c in branch.get('conditionalEffects') or ()):
+        unsupported.append(f"incarnon-{branch.get('id')}-conditional-effects-not-applied")
+    if branch.get("runtimeScripts") and not any(verified_incarnon_condition(branch, c) for c in branch.get('conditionalEffects') or ()):
+        unsupported.append(f"incarnon-{branch.get('id')}-runtime-scripts-not-applied")
+    if branch.get("unresolvedReferences"):
+        unsupported.append(f"incarnon-{branch.get('id')}-unresolved-references")
+    return effects, unsupported
+
+
+def _branch_trigger_specs(branch: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Export only identified events; a duration alone does not imply on-hit."""
+    from .manual_combat import condition_kind
+    from .runtime_adapters import verified_incarnon_condition
+    specs=[]
+    for condition in branch.get('conditionalEffects') or []:
+        verified=verified_incarnon_condition(branch, condition)
+        if verified:condition=verified
+        if condition.get('runtimeScripts'):continue
+        kind=condition.get('eventKind') or condition_kind(condition)
+        if not kind:continue
+        source=str(condition.get('sourcePath') or branch.get('path') or '')
+        terms=condition.get('effects') or []
+        spec={'id':'incarnon-'+str(branch.get('id'))+'-'+source.rsplit('/',1)[-1],
+              'label':'灵化·'+str(branch.get('id')),'kind':kind,
+              'perEvent':float(condition.get('chance') or 1.),
+              'maxStacks':float(condition.get('maxStacks') or 1.),
+              'duration':float(condition.get('duration') or 0.)}
+        if condition.get('resetOn'):
+            spec['resetOn']=list(condition['resetOn'])
+        if condition.get('conditionText'):
+            spec['conditionText']=condition['conditionText']
+        damage=sum(float(e.get('valuePerRank') or 0.) for e in terms if e.get('upgradeType')=='WEAPON_DAMAGE_AMOUNT')
+        if damage:spec['damagePerStack']=damage
+        specs.append(spec)
+    return specs
+
+
+def _incarnon_actor_effects(branch, scenario, weapon):
+    from .runtime_adapters import verified_incarnon_condition, incarnon_actor_stacks
+    effects = []
+    for raw in branch.get('conditionalEffects') or ():
+        condition = verified_incarnon_condition(branch,raw)
+        if not condition or not (condition.get('actorGate') or condition.get('energyGate')):
+            continue
+        stacks = (min(float(condition.get('maxStacks') or 1),
+                      math.floor(scenario.combat_state.get('energySpent',0)/condition['energyGate']))
+                  if condition.get('energyGate') else incarnon_actor_stacks(condition,scenario,weapon))
+        if stacks<=0:
+            continue
+        for term in condition.get('effects') or ():
+            effect = ModEffect.from_export(term,0,source_path=condition.get('sourcePath') or branch.get('path'))
+            if effect.supported:
+                effects.append(replace(effect,value=effect.value*stacks))
+    return effects
+
+
+# Incarnon evolution perks whose exported effect rows are UNCONDITIONAL but the
+# in-game perk is gated on a hit condition (wfsim docs/MECHANICS.md §Incarnon
+# evolutions, AGPL-3.0 — see THIRD_PARTY_NOTICES.md).  The export carries no
+# condition marker, so the gate is recognised by sourcePath and the effect is
+# re-weighted to its expected share of hits.
+#
+#   EvoPistolDamageOnNoCritAndNoProcHit — "Evolution V: +400% damage on hits
+#     that neither crit nor status" → expected weight = (1-cc)·(1-sc).
+#   EvoPistolAmmoEfficiencyOnHeadshot — ammo efficiency only lands on
+#     headshots → a no-aim benchmark (headshot=0) earns nothing.
+_INCARNON_NO_CRIT_NO_PROC_SOURCES = {
+    "/Lotus/Upgrades/Evolutions/Pistol/EvoPistolDamageOnNoCritAndNoProcHit",
+}
+_INCARNON_HEADSHOT_ONLY_SOURCES = {
+    "/Lotus/Upgrades/Evolutions/Pistol/EvoPistolAmmoEfficiencyOnHeadshot",
+    "/Lotus/Upgrades/Evolutions/Rifle/EvoRifleAmmoEfficiencyOnHeadshot",
+}
+
+
+def _incarnon_expected_weight(source: str) -> str | None:
+    """Classify one evolution effect's hit-gate for expected-value weighting."""
+    if source in _INCARNON_NO_CRIT_NO_PROC_SOURCES:
+        return "no_crit_no_proc"
+    if source in _INCARNON_HEADSHOT_ONLY_SOURCES:
+        return "headshot_only"
+    return None
+
+
+def _incarnon_card(
+    weapon: Mapping[str, Any],
+    requested: Any,
+    *,
+    scenario: Scenario,
+    metric: str,
+    policy: Mapping[str, Any] | None = None,
+    build_label: str | None = None,
+) -> tuple[_Card | None, dict[str, str], list[str], dict[str, Any]]:
+    incarnon = weapon.get("incarnon") or {}
+    tiers = incarnon.get("tiers") or () if isinstance(incarnon, Mapping) else ()
+    tier_rows = tiers if isinstance(tiers, list) else []
+    requested_map = requested if isinstance(requested, Mapping) else {}
+    normalized: dict[int, str] = {}
+    for key, value in requested_map.items():
+        tier = _tier_number(key)
+        if tier is None or not str(value).strip():
+            continue
+        if tier in normalized:
+            raise SimulationError(f"duplicate incarnon tier choice: tier{tier}")
+        normalized[tier] = str(value).strip()
+
+    # An explicit route is a user/account state, not a hint.  Reject choices for
+    # absent or fixed tiers before the automatic policy/objective fallback runs.
+    available_tiers: set[int] = set()
+    for raw_tier in tier_rows:
+        if not isinstance(raw_tier, Mapping):
+            continue
+        tier = _tier_number(raw_tier.get("tier"))
+        branches = [
+            branch
+            for branch in (raw_tier.get("branches") or ())
+            if isinstance(branch, Mapping)
+        ]
+        if tier in {2, 3, 4, 5} and (
+            raw_tier.get("selectable") is True or len(branches) > 1
+        ):
+            available_tiers.add(tier)
+    unavailable = sorted(set(normalized) - available_tiers)
+    if unavailable:
+        raise SimulationError(
+            "incarnon tier choice unavailable for this weapon: "
+            + ", ".join(f"tier{tier}" for tier in unavailable)
+        )
+    if not tier_rows:
+        return None, {}, [], {}
+    defaults = DEFAULT_INCARNON_CHOICES.get(str(weapon.get("path") or ""), {})
+    selected_effects: list[ModEffect] = []
+    selected_triggers: list[dict[str, Any]] = []
+    selected: dict[str, str] = {}
+    unsupported: list[str] = []
+    policy_route: Mapping[str, Any] = {}
+    policy_meta: dict[str, Any] = {}
+    policy_used: list[str] = []
+
+    if policy:
+        adapter = str(incarnon.get("adapter") or "")
+        adapter_key = _path_basename(adapter)
+        policy_meta = {
+            "adapter": adapter,
+            "strategyKey": adapter_key,
+            "sampledAt": policy.get("sampledAt"),
+            "gameBuild": policy.get("gameBuild"),
+            "matched": False,
+        }
+        if policy.get("gameBuild") != build_label:
+            policy_meta["reason"] = "build-mismatch"
+            unsupported.append("incarnon-policy-build-mismatch")
+        elif not adapter_key:
+            policy_meta["reason"] = "weapon-adapter-missing"
+            unsupported.append("incarnon-policy-adapter-missing")
+        else:
+            strategies = policy.get("strategies") or {}
+            match = next(
+                (
+                    (key, value)
+                    for key, value in strategies.items()
+                    if str(key).casefold() == adapter_key.casefold()
+                    and isinstance(value, Mapping)
+                ),
+                None,
+            )
+            if match is None:
+                policy_meta["reason"] = "strategy-not-found"
+                unsupported.append(f"incarnon-policy-{adapter_key}-not-found")
+            else:
+                strategy_key, strategy = match
+                route = strategy.get("route") or {}
+                if isinstance(route, Mapping):
+                    policy_route = route
+                policy_meta.update(
+                    {
+                        "strategyKey": str(strategy_key),
+                        "objective": strategy.get("objective"),
+                        "confidence": strategy.get("confidence"),
+                        "sources": strategy.get("sources")
+                        or [
+                            f"{str(policy.get('sourceBase')).rstrip('/')}/{build['id']}/"
+                            for build in strategy.get("builds") or ()
+                            if isinstance(build, Mapping) and build.get("id") is not None
+                        ]
+                        + ([str(policy.get("regionalSource"))] if policy.get("regionalSource") else []),
+                        "builds": strategy.get("builds") or [],
+                        "alternatives": strategy.get("alternatives") or [],
+                        "sourceKind": policy.get("sourceKind") or "whole-build-votes",
+                        "selectionMode": "community-default",
+                        "matched": True,
+                    }
+                )
+
+    for raw_tier in tier_rows:
+        if not isinstance(raw_tier, Mapping):
+            continue
+        tier = _tier_number(raw_tier.get("tier"))
+        if tier == 1:
+            for fixed in raw_tier.get('branches') or ():
+                selected_effects.extend(_incarnon_actor_effects(fixed,scenario,weapon))
+            continue
+        branches = [
+            branch for branch in (raw_tier.get("branches") or ())
+            if isinstance(branch, Mapping)
+        ]
+        if tier is None or not branches:
+            continue
+        policy_choice = policy_route.get(f"tier{tier}") or policy_route.get(str(tier))
+        wanted = (
+            normalized.get(tier)
+            or policy_choice
+            or defaults.get(f"tier{tier}")
+            or defaults.get(str(tier))
+        )
+        branch = next(
+            (
+                item for item in branches
+                if wanted
+                and wanted in {
+                    str(item.get("id") or ""),
+                    str(item.get("path") or ""),
+                }
+            ),
+            None,
+        )
+        # Keep the offline/UI contract friendly: `tier2=1` means the first
+        # visible branch, while exports and policy use stable `2-1` IDs.
+        if branch is None and wanted:
+            try:
+                branch_index = int(str(wanted).strip())
+            except (TypeError, ValueError):
+                branch_index = 0
+            if branch_index > 0:
+                branch = next(
+                    (
+                        item
+                        for position, item in enumerate(branches, start=1)
+                        if int(item.get("index") or position) == branch_index
+                    ),
+                    None,
+                )
+        if wanted and branch is None:
+            # An explicit UI choice must never silently turn into an automatic
+            # choice: the response would otherwise score a different build.
+            if normalized.get(tier):
+                raise SimulationError(
+                    f"incarnon tier {tier} choice {wanted!r} was not found"
+                )
+            unsupported.append(f"incarnon-tier{tier}-choice-{wanted}-not-found")
+
+        if branch is None:
+            best_score = -math.inf
+            for candidate in branches:
+                candidate_effects, _ = _branch_effects(candidate)
+                candidate_effects.extend(_incarnon_actor_effects(candidate,scenario,weapon))
+                trial = ModEffectList([*selected_effects, *candidate_effects])
+                try:
+                    stats = apply_mods(weapon, trial, scenario=scenario)
+                    events = evaluate_projectile_events(
+                        weapon, trial, scenario=scenario
+                    )
+                    candidate_score = _score(stats, metric, events)
+                    if weapon.get('slot') in {'primary','secondary','arch_gun'} and metric not in {'shotDamage','perShot','burstDps'}:
+                        from .manual_combat import prepare
+                        from .combat_replay import replay
+                        modes=weapon.get('__baseFireModes__') or weapon.get('fireModes') or []
+                        full_weapon={**weapon,'fireModes':modes,'incarnon':{**incarnon,'tiers':[t for t in tier_rows if _tier_number(t.get('tier'))<=tier]}}
+                        route={**selected,f'tier{tier}':str(candidate.get('id') or candidate['path'])}
+                        combat=prepare(dict(weapon=full_weapon,effects=trial,scenario=scenario,
+                                            fire_mode=weapon.get('__selectedFireMode__',0)),[],[],
+                                       cycle_enabled=scenario.incarnon_cycle,assumed=False,incarnon_choices=route)
+                        replayed=replay(stats,dict(health=1e12,shield=0.,armour=0.,overguard=0.,baseLevel=1),
+                                        attacks_per_second=stats.sustained_attack_rate,window_seconds=30.,
+                                        combat=combat,trigger_sources=combat['trigger_sources'],collect_timeline=False)
+                        candidate_score=(replayed['directWindow']+replayed['dotWindow']+replayed['nonDotWindow'])/30.
+                except (TypeError, ValueError):
+                    candidate_score = -math.inf
+                if branch is None or candidate_score > best_score:
+                    best_score, branch = candidate_score, candidate
+            mode='event' if weapon.get('slot') in {'primary','secondary','arch_gun'} and metric not in {'shotDamage','perShot','burstDps'} else 'static'
+            unsupported.append(f"incarnon-tier{tier}-auto-selected-{mode}-objective")
+
+        assert branch is not None
+        branch_effects, branch_unsupported = _branch_effects(branch)
+        branch_effects.extend(_incarnon_actor_effects(branch,scenario,weapon))
+        selected_effects.extend(branch_effects)
+        unsupported.extend(branch_unsupported)
+        # 条件 SubUpgrade 子词条 → 触发规格（事件化叠层，进 trigger_specs）。
+        branch_triggers = _branch_trigger_specs(branch)
+        selected_triggers.extend(branch_triggers)
+        selected[f"tier{tier}"] = str(branch.get("id") or branch.get("path") or "")
+        if policy_choice and not normalized.get(tier) and selected[f"tier{tier}"] == policy_choice:
+            policy_used.append(f"tier{tier}")
+
+    if policy_meta:
+        policy_meta["appliedTiers"] = policy_used
+
+    if not selected_effects and not selected:
+        return None, selected, unsupported, policy_meta
+    return (
+        _Card(
+            key="__incarnon__",
+            record=None,
+            rank=0,
+            effects=tuple(selected_effects),
+            skipped=(),
+            drain=0,
+            polarity=None,
+            trigger_specs=tuple(selected_triggers),
+            incarnon_choices=tuple(selected.items()),
+        ),
+        selected,
+        unsupported,
+        policy_meta,
+    )
+
+
+# Incarnon effects the analysis' replay does not score: the neutral Riven
+# maluses (recoil, zoom, reserve ammo), holster reload (the weapon stays
+# drawn), Incarnon charge gain (the form counts as permanent), noise, and
+# avatar movement or ability effects.
+ROUTE_NEUTRAL_UPGRADE_TYPES = frozenset({
+    "NONE", "WEAPON_RECOIL", "WEAPON_ZOOM", "WEAPON_AMMO_MAX", "WEAPON_AUTO_RELOAD_RATE",
+    "WEAPON_ADD_CHARGE_COUNTER_MULTIPLIER", "WEAPON_NOISE_REDUCTION",
+})
+
+
+def _route_neutral_branch(branch: Mapping[str, Any]) -> bool:
+    """A branch that cannot change an analysis score (nothing to screen)."""
+    if branch.get("runtimeScripts") or branch.get("conditionalEffects") or any(
+        isinstance(source, Mapping) and source.get("conditionalEffects") for source in branch.get("sources") or ()
+    ):
+        return False
+    effects, _ = _branch_effects(branch)
+    return all(effect.upgrade_type in ROUTE_NEUTRAL_UPGRADE_TYPES
+               or effect.upgrade_type.startswith(("AVATAR_", "SKILL_")) for effect in effects)
+
+
+def _route_options(weapon: Mapping[str, Any], choices: Mapping[str, str]) -> list[tuple[str, list[str]]]:
+    """Per selectable tier of a resolved route: the chosen branch and every
+    other branch that can change a score. Tiers with nothing to compare are
+    left out."""
+    incarnon = weapon.get("incarnon") or {}
+    tiers = incarnon.get("tiers") if isinstance(incarnon, Mapping) else None
+    options: list[tuple[str, list[str]]] = []
+    for raw_tier in tiers if isinstance(tiers, list) else ():
+        if not isinstance(raw_tier, Mapping):
+            continue
+        key = f"tier{_tier_number(raw_tier.get('tier'))}"
+        chosen = choices.get(key)
+        branches = [branch for branch in raw_tier.get("branches") or () if isinstance(branch, Mapping)]
+        if chosen is None or len(branches) < 2:
+            continue
+        ids = [str(branch.get("id") or branch.get("path") or "") for branch in branches]
+        if chosen not in ids:
+            continue
+        row = [chosen] + [branch_id for branch_id, branch in zip(ids, branches)
+                          if branch_id != chosen and not _route_neutral_branch(branch)]
+        if len(row) > 1:
+            options.append((key, row))
+    return options
+
+
+def _arcane_matches_weapon(
+    arcane: Mapping[str, Any], weapon: Mapping[str, Any]
+) -> bool:
+    """Allow frame-owned Arcanes when the export declares weapon effects.
+
+    Several weapon buffs are installed on ``PowerSuits/PlayerPowerSuit`` in
+    the game data (Avenger, Fury, Rage, etc.).  The authoritative
+    ``support.weaponEffects`` count distinguishes those from frame-only
+    effects; ``validType`` and upgrade qualifiers are still enforced later by
+    ``apply_mods``.
+    """
+    if arcane.get("equipmentType") == "Kitgun Arcane":
+        ancestry = " ".join(str(p) for p in weapon.get("ancestry") or ()).casefold()
+        if "modular" not in ancestry and not weapon.get("kitgunParts"):
+            return False
+    from .damage import archgun_arcane_type_applies
+    if archgun_arcane_type_applies(weapon, arcane.get("path"), arcane.get("compatibility")):
+        return True
+    if _mod_matches_weapon(arcane, weapon):
+        return True
+    if not _frame_owned_arcane(arcane):
+        return False
+    support = arcane.get("support")
+    if not isinstance(support, Mapping):
+        return False
+    try:
+        if int(support.get("weaponEffects") or 0) <= 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    # Only where one of its weapon effects lands: Arcane Precision is for
+    # secondaries, Fury for melee, Arachne for guns (arcane_runtime).
+    from .arcane_runtime import scope_applies, weapon_scopes
+    return scope_applies(weapon_scopes(arcane), weapon)
+
+
+def _frame_owned_arcane(arcane: Mapping[str, Any]) -> bool:
+    compatibility = str(arcane.get("compatibility") or "").replace("\\", "/")
+    return compatibility.strip("/").casefold().endswith("powersuits/playerpowersuit")
+
+
+def _expected_capped_poisson(mean: float, limit: int) -> float:
+    """Expected ``min(Poisson(mean), limit)`` without external dependencies."""
+    if mean <= 0 or limit <= 0:
+        return 0.0
+    probability = math.exp(-mean)
+    cumulative = probability
+    expected = 0.0
+    for count in range(1, limit + 1):
+        expected += max(0.0, 1.0 - cumulative)
+        probability *= mean / count
+        cumulative = min(1.0, cumulative + probability)
+    return min(float(limit), expected)
+
+
+def _expected_arcane_state(
+    arcane: Mapping[str, Any], event_rate: float, elapsed: float | None
+) -> tuple[int, float, float, float, dict[str, Any]]:
+    trigger = arcane.get("trigger")
+    if not isinstance(trigger, Mapping):
+        raise SimulationError(
+            f"arcane {arcane.get('nameEn') or arcane.get('path') or '?'} "
+            "has no exported trigger model"
+        )
+    chance = _number("arcane trigger chance", trigger.get("chance"), 1.0)
+    duration = _number("arcane trigger duration", trigger.get("duration"), 0.0)
+    if not 0 <= chance <= 1:
+        raise SimulationError("arcane trigger chance must be between zero and one")
+    if duration <= 0:
+        raise SimulationError("arcane trigger duration must be positive")
+    if trigger.get("durationScalesWithRank"):
+        raise SimulationError("rank-scaled Arcane trigger duration is not evaluated")
+    maximum = trigger.get("maxStacks")
+    if maximum is None:
+        limit = 1
+    elif isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+        raise SimulationError("arcane max stacks must be a positive integer")
+    else:
+        limit = maximum
+
+    window = duration if elapsed is None else min(duration, max(0.0, elapsed))
+    mean = event_rate * chance * window
+    active_uptime = 1.0 - math.exp(-mean) if mean else 0.0
+    expected_stacks = _expected_capped_poisson(mean, limit)
+    applied_stacks = math.ceil(expected_stacks) if expected_stacks else 0
+    effect_uptime = expected_stacks / applied_stacks if applied_stacks else 0.0
+    # conditionTag 为空时回退 conditions 数组（Primary Crux 家族的
+    # OnWeakpointHitCondition 只出现在 conditions 里）。
+    condition_bits = [str(trigger.get("conditionTag") or "")]
+    trigger_conditions = trigger.get("conditions")
+    if isinstance(trigger_conditions, (list, tuple)):
+        condition_bits.extend(str(item) for item in trigger_conditions)
+    return applied_stacks, effect_uptime, expected_stacks, active_uptime, {
+        "triggerChance": chance,
+        "durationSeconds": duration,
+        "maxStacks": limit,
+        "stackMode": str(trigger.get("stackMode") or ""),
+        "triggerCondition": " ".join(bit for bit in condition_bits if bit),
+    }
+
+
+def _arcane_card(
+    records: Sequence[Mapping[str, Any]],
+    requested: Any,
+    weapon: Mapping[str, Any],
+    *,
+    elapsed: float | None = None,
+    default_heavy_state: bool = False,
+) -> tuple[_Card | None, list[dict[str, Any]], list[str]]:
+    if requested is None:
+        return None, [], []
+    if not isinstance(requested, list):
+        raise SimulationError("arcanes must be an array")
+
+    combined: list[ModEffect] = []
+    skipped: list[str] = []
+    states: list[dict[str, Any]] = []
+    unsupported: list[str] = []
+    event_arcanes = []
+    weapon_arcane_count = 0
+    frame_arcane_count = 0
+    queries: list[str] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(requested):
+        if not isinstance(raw, Mapping):
+            raise SimulationError(f"arcane state {index} must be an object")
+        query_raw = raw.get("query") or raw.get("path")
+        if not isinstance(query_raw, str) or not query_raw.strip():
+            raise SimulationError(f"arcane state {index} query is empty")
+        query = query_raw.strip()
+        query_key = query.casefold()
+        if query_key in seen:
+            raise SimulationError(f"duplicate arcane query: {query!r}")
+        seen.add(query_key)
+        queries.append(query)
+
+    for index, (raw, query) in enumerate(zip(requested, queries)):
+        requested_rank = raw.get("rank")
+        if requested_rank is not None and (
+            isinstance(requested_rank, bool)
+            or not isinstance(requested_rank, int)
+            or requested_rank < 0
+        ):
+            raise SimulationError(f"arcane {query!r} rank must be non-negative")
+        wire_rank = requested_rank if requested_rank is not None else 0
+        requested_stacks = raw.get("stacks", 0)
+        if (
+            isinstance(requested_stacks, bool)
+            or not isinstance(requested_stacks, int)
+            or requested_stacks < 0
+        ):
+            raise SimulationError(f"arcane {query!r} stacks must be non-negative")
+        wire_stacks = requested_stacks
+        requested_uptime = raw.get("uptime", 1.0)
+        if (
+            isinstance(requested_uptime, bool)
+            or not isinstance(requested_uptime, (int, float))
+            or not math.isfinite(float(requested_uptime))
+            or not 0 <= float(requested_uptime) <= 1
+        ):
+            raise SimulationError(
+                f"arcane {query!r} uptime must be finite and between zero and one"
+            )
+        wire_uptime = float(requested_uptime)
+        requested_rate = raw.get("triggerRate")
+        if requested_rate is not None:
+            if "stacks" in raw or "uptime" in raw:
+                raise SimulationError(
+                    f"arcane {query!r} triggerRate cannot be combined with stacks or uptime"
+                )
+            requested_rate = _number(
+                f"arcane {query!r} trigger rate", requested_rate
+            )
+            if requested_rate < 0:
+                raise SimulationError(
+                    f"arcane {query!r} trigger rate must be non-negative"
+                )
+        state: dict[str, Any] = {
+            "query": query,
+            "rank": wire_rank,
+            "stacks": wire_stacks,
+            "uptime": wire_uptime,
+            "mode": "expected" if requested_rate is not None else "manual",
+            "triggerRate": requested_rate or 0.0,
+            "expectedStacks": wire_stacks * wire_uptime,
+            "expectedUptime": wire_uptime if wire_stacks else 0.0,
+            "active": False,
+            "effectCount": 0,
+            "applied": False,
+        }
+        states.append(state)
+        if not records:
+            raise SimulationError(
+                f"arcane {query!r} cannot be resolved: arcane export is unavailable"
+            )
+        try:
+            arcane = resolve_record(records, query, kind="arcane")
+        except SimulationError:
+            raise SimulationError(f"arcane {query!r} was not found")
+
+        state.update(record_identity(arcane))
+        max_rank = arcane.get("maxRank")
+        if (
+            requested_rank is not None
+            and isinstance(max_rank, int)
+            and requested_rank > max_rank
+        ):
+            raise SimulationError(
+                f"arcane {query!r} ranks to {max_rank}, got rank {requested_rank}"
+            )
+        if requested_rank is None:
+            state["rank"] = max_rank if max_rank is not None else 0
+        from .enervate import configuration
+        enervate_spec = configuration(arcane, int(state['rank']))
+        trigger = arcane.get("trigger")
+        if enervate_spec:
+            trigger = {**(trigger or {}), 'duration': None, 'maxStacks': None}
+        if isinstance(trigger, Mapping):
+            # conditionTag 为空时回退 conditions 数组（同 _expected_trigger_state）。
+            _cond_bits = [str(trigger.get("conditionTag") or "")]
+            _trigger_conditions = trigger.get("conditions")
+            if isinstance(_trigger_conditions, (list, tuple)):
+                _cond_bits.extend(str(item) for item in _trigger_conditions)
+            state.update(
+                {
+                    "triggerChance": _number(
+                        "arcane trigger chance", trigger.get("chance"), 1.0
+                    ),
+                    "durationSeconds": _number(
+                        "arcane trigger duration", trigger.get("duration"), 0.0
+                    ),
+                    "maxStacks": int(trigger.get("maxStacks") or 1),
+                    "stackMode": str(trigger.get("stackMode") or ""),
+                    "triggerCondition": " ".join(bit for bit in _cond_bits if bit),
+                }
+            )
+        implicit_heavy_state = (
+            default_heavy_state and not enervate_spec
+            and requested_rate is None
+            and "stacks" not in raw
+            and "uptime" not in raw
+        )
+        if implicit_heavy_state:
+            limits = [
+                int(conditional.get("maxStacks") or 1)
+                for conditional in arcane.get("conditionalEffects") or ()
+                if isinstance(conditional, Mapping)
+                and isinstance(conditional.get("maxStacks", 1), int)
+                and not isinstance(conditional.get("maxStacks", 1), bool)
+            ]
+            wire_stacks = int(
+                (trigger.get("maxStacks") if isinstance(trigger, Mapping) else 0)
+                or (max(limits) if limits else 0)
+            )
+            wire_uptime = 1.0
+            state.update(
+                {
+                    "stacks": wire_stacks,
+                    "uptime": wire_uptime,
+                    "mode": "manual-default-max",
+                    "expectedStacks": float(wire_stacks),
+                    "expectedUptime": 1.0 if wire_stacks else 0.0,
+                    "maxStacks": wire_stacks,
+                }
+            )
+        if not _arcane_matches_weapon(arcane, weapon):
+            unsupported.append(f"arcane-state-{index}-incompatible-with-weapon")
+            continue
+        if _frame_owned_arcane(arcane):
+            frame_arcane_count += 1
+            if frame_arcane_count > 2:
+                raise SimulationError("at most two frame-owned Arcanes may be selected")
+        else:
+            weapon_arcane_count += 1
+            if weapon_arcane_count > (2 if weapon.get("slot") == "arch_gun" else 1):
+                raise SimulationError("weapon Arcane slot limit exceeded")
+        if arcane.get("unresolvedReferences"):
+            unsupported.append(f"arcane-state-{index}-has-unresolved-references")
+            continue
+        effect_stacks = wire_stacks
+        effect_uptime = wire_uptime
+        if requested_rate is not None and not enervate_spec:
+            (
+                effect_stacks,
+                effect_uptime,
+                expected_stacks,
+                expected_uptime,
+                trigger_state,
+            ) = _expected_arcane_state(arcane, requested_rate, elapsed)
+            state.update(trigger_state)
+            state["stacks"] = effect_stacks
+            state["uptime"] = expected_uptime
+            state["expectedStacks"] = expected_stacks
+            state["expectedUptime"] = expected_uptime
+        from .runtime_adapters import compression_configuration
+        compression_spec = compression_configuration(arcane, int(state['rank']))
+        if compression_spec and raw.get('stacks') == 0:
+            effect_uptime = 0.0
+        try:
+            effects = arcane_effects(
+                arcane,
+                rank=raw.get("rank"),
+                stacks=effect_stacks,
+                uptime=effect_uptime,
+            )
+        except (TypeError, ValueError) as exc:
+            state["error"] = str(exc)
+            unsupported.append(f"arcane-state-{index}-invalid-not-applied")
+            continue
+        from .status_arcanes import configuration as status_configuration
+        status_spec = status_configuration(arcane, int(state['rank']))
+        if status_spec:
+            status_uptime = 0.0 if raw.get('stacks') == 0 else wire_uptime
+            state.update(active=status_uptime>0, applied=True, effectCount=1, mode='events',
+                         eventModel=status_spec['kind'], expectedUptime=status_uptime)
+            state.pop('error', None)
+        if enervate_spec:
+            state.update(durationSeconds=None,maxStacks=None,stackMode='joint-probability-reset',
+                         mode='explicit-fixed' if 'stacks' in raw else 'events',
+                         resetAfter=enervate_spec['resetAfter'])
+        event_arcanes.append((arcane, int(state["rank"]), dict(raw)))
+        supported_effects = [effect for effect in effects if effect.supported]
+        unsupported_effects = [effect for effect in effects if not effect.supported]
+        if effects.skipped:
+            skipped.extend(effects.skipped)
+        if unsupported_effects:
+            unsupported.append(f"arcane-state-{index}-unsupported-effects-skipped")
+        if effects.skipped:
+            unsupported.append(f"arcane-state-{index}-runtime-effects-skipped")
+        if supported_effects:
+            combined.extend(supported_effects)
+            state["active"] = bool(state["expectedStacks"]) or bool(enervate_spec)
+            state["applied"] = True
+            state["effectCount"] = len(supported_effects)
+            if compression_spec:
+                # Actual ADS and per-attack profile gates resolve downstream.
+                state.update(mode='conditional', triggerCondition='aiming',
+                    eventModel='primary-compression', active=effect_uptime > 0,
+                    expectedUptime=effect_uptime, conditionRequired=True,
+                    triggerDescription='While aiming: lose 80% of the audited attack radius; continuous damage and ammo-efficiency bonuses per metre lost. Unknown profiles are excluded.',
+                    damagePerMeter=compression_spec['damagePerMeter'],
+                    ammoEfficiencyPerMeter=compression_spec['ammoPerMeter'])
+        elif not status_spec:
+            from .manual_combat import modeled_event_kinds
+            event_kinds = modeled_event_kinds(arcane, int(state['rank']))
+            if event_kinds:
+                # Zero starting stacks do not mean the event effect is missing.
+                explicit = 'stacks' in raw or 'uptime' in raw
+                state.update(
+                    applied=True, active=bool(state['expectedStacks']),
+                    mode='explicit-fixed' if explicit else 'events',
+                    eventModel='conditional-effects', eventKinds=event_kinds,
+                )
+            else:
+                state['error'] = 'no supported static effect'
+                unsupported.append(f'arcane-state-{index}-no-supported-effects')
+
+    card = None
+    if combined or skipped or event_arcanes:
+        card = _Card(
+            key="__arcanes__",
+            event_arcanes=tuple(event_arcanes),
+            record=None,
+            rank=0,
+            effects=tuple(combined),
+            skipped=tuple(skipped),
+            drain=0,
+            polarity=None,
+        )
+    return card, states, unsupported
+
+
+def _merge_passives(*cards: _Card | None) -> _Card | None:
+    active = [card for card in cards if card is not None]
+    if not active:
+        return None
+    return _Card(
+        key="__passives__",
+        trigger_specs=tuple(t for c in active for t in c.trigger_specs),
+        event_arcanes=tuple(r for c in active for r in c.event_arcanes),
+        incarnon_choices=tuple(x for c in active for x in c.incarnon_choices),
+        record=None,
+        rank=0,
+        effects=tuple(effect for card in active for effect in card.effects),
+        skipped=tuple(reason for card in active for reason in card.skipped),
+        drain=0,
+        polarity=None,
+    )
+
+
+def _effects(cards: Sequence[_Card], scenario: Scenario) -> ModEffectList:
+    result = ModEffectList()
+    set_counts: dict[str, int] = {}
+    set_shells: dict[str, Mapping[str, Any]] = {}
+    for card in cards:
+        if card.record is None:
+            continue
+        set_id = _set_key(card.record.get("modSet"))
+        if set_id:
+            set_counts[set_id] = set_counts.get(set_id, 0) + 1
+            if card.set_shell is not None:
+                set_shells[set_id] = card.set_shell
+    for card in cards:
+        current = ModEffectList(card.effects, skipped=card.skipped)
+        if card.record is not None:
+            set_id = _set_key(card.record.get("modSet"))
+            pieces = set_counts.get(set_id, 0)
+            if pieces and card.record.get("modSetValues"):
+                multiplier = _buff_set_multiplier(card.record, pieces)
+                if multiplier != 1.0:
+                    current = ModEffectList(
+                        (with_value(effect, effect.value * multiplier) for effect in current),
+                        skipped=current.skipped,
+                    )
+        result.extend(current)
+        result.skipped.extend(current.skipped)
+    for set_id, pieces in set_counts.items():
+        shell = set_shells.get(set_id)
+        if shell is not None:
+            expanded = _set_shell_effects(shell, pieces, scenario)
+            result.extend(expanded)
+            result.skipped.extend(expanded.skipped)
+    return result
+
+
+def _capacity(cards: Sequence[_Card]) -> int:
+    # The theoretical build assumes a Catalyst and enough Forma to match every
+    # equipped polarity.  This is the only account-independent capacity model.
+    return sum(
+        math.ceil(card.drain / 2)
+        if card.polarity and card.polarity != "AP_UNIVERSAL"
+        else card.drain
+        for card in cards
+    )
+
+
+_UMBRA_POLARITIES = frozenset({"AP_UMBRA", "AP_ULTIMATE"})
+
+
+def _slot_polarity(value: Any) -> str | None:
+    token = str(value or "").strip().upper()
+    return None if token in {"", "AP_UNIVERSAL", "AP_NONE", "NONE", "NULL"} else token
+
+
+def _slot_drain(drain: int, polarity: str | None, slot: str | None) -> int:
+    """In-game slot cost: matching halves, mismatching adds 25%, rounded up.
+
+    Negative drains (stances) add capacity instead: matching doubles it,
+    mismatching halves it.
+    """
+    if not polarity or not slot:
+        return drain
+    matched = polarity == slot or "AP_ANY" in (polarity, slot)
+    factor = (0.5 if matched else 1.25) if drain >= 0 else (2.0 if matched else 0.5)
+    adjusted = math.ceil(abs(drain) * factor)
+    return -adjusted if drain < 0 else adjusted
+
+
+@dataclass(frozen=True)
+class FormaItem:
+    """One equipped card for :func:`forma_plan`, at its current slot."""
+
+    origin: int
+    polarity: str | None
+    drain: int
+    elemental: bool = False
+    fixed: bool = False
+
+
+def forma_plan(
+    slots: Sequence[str | None],
+    items: Sequence[FormaItem],
+    *,
+    limit: int,
+    extras: Sequence[Sequence[tuple[int, int, int]]] = (),
+    allow_move: bool = True,
+) -> dict[str, Any]:
+    """The fewest Forma that fit ``items`` into ``limit`` capacity.
+
+    ``slots`` are the slot polarities before this plan. A Forma turns one
+    slot into its card's polarity. ``extras`` are other Forma choices that do
+    not hold a card (stance / Exilus slot): per slot, the alternatives
+    ``(formas, umbra, drain_delta)``, the first one being "leave it".
+
+    Exact DP over slots. Objective, in order: Forma count, cards moved,
+    capacity used. Cards with base elements keep their relative order
+    (it decides which combined elements form); ``fixed`` cards and, with
+    ``allow_move`` off, every card stay in their slot.
+    """
+    n = len(slots)
+    items = [item for item in items if 0 <= item.origin < n]
+    elemental_fixed = not allow_move or any(item.elemental and item.fixed for item in items)
+    fixed_at = {item.origin: index for index, item in enumerate(items)
+                if item.fixed or not allow_move or (item.elemental and elemental_fixed)}
+    pinned = set(fixed_at.values())
+    movable = [index for index in sorted(range(len(items)), key=lambda i: items[i].origin) if index not in pinned]
+    chain = [index for index in movable if items[index].elemental]
+    free = [index for index in movable if not items[index].elemental]
+    bit = {index: 1 << position for position, index in enumerate(free)}
+    full = (1 << len(free)) - 1
+    open_after = [sum(1 for j in range(k + 1, n) if j not in fixed_at) for k in range(n)]
+    layer: dict[tuple[int, int, int, int], tuple[int, Any]] = {(0, 0, 0, 0): (0, None)}
+    history = []
+    for j in range(n):
+        nxt: dict[tuple[int, int, int, int], tuple[int, Any]] = {}
+
+        def push(key: tuple[int, int, int, int], drain: int, back: Any) -> None:
+            if key not in nxt or drain < nxt[key][0]:
+                nxt[key] = (drain, back)
+
+        for key, (drain, _back) in layer.items():
+            e, mask, formas, moves = key
+            if j in fixed_at:
+                options = [(fixed_at[j], e, mask)]
+            else:
+                options = [(None, e, mask)]
+                if e < len(chain):
+                    options.append((chain[e], e + 1, mask))
+                options.extend((index, e, mask | bit[index]) for index in free if not mask & bit[index])
+            for index, e2, mask2 in options:
+                if j not in fixed_at and (len(chain) - e2) + (len(free) - bin(mask2).count("1")) > open_after[j]:
+                    continue
+                if index is None:
+                    push((e2, mask2, formas, moves), drain, (key, None, False))
+                    continue
+                item = items[index]
+                moved = moves + (item.origin != j)
+                push((e2, mask2, formas, moved), drain + _slot_drain(item.drain, item.polarity, slots[j]),
+                     (key, index, False))
+                if item.polarity and _slot_drain(item.drain, item.polarity, slots[j]) != _slot_drain(
+                        item.drain, item.polarity, item.polarity):
+                    push((e2, mask2, formas + 1, moved),
+                         drain + _slot_drain(item.drain, item.polarity, item.polarity), (key, index, True))
+        history.append(nxt)
+        layer = nxt
+    finals = [(key, drain) for key, (drain, _back) in layer.items() if key[0] == len(chain) and key[1] == full]
+    combos = list(itertools.product(*[list(enumerate(options)) for options in extras])) or [()]
+    best = None
+    for key, drain in finals:
+        for combo in combos:
+            formas = key[2] + sum(option[0] for _index, option in combo)
+            used = drain + sum(option[2] for _index, option in combo)
+            fits = used <= limit
+            rank = (not fits, (used if not fits else 0), formas, key[3], used)
+            if best is None or rank < best[0]:
+                best = (rank, key, combo, used, fits)
+    if best is None:
+        return {"formas": 0, "umbra": 0, "moves": 0, "drain": 0, "fits": True,
+                "placement": [None] * n, "forma": [None] * n, "extras": [0] * len(extras)}
+    _rank, key, combo, used, fits = best
+    placement: list[int | None] = [None] * n
+    forma: list[str | None] = [None] * n
+    for j in range(n - 1, -1, -1):
+        _drain, (previous, index, formed) = history[j][key]
+        placement[j] = index
+        if formed:
+            forma[j] = items[index].polarity
+        key = previous
+    umbra = sum(1 for value in forma if value in _UMBRA_POLARITIES) + sum(option[1] for _i, option in combo)
+    return {
+        "formas": sum(1 for value in forma if value) + sum(option[0] for _i, option in combo),
+        "umbra": umbra,
+        "moves": sum(1 for j, index in enumerate(placement) if index is not None and items[index].origin != j),
+        "drain": used,
+        "fits": fits,
+        "placement": placement,
+        "forma": forma,
+        "extras": [index for index, _option in combo],
+    }
+
+
+def _forma_summary(
+    weapon: Mapping[str, Any],
+    cards: Sequence[_Card],
+    riven: _Card | None = None,
+    stance: Mapping[str, Any] | None = None,
+    *,
+    riven_index: int | None = None,
+    exilus: Mapping[str, Any] | None = None,
+    include_placement: bool = False,
+) -> dict[str, Any]:
+    """该配装放进容量所需的最少极化次数（不是逐张都极化）。
+
+    搜索按「每张都已极化匹配」的容量口径进行；实际只需让总消耗不超过
+    容量，所以用 :func:`forma_plan` 求最少极化：非元素 MOD 可以换槽去
+    占原生极性槽，元素 MOD 保持相对顺序。架势槽不匹配时可以极化来提高
+    容量，功能槽不匹配时可以极化来降低消耗；都只在需要时计入。
+    """
+    slots = [_slot_polarity(value) for value in list(weapon.get("polarities") or ())[:8]]
+    slots += [None] * (8 - len(slots))
+    ordered = list(cards)
+    if riven is not None:
+        index = riven_index if isinstance(riven_index, int) and 0 <= riven_index <= len(ordered) else len(ordered)
+        ordered.insert(index, riven)
+    items = [FormaItem(origin=index, polarity=_slot_polarity(card.polarity), drain=int(card.drain),
+                       elemental=bool(_card_elements(card)))
+             for index, card in enumerate(ordered[:8])]
+    extras: list[list[tuple[int, int, int]]] = []
+    kinds: list[str] = []
+    gain = 0
+    if stance and stance.get("path") and not stance.get("builtIn"):
+        gain = int(stance.get("nativeCapacityGain", stance.get("capacityGain")) or 0)
+        matched = int(stance.get("matchedCapacityGain", stance.get("capacityGain")) or 0)
+        if stance.get("polarityRelation") != "matched" and matched > gain:
+            extras.append([(0, 0, 0), (1, 0, gain - matched)])
+            kinds.append("stance")
+    if exilus and exilus.get("polarity") and isinstance(exilus.get("rawDrain"), int):
+        raw = int(exilus["rawDrain"])
+        polarity = _slot_polarity(exilus.get("polarity"))
+        current = _slot_drain(raw, polarity, _slot_polarity(exilus.get("slotPolarity")))
+        matched = _slot_drain(raw, polarity, polarity)
+        if matched < current:
+            extras.append([(0, 0, current), (1, 1 if polarity in _UMBRA_POLARITIES else 0, matched)])
+            kinds.append("exilus")
+        else:
+            extras.append([(0, 0, current)])
+            kinds.append("exilus")
+    plan = forma_plan(slots, items, limit=60 + gain, extras=extras)
+    special = {kind: index for kind, index in zip(kinds, plan["extras"])}
+    regular_slots = sum(1 for value in plan["forma"] if value and value not in _UMBRA_POLARITIES)
+    umbra_slots = sum(1 for value in plan["forma"] if value in _UMBRA_POLARITIES)
+    stance_count = int(special.get("stance", 0) == 1)
+    exilus_count = int(special.get("exilus", 0) == 1)
+    summary = {
+        "regular": regular_slots,
+        "umbra": umbra_slots,
+        "stance": stance_count,
+        "exilus": exilus_count,
+        "total": regular_slots + umbra_slots + stance_count + exilus_count,
+        "fits": plan["fits"],
+        "slots": {str(index): value for index, value in enumerate(plan["forma"]) if value},
+    }
+    if include_placement:
+        placement = []
+        for index, origin in enumerate(plan["placement"]):
+            if origin is None:
+                placement.append(None)
+                continue
+            item = items[origin]
+            slot = plan["forma"][index] or slots[index]
+            placement.append(
+                {"origin": item.origin, "polarity": slot,
+                 "drain": _slot_drain(item.drain, item.polarity, slot)}
+            )
+        summary.update(placement=placement, drain=plan["drain"], limit=60 + gain)
+    return summary
+
+
+def _mod_family(card: _Card) -> str:
+    if card.record is None:
+        return card.key
+    return str(
+        card.record.get("modFamily")
+        or card.record.get("nameTag")
+        or card.record.get("nameEn")
+        or card.record.get("nameInternal")
+        or card.key
+    ).casefold()
+
+
+def _metrics(
+    stats: Any, projectile_events: Mapping[str, Any] | None = None
+) -> dict[str, float]:
+    grimoire = _grimoire_metric_values(stats)
+    if grimoire is not None:
+        return {key: grimoire[key] for key in
+                ('shotDamage','burstDps','sustainedDps','attackDps','heavyDamage','heavyAttackDps')}
+    crit = effective_hit_multiplier(
+        stats.crit_chance, stats.crit_multiplier, stats.noncrit_damage_multiplier
+    )
+    shot = stats.average_hit * stats.multishot
+    result = {
+        "shotDamage": shot,
+        "burstDps": stats.burst_dps * crit,
+        "sustainedDps": stats.sustained_dps * crit,
+        "attackDps": shot * stats.fire_rate,
+        "heavyDamage": (
+            float(stats.heavy_damage)
+            if stats.heavy_damage is not None
+            else stats.average_hit * stats.fire_rate
+        ),
+    }
+    safe_hit = (
+        ((projectile_events or {}).get("totals") or {})
+        .get("averageHit", {})
+        .get("minimum", 0.0)
+    )
+    if isinstance(safe_hit, (int, float)) and not isinstance(safe_hit, bool) and safe_hit > 0:
+        safe_hit = float(safe_hit)
+        burst = safe_hit * stats.fire_rate
+        if stats.magazine and stats.fire_rate:
+            shots = stats.magazine
+            cycle = shots / stats.fire_rate + (stats.reload_time or 0.0)
+            sustained = safe_hit * shots / cycle if cycle else 0.0
+        else:
+            sustained = burst
+        result.update(
+            shotDamage=safe_hit,
+            burstDps=burst,
+            sustainedDps=sustained,
+            attackDps=burst,
+        )
+    result["heavyAttackDps"] = result["heavyDamage"]
+    return result
+
+
+def _bind_combat_inputs(stats, weapon, cards, effects, scenario, passives=None):
+    """Keep the loadout with its stats across beam, Riven and ablation scoring.
+
+    Plain data is picklable by search workers. Runtime resolver closures are
+    built only inside the event evaluation; public stat serialization is unchanged.
+    """
+    from .search_combat import bind
+    bind(stats, weapon, cards, effects, scenario, passives)
+    return stats
+
+
+def _event_window(stats, context, *, score_only=False):
+    from .search_combat import window
+    return window(stats, context, score_only=score_only)
+
+
+def _grimoire_metric_values(stats, context=None):
+    """One original-recipient orb over its native45s availability cycle.
+
+    The exported350 is a packet source, not a physical contact. Shot damage
+    is the admitted orb's direct packets; burst/attack DPS spans its6s life,
+    and sustained metrics pay the full45s alt gate. Status ticks settle in
+    that same cycle through the normal replay, with no invented successor.
+    """
+    data = getattr(stats, '_combat_inputs', None)
+    if not data:
+        return None
+    engine = data['engine']
+    from .projectile_events import grimoire_strategy
+    contract = grimoire_strategy(engine['weapon'], engine['fire_mode'], engine['scenario'].combat_state)
+    if contract is None:
+        return None
+    for reason in contract['unsupported']:
+        if reason not in stats.unsupported:stats.unsupported.append(reason)
+    if not contract['parts']:
+        return dict.fromkeys(('shotDamage','burstDps','attackDps','sustainedDps','targetSustainedDps',
+            'statusSustainedDps','totalSustainedDps','dotSustainedDps','nonDotStatusSustainedDps',
+            'heavyDamage','heavyAttackDps'),0.) | dict(lifetimeSeconds=6.,cycleSeconds=45.)
+    neutral = dict(health=1e15,shield=0.,overguard=0.,armour=0.,baseLevel=1)
+    supplied = context or {}
+    options = {key:value for key,value in supplied.items() if key != 'hardnessNodes'}
+    options.setdefault('target', neutral)
+    options.setdefault('level', 1)
+    # A shot exactly at45 belongs to the next native availability cycle.
+    options['windowSeconds'] = 45.0-1e-7
+    options['headshotChance'] = 0.0
+    replayed = _event_window(stats, options)
+    direct = float(replayed.get('directWindow', 0.))
+    dots = float(replayed.get('dotWindow', 0.))
+    non = float(replayed.get('nonDotWindow', 0.))
+    return dict(shotDamage=direct, burstDps=direct/6., attackDps=direct/6.,
+                sustainedDps=direct/45., targetSustainedDps=direct/45.,
+                statusSustainedDps=(direct+dots+non)/45.,totalSustainedDps=(direct+dots+non)/45.,
+                dotSustainedDps=dots/45.,nonDotStatusSustainedDps=non/45.,
+                heavyDamage=0.,heavyAttackDps=0.,lifetimeSeconds=6.,cycleSeconds=45.)
+
+
+def _score(
+    stats: Any,
+    metric: str,
+    projectile_events: Mapping[str, Any] | None = None,
+    target_context: Mapping[str, Any] | None = None,
+) -> float:
+    if metric in {'shotDamage','perShot','perHit','burstDps','attackDps','sustainedDps',
+                  'targetSustainedDps','statusSustainedDps','totalSustainedDps','heavyDamage','heavyAttackDps'}:
+        grimoire = _grimoire_metric_values(stats, target_context)
+        if grimoire is not None:
+            return float(grimoire['shotDamage' if metric in {'perShot','perHit'} else metric])
+    if metric in {"targetSustainedDps", "statusSustainedDps"}:
+        context = target_context or {}
+        target = context.get("target")
+        target = target if isinstance(target, Mapping) else {}
+        target_kwargs = {
+            key: context[key]
+            for key in (
+                "level",
+                "armour_strip",
+                "elemental_armour_strip",
+                "steel_path",
+                "enemy_enhancements",
+                "hit_location",
+            )
+            if key in context
+        }
+        if _status_native.ENABLED:
+            try:
+                return _status_native.score(
+                    stats, target, target_kwargs,
+                    status_rate_multiplier=float(context.get("statusRateMultiplier") or 1.0),
+                    damage_rate_multiplier=float(context.get("stanceMultiplier") or 1.0),
+                    total=metric == "statusSustainedDps",
+                )
+            except _status_native.Unsupported:
+                pass
+        status = sustained_status_damage(
+            stats,
+            target,
+            attacks_per_second=stats.sustained_attack_rate,
+            status_rate_multiplier=float(context.get("statusRateMultiplier") or 1.0),
+            damage_rate_multiplier=float(context.get("stanceMultiplier") or 1.0),
+            **target_kwargs,
+        )
+        return float(
+            status["totalDps"]
+            if metric == "statusSustainedDps"
+            else status["directDps"]
+        )
+    if metric in {"windowedDps", "windowedTotalDamage", "killsPerMinute"}:
+        # Event-window scores use the caller's complete target and scenario.
+        # Bound loadouts share prepare/replay with manual builds; unbound legacy
+        # panel callers retain their original fallback. KPM is the window rate.
+        context = target_context or {}
+        nodes = context.get("hardnessNodes")
+        if nodes:
+            # Hardness-integrated score: the geometric mean over target-health
+            # nodes (log-uniform hardness), so a 10% gain on any node counts the
+            # same and KPM / window-DPS rankings coincide.
+            # Per-hit randomness is a random target health: damage + noise >=
+            # health is damage >= health - noise. Each node averages two
+            # health points at +-1 baseline spread (2-point Gauss-Hermite),
+            # which turns shots-to-kill steps into a monotone ramp.
+            single = {key: value for key, value in context.items() if key != "hardnessNodes"}
+            from .search_combat import windows
+            contexts = []
+            for node in nodes:
+                scale, spread = float(node["healthScale"]), float(node.get("healthSpread") or 0.0)
+                points = (scale * (1.0 - spread), scale * (1.0 + spread)) if spread > 0 else (scale,)
+                contexts.extend(_with_health_scale(single, point) for point in points)
+            batched = windows(stats, contexts)
+            values = iter(batched) if batched is not None else None
+            field = {"killsPerMinute": "killsPerMinute", "windowedDps": "windowDps",
+                     "windowedTotalDamage": "totalWindowDamage"}[metric]
+            total = weights = 0.0
+            for node in nodes:
+                scale, spread = float(node["healthScale"]), float(node.get("healthSpread") or 0.0)
+                points = (scale * (1.0 - spread), scale * (1.0 + spread)) if spread > 0 else (scale,)
+                value = (sum(float(next(values)[field]) for _ in points) if values is not None else
+                         sum(_score(stats, metric, projectile_events, _with_health_scale(single, point))
+                             for point in points)) / len(points)
+                total += float(node["weight"]) * math.log(max(value, 1e-12))
+                weights += float(node["weight"])
+            return math.exp(total / weights)
+        target = context.get("target")
+        target = target if isinstance(target, Mapping) else None
+        windowed = _event_window(stats, context, score_only=True) if hasattr(stats, "_combat_inputs") else windowed_status_damage(
+            stats,
+            target,
+            attacks_per_second=stats.sustained_attack_rate,
+            window_seconds=float(context.get("windowSeconds") or 5.0),
+            headshot_chance=float(context.get('headshotChance') or (1.0 if context.get('hit_location') == 'head' else 0.0)),
+            status_rate_multiplier=float(context.get("statusRateMultiplier") or 1.0),
+            damage_rate_multiplier=float(context.get("stanceMultiplier") or 1.0),
+            level=context.get("level"),
+            armour_strip=float(context.get("armour_strip") or 0.0),
+            elemental_armour_strip=float(context.get("elemental_armour_strip") or 0.0),
+            steel_path=bool(context.get("steel_path")),
+            enemy_enhancements=context.get("enemy_enhancements"),
+            collect_timeline=False,
+        )
+        if metric == "killsPerMinute":
+            return float(windowed["killsPerMinute"])
+        return float(
+            windowed["windowDps"]
+            if metric == "windowedDps"
+            else windowed["totalWindowDamage"]
+        )
+    return _metrics(stats, projectile_events)[
+        "heavyDamage" if metric == "heavyAttackDps" else metric
+    ]
+
+
+# Target calibration is intentionally independent from the historical KPM
+# ceiling.  The event ledger can now settle multiple deaths inside one coarse
+# integration slice, so pressure is detected from event timing/coverage rather
+# than from a magic 120/240 value.
+TARGET_CALIBRATION_VERSION = "hardness-integrated-v1"
+TARGET_CALIBRATION_MAX_ITERATIONS = 5
+TARGET_CALIBRATION_MIN_FIRST_KILL_SECONDS = 1.0
+# Target hardness is integrated, not chosen. Hardness is the time the weapon's
+# no-Riven baseline needs to kill with body shots, log-uniform over this range
+# (seconds), with a 3-point Gauss-Legendre rule in log space: 1.4 / 4.5 /
+# 14.3 s. Status ramps and strips are time-based, so a time coordinate is fair
+# to beams and snipers alike; integrating over it also averages out
+# shots-to-kill steps. Body shots for every headshot rate: 0% and 100%
+# analyses of a weapon share one target set.
+HARDNESS_TTK_RANGE = (1.0, 20.0)
+# Relative health spread (the baseline's damage noise at the node time) is
+# capped so a node never reaches a non-positive health.
+HEALTH_SPREAD_CAP = 0.5
+_GAUSS_LEGENDRE_3 = ((-math.sqrt(0.6), 5.0 / 18.0), (0.0, 8.0 / 18.0), (math.sqrt(0.6), 5.0 / 18.0))
+# Weak-point-kill feedback branches for the fast/ultra profiles.
+FAST_KILL_BRANCHES = 4
+# Element seeds: the greedy beam fixes one element pairing early, so viral
+# and corrosive builds are also searched from their two component MODs.
+ELEMENT_SEEDS = {"DT_VIRAL": ("DT_FREEZE", "DT_POISON"), "DT_CORROSIVE": ("DT_ELECTRICITY", "DT_POISON")}
+# Every element target the build page offers, by the mods that make it. The
+# analysis' own seed list above stays the two it always searched.
+ELEMENT_TARGET_PARTS = {
+    "DT_EXPLOSION": ("DT_FIRE", "DT_FREEZE"),
+    "DT_RADIATION": ("DT_FIRE", "DT_ELECTRICITY"),
+    "DT_GAS": ("DT_FIRE", "DT_POISON"),
+    "DT_MAGNETIC": ("DT_FREEZE", "DT_ELECTRICITY"),
+    "DT_VIRAL": ("DT_FREEZE", "DT_POISON"),
+    "DT_CORROSIVE": ("DT_ELECTRICITY", "DT_POISON"),
+}
+
+
+def optimize_for_element(
+    weapon: Mapping[str, Any],
+    candidates: Sequence[_Card],
+    riven: _Card | None,
+    *,
+    required_damage_type: str | None = None,
+    **kwargs: Any,
+) -> _Evaluation:
+    """``_optimize`` with an element target that a narrow beam can miss.
+
+    The beam ranks single cards and keeps the best partial builds, so a pure
+    two-element pair (Boltor Prime + viral: nothing cold ranks well alone) may
+    never survive to be combined. Before calling the target infeasible, seed
+    one mod of each component -- the strongest, then the cheapest for tight
+    capacity -- and search again.
+    """
+    try:
+        return _optimize(weapon, candidates, riven, required_damage_type=required_damage_type, **kwargs)
+    except SimulationError as exc:
+        if not required_damage_type or f"damage type {required_damage_type}" not in str(exc):
+            raise
+        failure = exc
+    required = list(kwargs.pop("required_mod_keys", None) or ())
+    forbidden = set(kwargs.get("forbidden_mod_keys") or ())
+    parts = ELEMENT_TARGET_PARTS.get(required_damage_type, (required_damage_type,))
+    tried = set()
+    for prefer in ("strongest", "cheapest"):
+        seeded = list(required)
+        for part in parts:
+            options = [
+                (sum(float(e.value) for e in card.effects if e.damage_type == part), card)
+                for card in candidates
+                if card.key not in forbidden and card.key not in seeded
+                and any(e.damage_type == part and e.upgrade_type == "WEAPON_PERCENT_BASE_DAMAGE_ADDED"
+                        for e in card.effects)
+            ]
+            if not options:
+                break
+            if prefer == "strongest":
+                _, card = max(options, key=lambda item: (item[0], -item[1].drain, item[1].key))
+            else:
+                _, card = min(options, key=lambda item: (item[1].drain, -item[0], item[1].key))
+            seeded.append(card.key)
+        else:
+            if tuple(seeded) in tried:
+                continue
+            tried.add(tuple(seeded))
+            try:
+                return _optimize(weapon, candidates, riven, required_damage_type=required_damage_type,
+                                 required_mod_keys=seeded, **kwargs)
+            except SimulationError:
+                # The unseeded search already ran; a seed that does not fit
+                # (slots, capacity, a family clash) just is not the answer.
+                continue
+    raise failure
+
+
+def proxy_seed_best(
+    weapon: Mapping[str, Any],
+    candidates: Sequence[_Card],
+    riven: _Card | None,
+    incumbent: _Evaluation,
+    *,
+    scenario: Scenario,
+    metric: str,
+    passives: _Card | None = None,
+    slot_count: int = 8,
+    capacity_limit: int = 60,
+    required_damage_type: str | None = None,
+    target_context: Mapping[str, Any] | None = None,
+    profile: str = "standard",
+    required_mod_keys: Sequence[str] | None = None,
+    forbidden_mod_keys: Sequence[str] | None = None,
+    min_fill: int | None = None,
+    max_fill: int | None = None,
+    **_ignored: Any,
+) -> _Evaluation:
+    """``incumbent`` or a better build from the open / viral / corrosive seeds.
+
+    The riven analysis' element seeds (``_optimize_archetype``) for the build
+    page: each seed is searched on the cheap panel proxy
+    (``statusSustainedDps``, beam 4 / shortlist 24) and re-scored with the
+    real metric. The proxy values conditional stacks (Galvanized MODs) at their
+    cap, so it reaches builds whose payoff a beam on the event metric prunes
+    while the build is still weak -- the case element niches do not cover.
+    Measured 2026-10-14 against a level-30 target: niches alone left 35% on
+    Kuva Nukor, the seeds closed it (~0.25 s).
+    """
+    if metric not in {"killsPerMinute", "windowedDps", "windowedTotalDamage"} or not target_context:
+        return incumbent
+    seeds: tuple[tuple[str | None, tuple[str, ...]], ...] = ((None, ()), *ELEMENT_SEEDS.items())
+    if required_damage_type:
+        seeds = ((required_damage_type, ELEMENT_SEEDS.get(required_damage_type, ())),)
+    forbidden = set(forbidden_mod_keys or ())
+    best = incumbent
+    for element, parts in seeds:
+        seeded = list(required_mod_keys or ())
+        for part in parts:
+            options = [(sum(float(e.value) for e in c.effects if e.damage_type == part), c.key)
+                       for c in candidates if any(e.damage_type == part for e in c.effects)
+                       and c.key not in forbidden and c.key not in seeded]
+            if options:
+                seeded.append(max(options)[1])
+        try:
+            found = _optimize(weapon, candidates, riven, scenario=scenario, metric="statusSustainedDps",
+                              passives=passives, beam_width=4, shortlist=24, slot_count=slot_count,
+                              capacity_limit=capacity_limit, required_damage_type=element or required_damage_type,
+                              target_context=target_context, profile=profile, required_mod_keys=seeded,
+                              forbidden_mod_keys=forbidden_mod_keys, min_fill=min_fill, max_fill=max_fill)
+        except SimulationError:
+            continue
+        scored = _evaluate(weapon, found.cards, riven, scenario=scenario, metric=metric, passives=passives,
+                           slot_limit=slot_count, capacity_limit=capacity_limit, target_context=target_context)
+        if scored is None or scored.score <= best.score + 1e-9:
+            continue
+        if required_damage_type and scored.stats.damage_types.get(required_damage_type, 0.0) <= 0:
+            continue
+        best = scored
+    return best
+
+
+def _riven_seed_subsets(base_cards, riven, *, capacity_limit=60, required_mod_keys=(),
+                        forbidden_mod_keys=(), min_fill=None, max_fill=None):
+    """Highest structurally legal keep layer; preserve order and required cards."""
+    required_keys = set(required_mod_keys or ())
+    required = tuple(c for c in base_cards if c.required or c.key in required_keys)
+    optional = tuple(c for c in base_cards if c not in required)
+    maximum = min(len(optional), 7 - len(required))
+    for keep in range(maximum, -1, -1):
+        legal = []
+        for indexes in itertools.combinations(range(len(optional)), keep):
+            selected = {id(c) for c in required} | {id(optional[i]) for i in indexes}
+            cards = tuple(c for c in base_cards if id(c) in selected)
+            if len({_mod_family(c) for c in cards}) != len(cards):
+                continue
+            if validate_build(cards, riven, slot_count=8, capacity_limit=capacity_limit,
+                              required_mod_keys=required_mod_keys, forbidden_mod_keys=forbidden_mod_keys,
+                              min_fill=min_fill, max_fill=max_fill) is None:
+                legal.append(cards)
+        if legal:
+            return legal
+    return []
+
+
+def refine_final_build(
+    weapon: Mapping[str, Any], candidates: Sequence[_Card], riven: _Card | None,
+    incumbent: _Evaluation, *, scenario: Scenario, metric: str,
+    passives: _Card | None = None, slot_count: int = 8, capacity_limit: int = 60,
+    required_damage_type: str | None = None, target_context: Mapping[str, Any] | None = None,
+    profile: str = 'standard', required_mod_keys: Sequence[str] | None = None,
+    forbidden_mod_keys: Sequence[str] | None = None, min_fill: int | None = None,
+    max_fill: int | None = None, max_evaluations: int | None = None,
+    max_rounds: int | None = None, full_neighbourhood: bool = False,
+    deadline_limit: float | None = None,
+) -> _Evaluation:
+    """Refine the final event-scored build, including discarded family variants.
+
+    A single-card ranking cannot choose between ordinary and Galvanized cards
+    for a completed build. The beam collapses those families, and panel seeds
+    arrive after its climb. Revisit both omissions once, after route selection.
+    Fast only checks same-family replacements; standard/deep also check the
+    full legal single-card neighbourhood. This is bounded local search, never
+    a claim of global optimality.
+    """
+    if metric not in {'killsPerMinute', 'windowedDps', 'windowedTotalDamage'} or not target_context:
+        return incumbent
+    fast = profile in {'fast', 'ultra'} and not full_neighbourhood
+    rounds = max_rounds if max_rounds is not None else (1 if fast else 4 if profile == 'deep' else 2)
+    evaluations = 0
+    forbidden = set(forbidden_mod_keys or ())
+    required = set(required_mod_keys or ()) | {c.key for c in candidates if c.required}
+    pool = tuple(c for c in candidates if c.key not in forbidden)
+    constraints = dict(slot_count=slot_count, capacity_limit=capacity_limit,
+                       required_mod_keys=tuple(required), forbidden_mod_keys=forbidden_mod_keys,
+                       min_fill=min_fill, max_fill=max_fill)
+    best = incumbent
+    seen = {tuple(c.key for c in best.cards)}
+    deadline = phase_deadline()
+    if deadline_limit is not None:
+        deadline = min(deadline, deadline_limit)
+    for _ in range(rounds):
+        base = best
+        cards = tuple(base.cards)
+        used = {c.key for c in cards}
+        alternatives: dict[int, list[tuple[float, _Card]]] = {}
+
+        def neighbours():
+            for index, old in enumerate(cards):
+                if old.required or old.key in required:
+                    continue
+                other_families = {_mod_family(c) for i, c in enumerate(cards) if i != index}
+                for new in pool:
+                    if new.key in used or _mod_family(new) in other_families:
+                        continue
+                    if fast and _mod_family(new) != _mod_family(old):
+                        continue
+                    yield (*cards[:index], new, *cards[index + 1:])
+                if not fast:
+                    yield (*cards[:index], *cards[index + 1:])
+            if not fast and len(cards) + bool(riven) < slot_count:
+                families = {_mod_family(c) for c in cards}
+                for new in pool:
+                    if new.key not in used and _mod_family(new) not in families:
+                        yield (*cards, new)
+
+        proposals = neighbours()
+        if max_evaluations is not None:
+            # Visit every slot before spending the bounded budget on its next
+            # candidate. Drops/adds participate early, not after one huge slot.
+            buckets = {}
+            for proposal in proposals:
+                removed = tuple(c.key for c in cards if c.key not in {x.key for x in proposal})
+                bucket = buckets.setdefault(removed, [])
+                if len(proposal) < len(cards):
+                    bucket.insert(0, proposal)
+                else:
+                    bucket.append(proposal)
+            proposals = (p for row in itertools.zip_longest(*buckets.values()) for p in row if p is not None)
+        for proposal in proposals:
+            if expired(deadline) or (max_evaluations is not None and evaluations >= max_evaluations):
+                return best
+            signature = tuple(c.key for c in proposal)
+            if signature in seen or validate_build(proposal, riven, **constraints):
+                continue
+            seen.add(signature)
+            evaluations += 1
+            value = _evaluate(weapon, proposal, riven, scenario=scenario, metric=metric,
+                              passives=passives, slot_limit=slot_count, capacity_limit=capacity_limit,
+                              target_context=target_context, required_damage_type=required_damage_type)
+            if profile == 'deep' and value is not None and len(proposal) == len(cards):
+                changed = [i for i,(before,after) in enumerate(zip(cards,proposal)) if before.key != after.key]
+                if len(changed) == 1:
+                    at = changed[0]
+                    alternatives.setdefault(at, []).append((value.score, proposal[at]))
+            if value is None or value.score <= best.score + 1e-9:
+                continue
+            if required_damage_type and value.stats.damage_types.get(required_damage_type, 0.) <= 0.:
+                continue
+            best = value
+        if best is base:
+            if profile == 'deep':
+                # The strongest bounded pair neighbourhood spans every slot,
+                # rather than exhausting the first pair's arbitrary pool prefix.
+                pairs = []
+                for left,right in itertools.combinations(sorted(alternatives),2):
+                    a = sorted(alternatives[left],key=lambda row:(-row[0],row[1].key))[:4]
+                    b = sorted(alternatives[right],key=lambda row:(-row[0],row[1].key))[:4]
+                    for sa,ca in a:
+                        for sb,cb in b:
+                            proposal = list(cards);proposal[left]=ca;proposal[right]=cb
+                            if len({_mod_family(c) for c in proposal}) != len(proposal):
+                                continue
+                            if validate_build(proposal,riven,**constraints):
+                                continue
+                            signature=tuple(c.key for c in proposal)
+                            if signature not in seen:
+                                pairs.append((sa+sb,signature,tuple(proposal)))
+                pairs.sort(key=lambda row:(-row[0],row[1]))
+                for _,signature,proposal in pairs[:256]:
+                    if expired(deadline):return best
+                    seen.add(signature)
+                    value=_evaluate(weapon,proposal,riven,scenario=scenario,metric=metric,passives=passives,
+                                    slot_limit=slot_count,capacity_limit=capacity_limit,target_context=target_context,
+                                    required_damage_type=required_damage_type)
+                    if (value is not None and value.score>best.score+1e-9 and
+                            (not required_damage_type or value.stats.damage_types.get(required_damage_type,0.)>0.)):
+                        best=value
+            if best is base:
+                break
+    return best
+
+
+def _with_health_scale(context: Mapping[str, Any], scale: float) -> dict[str, Any]:
+    enhancements = dict(context.get("enemy_enhancements") or {})
+    enhancements["healthScale"] = float(scale)
+    return dict(context, enemy_enhancements=enhancements)
+
+
+def _hardness_times() -> list[tuple[float, float]]:
+    low, high = (math.log(value) for value in HARDNESS_TTK_RANGE)
+    middle, half = (low + high) / 2.0, (high - low) / 2.0
+    return [(math.exp(middle + x * half), weight) for x, weight in _GAUSS_LEGENDRE_3]
+
+
+def _hardness_nodes(stats: Any, context: Mapping[str, Any]) -> list[dict[str, float]] | None:
+    """Health-scale nodes that ``stats`` kills in the node times (body shots)."""
+    if not hasattr(stats, "_combat_inputs"):
+        return None
+    from .search_combat import body_ttk_health
+    times = _hardness_times()
+    rows = body_ttk_health(stats, context, [t for t, _ in times])
+    if not rows or any(not math.isfinite(s) or s <= 0 for s, _ in rows):
+        return None
+    return [dict(ttkSeconds=round(t, 3), healthScale=float(s), weight=w,
+                 healthSpread=min(HEALTH_SPREAD_CAP, max(0.0, float(spread))))
+            for (t, w), (s, spread) in zip(times, rows)]
+
+
+def _valid_hardness_nodes(nodes: Any) -> bool:
+    return (isinstance(nodes, list) and len(nodes) == len(_GAUSS_LEGENDRE_3) and all(
+        isinstance(n, Mapping) and isinstance(n.get("healthScale"), (int, float)) and n["healthScale"] > 0
+        and isinstance(n.get("weight"), (int, float)) for n in nodes))
+
+
+def _center_context(context: Mapping[str, Any], nodes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Single-target search context at the middle hardness node."""
+    single = {key: value for key, value in context.items() if key != "hardnessNodes"}
+    return _with_health_scale(single, float(nodes[len(nodes) // 2]["healthScale"]))
+
+
+def _window_pressure_probe(
+    stats: Any,
+    target_context: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Run the cheap event-ledger probe used by automatic target calibration."""
+    context = target_context or {}
+    target = context.get("target")
+    if not isinstance(target, Mapping):
+        return None
+    result = _event_window(stats, context) if hasattr(stats, "_combat_inputs") else windowed_status_damage(
+        stats,
+        target,
+        attacks_per_second=stats.sustained_attack_rate,
+        window_seconds=float(context.get("windowSeconds") or 30.0),
+        headshot_chance=float(context.get('headshotChance') or (1.0 if context.get('hit_location') == 'head' else 0.0)),
+        status_rate_multiplier=float(context.get("statusRateMultiplier") or 1.0),
+        damage_rate_multiplier=float(context.get("stanceMultiplier") or 1.0),
+        level=context.get("level"),
+        armour_strip=float(context.get("armour_strip") or 0.0),
+        elemental_armour_strip=float(context.get("elemental_armour_strip") or 0.0),
+        steel_path=bool(context.get("steel_path")),
+        enemy_enhancements=context.get("enemy_enhancements"),
+        collect_timeline=False,
+    )
+    step = max(float(result.get("timeStep") or 0.25), 0.05)
+    first = result.get("firstKillTime")
+    interval = result.get("minKillInterval")
+    max_per_step = int(result.get("maxKillsPerStep") or 0)
+    ledger = result.get("directEventLedger")
+    attack_period = (
+        1.0 / float(result.get("attacksPerSecond") or 0.0)
+        if float(result.get("attacksPerSecond") or 0.0) > 0.0
+        else None
+    )
+    # A target is pressure-insufficient when the first kill is effectively
+    # instantaneous, or when the continuous interval is finer than the grid
+    # while the direct event ledger says the weapon cannot produce events that
+    # quickly.  ``maxKillsPerStep`` is retained as an observability field only:
+    # multiple legitimate attack events in one coarse slice are not themselves
+    # a simulation error.
+    reasons: list[str] = []
+    if isinstance(first, (int, float)) and first < TARGET_CALIBRATION_MIN_FIRST_KILL_SECONDS:
+        reasons.append("first-kill-below-pressure-floor")
+    resolution_floor = max(step * 1.5, 0.2)
+    if (
+        isinstance(interval, (int, float))
+        and interval < resolution_floor
+        and isinstance(attack_period, (int, float))
+        and attack_period > resolution_floor
+    ):
+        reasons.append("kill-interval-near-integration-resolution")
+    event_ledger_status = (
+        str(ledger.get("status")) if isinstance(ledger, Mapping) else "missing"
+    )
+    result["pressureReasons"] = reasons
+    result["pressureInsufficient"] = bool(reasons)
+    result["calibrationStep"] = step
+    result["pressureDiagnostics"] = {
+        "maxKillsPerStep": max_per_step,
+        "attackPeriod": attack_period,
+        "resolutionFloor": resolution_floor,
+        "eventLedgerStatus": event_ledger_status,
+        "multipleKillsPerStepIsDiagnosticOnly": True,
+    }
+    return result
+
+
+def _next_calibration_level(level: Any) -> int | None:
+    """Return the next deterministic pressure-test level, capped at 9999."""
+    try:
+        current = max(1, int(level))
+    except (TypeError, ValueError):
+        return None
+    if current >= 9999:
+        return None
+    return min(9999, max(current + 1, int(math.ceil(current * 1.75))))
+
+
+def _card_elements(card: _Card) -> list[str]:
+    return [effect.damage_type for effect in card.effects
+            if getattr(effect, "damage_type", None) in BASE_ELEMENTS and effect.value > 0]
+
+
+def _element_orders(cards: Sequence[_Card], *, anchor: tuple[int, _Card] | None = None) -> list[tuple[_Card, ...]]:
+    """One card order per distinct element pairing, the given order first.
+
+    MOD base elements combine pairwise in order of first appearance (native
+    elements always follow), so with three or more MOD elements the same set
+    can yield e.g. Viral + Heat or Blast + Toxin. A greedy build order fixes
+    one pairing; permute only the element cards among their own slots.
+    """
+    slots = [index for index, card in enumerate(cards) if _card_elements(card)]
+    if len(slots) < (2 if anchor else 3):
+        return [tuple(cards)]
+    original = tuple(cards)
+    def pairing(ordered):
+        if anchor is None:
+            return _pairing_key(ordered)
+        position, card = anchor
+        return _pairing_key((*ordered[:position], card, *ordered[position:]))
+    key = pairing(original)
+    if not key[1]:  # fewer than three distinct elements: one pairing only
+        return [original]
+    orders = {key: original}
+    for permutation in itertools.permutations([cards[index] for index in slots]):
+        ordered = list(cards)
+        for index, card in zip(slots, permutation):
+            ordered[index] = card
+        orders.setdefault(pairing(ordered), tuple(ordered))
+    return list(orders.values())
+
+
+def _pairing_key(cards: Sequence[_Card]) -> tuple:
+    sequence: list[str] = []
+    for damage_type in (t for card in cards for t in _card_elements(card)):
+        if damage_type not in sequence:
+            sequence.append(damage_type)
+    return (frozenset(sequence[:2]), frozenset(sequence[2:4]))
+
+
+def _best_finalist(candidates, rescore):
+    """Rank whole builds on the final objective, keeping original tie order."""
+    best = None
+    seen = set()
+    for candidate in candidates:
+        identity = (tuple((card.key, card.rank) for card in candidate.cards), candidate.riven_index)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        scored = rescore(candidate)
+        if best is None or scored.score > best.score:
+            best = scored
+    if best is None:
+        raise SimulationError("no finalists to score")
+    return best
+
+
+def _evaluate(
+    weapon: Mapping[str, Any],
+    cards: Sequence[_Card],
+    riven: _Card | None,
+    *,
+    scenario: Scenario,
+    metric: str,
+    passives: _Card | None = None,
+    slot_limit: int = 8,
+    capacity_limit: int = 60,
+    special_cards: Sequence[_Card] = (),
+    special_capacity_cost: int = 0,
+    target_context: Mapping[str, Any] | None = None,
+    fixed_riven_index: int | None = None,
+    reorder_elements: bool = True,
+    required_damage_type: str | None = None,
+) -> _Evaluation | None:
+    heartbeat(1)
+    if len(cards) + (1 if riven else 0) > slot_limit:
+        return None
+    from . import evaluation_cache
+    cache_key = evaluation_cache.key(
+        weapon, cards, riven, scenario=scenario, metric=metric, passives=passives,
+        slot_limit=slot_limit, capacity_limit=capacity_limit, special_cards=special_cards,
+        special_capacity_cost=special_capacity_cost, target_context=target_context,
+        fixed_riven_index=fixed_riven_index, reorder_elements=reorder_elements)
+    if cache_key is not None and required_damage_type is not None:
+        cache_key = ("required-damage-type", required_damage_type, cache_key)
+    if cache_key is not None:
+        # Keep the evaluator identity too: instrumentation or a replaced scorer
+        # must never consume an answer produced by the previous function.
+        from . import native_replay, mods_native
+        cache_key = ((_score, _event_window, apply_mods, _effects, evaluate_projectile_events,
+                      native_replay.ENABLED, mods_native.ENABLED), cache_key)
+        if native_replay.SHADOW or mods_native.SHADOW:
+            cache_key = None
+    cached = evaluation_cache.get(cache_key)
+    if cached is not evaluation_cache.MISSING:
+        if cached is None:
+            return None
+        score, order, fields, capacity, position, victim_count = cached
+        from .damage import ModdedStats
+        stats = ModdedStats.__new__(ModdedStats)
+        stats.__dict__.update(pickle.loads(fields))
+        card_order = tuple(cards[i] for i in order)
+        ordered = list(card_order)
+        if riven is not None and position is not None:
+            ordered.insert(position, riven)
+        all_cards = [*ordered, *special_cards]
+        effects = _effects([*all_cards, passives] if passives is not None else all_cards, scenario)
+        derived = scenario_with(scenario, victim_status_count=victim_count)
+        _bind_combat_inputs(stats, weapon, all_cards, effects, derived, passives)
+        return _Evaluation(score, card_order, stats, capacity, position, derived)
+    positions: Iterable[int | None] = (None,)
+    if riven is not None and fixed_riven_index is not None:
+        positions = (fixed_riven_index,)
+    elif riven is not None:
+        polarity_sensitive = False  # all cards use matching Forma in this model
+        element_sensitive = any(
+            effect.damage_type in BASE_ELEMENTS for effect in riven.effects
+        )
+        if element_sensitive:
+            # 元素 coalesce 只在「元素边界」处不同：基伤/暴击/触发卡不改变
+            # 元素合并顺序，把紫卡插在它们前后是等价的（每步全量重算的
+            # apply_mods + 窗口模型给出相同结果）。等价类 =「riven 排在
+            # 第 k 张元素卡之前」（k = 0..n），位置代表取每张元素卡的
+            # index + 末尾，把每评估 ~9 次重复计算压到 ~元素卡数+1 次。
+            def _is_element_card(card: _Card) -> bool:
+                return any(
+                    getattr(effect, "damage_type", None) in BASE_ELEMENTS
+                    for effect in card.effects
+                )
+
+            element_indexes = [
+                index for index, card in enumerate(cards) if _is_element_card(card)
+            ]
+            positions = (*element_indexes, len(cards))
+        elif polarity_sensitive:
+            positions = range(len(cards) + 1)
+        else:
+            positions = (len(cards),)
+    best: _Evaluation | None = None
+    # An elemental Riven splits ordinary pairings. Deduplicating the MODs
+    # before inserting it can lose real combinations; canonicalize the full
+    # layout, including its exact insertion point, before any expensive work.
+    variants = ((position, order) for position in positions for order in
+                (_element_orders(cards, anchor=(position, riven) if riven is not None else None)
+                 if reorder_elements else [tuple(cards)]))
+    seen_pairings = set()
+    for position, card_order in variants:
+        ordered = list(card_order)
+        if riven is not None and position is not None:
+            ordered.insert(position, riven)
+        pairing = _pairing_key(ordered)
+        if pairing in seen_pairings:
+            continue
+        seen_pairings.add(pairing)
+        capacity = _capacity(ordered) + special_capacity_cost
+        if capacity > capacity_limit:
+            continue
+        all_cards = [*ordered, *special_cards]
+        # Passives (arcanes, Incarnon, external buffs, sentinel Fired Up) join after
+        # the installed mods, as the manual simulator does: a runtime elemental
+        # buff takes its combine position after the mod slots and before the
+        # weapon's innate element (wiki Damage: innate elements are always last).
+        effect_cards = [*all_cards, passives] if passives is not None else all_cards
+        effects = _effects(effect_cards, scenario)
+        probe_scenario = scenario_with(scenario, victim_status_count=0)
+        probe_stats = apply_mods(weapon, effects, scenario=probe_scenario)
+        derived_scenario = scenario_with(
+            scenario,
+            victim_status_count=expected_victim_status_count(probe_stats),
+        )
+        stats = apply_mods(weapon, effects, scenario=derived_scenario)
+        # Filter each actual pairing before comparing scores. Filtering only
+        # the winning layout would also discard a legal lower-scoring slot.
+        if required_damage_type and stats.damage_types.get(required_damage_type, 0.0) <= 0.0:
+            continue
+        projectile_events = evaluate_projectile_events(
+            weapon, effects, scenario=derived_scenario
+        )
+        _bind_combat_inputs(stats, weapon, all_cards, effects, derived_scenario, passives)
+        current = _Evaluation(
+            score=_score(stats, metric, projectile_events, target_context),
+            cards=tuple(card_order),
+            stats=stats,
+            capacity=capacity,
+            riven_index=position if riven is not None else None,
+            scenario=derived_scenario,
+        )
+        if best is None or current.score > best.score:
+            best = current
+    if cache_key is not None:
+        try:
+            evaluation_cache.put(cache_key, evaluation_cache.snapshot(best, cards) if best is not None else None)
+        except (TypeError, AttributeError, pickle.PicklingError):
+            pass  # Optional extension objects may not support a value snapshot.
+    return best
+
+
+@memoized_search
+def _optimize(
+    weapon: Mapping[str, Any],
+    candidates: Sequence[_Card],
+    riven: _Card | None,
+    *,
+    scenario: Scenario,
+    metric: str,
+    passives: _Card | None = None,
+    beam_width: int = 24,
+    shortlist: int = 56,
+    slot_count: int = 8,
+    capacity_limit: int = 60,
+    required_damage_type: str | None = None,
+    target_context: Mapping[str, Any] | None = None,
+    profile: str = "standard",
+    required_mod_keys: Sequence[str] | None = None,
+    forbidden_mod_keys: Sequence[str] | None = None,
+    min_fill: int | None = None,
+    max_fill: int | None = None,
+    seed_cards: Sequence[_Card] | None = None,
+    element_niches: int = 0,
+    phase_seconds: float | None = None,
+) -> _Evaluation:
+    # 解算档位（用户可调，平衡深度与等待时间）：
+    #   fast     — beam 12/32，不做爬山。适合快速预览；可能漏掉冷门协同组合。
+    #   standard — beam 24/40 + 至多 3 轮爬山（默认）。
+    #   deep     — beam 24/56 + 12 轮全邻域爬山 + riven floor 修正（原完整口径）。
+    #
+    # 搜索约束（wfsim 优化器 scope 模型的移植，见 docs/OPTIMIZER.md）：
+    #   required_mod_keys — 必选卡（候选标 required，与架势/剑风同通道）。
+    #   forbidden_mod_keys — 禁选卡（从候选池剔除）。
+    #   min_fill/max_fill — 配卡数量范围（含必选与紫卡槽）；空范围（0）= 裸枪。
+    profile = str(profile or "standard").strip().casefold()
+    if profile == "ultra":
+        profile = "fast"
+    if profile not in {"fast", "standard", "deep"}:
+        raise SimulationError(
+            "profile must be one of fast, standard, deep"
+        )
+    if profile == "fast":
+        beam_width = min(beam_width, 12)
+        shortlist = min(shortlist, 32)
+    elif profile == "standard":
+        beam_width = min(beam_width, 24)
+        shortlist = min(shortlist, 40)
+    climb_rounds = {"fast": 0, "standard": 3, "deep": 12}[profile]
+    deadline = phase_deadline(phase_seconds)
+    if isinstance(slot_count, bool) or not isinstance(slot_count, int) or not 1 <= slot_count <= 8:
+        raise SimulationError("slot_count must be an integer between 1 and 8")
+    if isinstance(capacity_limit, bool) or not isinstance(capacity_limit, int) or capacity_limit < 0:
+        raise SimulationError("capacity_limit must be a non-negative integer")
+    required_cards = tuple(card for card in candidates if card.required)
+    # ── 搜索约束：必选/禁选/数量范围（在家族去重前应用）────────────────
+    forbidden = {str(key) for key in (forbidden_mod_keys or ()) if str(key)}
+    if forbidden:
+        candidates = tuple(
+            card for card in candidates if card.key not in forbidden
+        )
+    extra_required = [
+        card for card in candidates
+        if card.key in {str(key) for key in (required_mod_keys or ()) if str(key)}
+        and not card.required
+    ]
+    if len(extra_required) != len({card.key for card in extra_required}):
+        raise SimulationError("required_mod_keys contains duplicates")
+    missing_required = (
+        {str(key) for key in (required_mod_keys or ()) if str(key)}
+        - {card.key for card in candidates}
+    )
+    if missing_required:
+        raise SimulationError(
+            "required mods not in candidate pool: " + ", ".join(sorted(missing_required))
+        )
+    if min_fill is not None or max_fill is not None:
+        base_fill = len(required_cards) + len(extra_required) + (1 if riven else 0)
+        # ── F07（审计修复）：未设置的边界不再默认 slot_count——
+        # 「只给 max_fill」应意味着下界 0（旧实现把 lo 默认成 8，与
+        # max_fill<8 的任何请求冲突直接报错）。
+        lo = 0 if min_fill is None else min(max(int(min_fill), 0), slot_count)
+        hi = slot_count if max_fill is None else min(max(int(max_fill), 0), slot_count)
+        if lo > hi:
+            raise SimulationError("min_fill must not exceed max_fill")
+        if base_fill > hi:
+            raise SimulationError(
+                f"required cards ({base_fill}) exceed max_fill ({hi})"
+            )
+        fill_floor = max(0, lo - base_fill)
+        optional_ceiling = max(0, hi - base_fill)
+    else:
+        fill_floor = 0
+        optional_ceiling = slot_count
+    required_cards = tuple(required_cards) + tuple(extra_required)
+    # ── F07（审计修复）：用户必选卡物化为 required=True ──────────────────
+    # 爬山的 Swap/Drop 阶段按 card.required 判定可移除集合；不标记的话
+    # beam 之后的局部搜索可能把用户必选卡删掉。
+    required_cards = _mark_required_cards(required_cards, required_mod_keys or ())
+    candidates = tuple(
+        card for card in candidates
+        if not card.required and card.key not in {c.key for c in extra_required}
+    )
+    # Collapse only verified equivalent optional identities, after applying
+    # the user's exact required/forbidden paths. Explicit choices stay intact.
+    available_keys={c.key for c in (*candidates,*required_cards)}
+    candidates=tuple(c for c in candidates
+                     if (c.record or {}).get('optimizerDuplicateOf') not in available_keys)
+
+    limit = min(
+        slot_count - len(required_cards) - (1 if riven else 0),
+        optional_ceiling,
+    )
+    if limit < 0:
+        raise SimulationError("required MODs do not fit the selected slot count")
+    empty = _evaluate(
+        weapon,
+        required_cards,
+        riven,
+        scenario=scenario,
+        metric=metric,
+        passives=passives,
+        slot_limit=slot_count,
+        capacity_limit=capacity_limit,
+        target_context=target_context,
+    )
+    if empty is None:
+        raise SimulationError("Riven does not fit the assumed 60-capacity build")
+
+    def eligible(value: _Evaluation) -> bool:
+        return required_damage_type is None or (
+            value.stats.damage_types.get(required_damage_type, 0.0) > 0
+        )
+
+    ranked: list[tuple[float, _Card]] = []
+    # ── 单卡排名并行化（~200 次独立评估；物理核 worker 池）────────────
+    _rank_jobs = [(*required_cards, card) for card in candidates]
+    _rank_scores: list[float | None] = []
+    from wfarsenal import parallel as _parallel
+
+    _wire_scenario = (
+        scenario
+        if isinstance(scenario.conditional_stacks, dict)
+        else replace(scenario, conditional_stacks=dict(scenario.conditional_stacks))
+    )
+    _pool_ctx = _parallel.shared({
+        "weapon": weapon,
+        "scenario": _wire_scenario,
+        "metric": metric,
+        "passives": passives,
+        "slot_limit": slot_count,
+        "capacity_limit": capacity_limit,
+        "target_context": target_context,
+    })
+    _pool_exec = _parallel.get_pool()
+    if _pool_exec is not None and len(_rank_jobs) >= 8:
+        _futures = [
+            _pool_exec.submit(_parallel._score_job, (cards, riven, _pool_ctx))
+            for cards in _rank_jobs
+        ]
+        _rank_scores = [fut.result() for fut in _futures]
+    for cards, score in zip(_rank_jobs, _rank_scores):
+        if score is not None:
+            ranked.append((score, cards[-1]))
+    if not _rank_scores:
+        for cards in _rank_jobs:
+            evaluated = _evaluate(
+                weapon,
+                cards,
+                riven,
+                scenario=scenario,
+                metric=metric,
+                passives=passives,
+                slot_limit=slot_count,
+                capacity_limit=capacity_limit,
+                target_context=target_context,
+            )
+            if evaluated is not None:
+                ranked.append((evaluated.score, cards[-1]))
+    ranked.sort(key=lambda item: (-item[0], item[1].key))
+    pool: list[_Card] = []
+    families: set[str] = set()
+    for _, card in ranked:
+        family = _mod_family(card)
+        if family in families:
+            continue
+        families.add(family)
+        pool.append(card)
+        if len(pool) >= shortlist:
+            break
+    if element_niches:
+        # Element niches (below) keep partial builds alive by the base
+        # elements they hold; a niche needs its element cards in the pool,
+        # however a lone element card ranks: the best ``element_niches`` of
+        # each base element join the shortlist.
+        for element in BASE_ELEMENTS:
+            have = sum(1 for card in pool if element in _card_elements(card))
+            for _, card in ranked:
+                if have >= element_niches:
+                    break
+                family = _mod_family(card)
+                if family in families or element not in _card_elements(card):
+                    continue
+                families.add(family)
+                pool.append(card)
+                have += 1
+
+    def niche(selection: Sequence[int]) -> frozenset[str]:
+        return frozenset(element for index in selection for element in _card_elements(pool[index]))
+
+    def survivors_of(scored_rows: list, width: int) -> list:
+        """The best ``width`` rows, plus the best ``element_niches`` rows of
+        every base-element set not already that well represented."""
+        chosen = scored_rows[:width]
+        if not element_niches:
+            return chosen
+        counts: dict[frozenset[str], int] = {}
+        for row in chosen:
+            key = niche(row[0])
+            counts[key] = counts.get(key, 0) + 1
+        for row in scored_rows[width:]:
+            key = niche(row[0])
+            if counts.get(key, 0) < element_niches:
+                chosen.append(row)
+                counts[key] = counts.get(key, 0) + 1
+        return chosen
+
+    beam: list[tuple[tuple[int, ...], _Evaluation]] = [((), empty)]
+    best = empty if eligible(empty) else None
+    # ── F15/S06（审计修复）：多起点——贪心种子先入 incumbent ─────────────
+    # beam 的层序选择是贪心的，但单层 beam 剪枝可能中途淘汰后续才显出协
+    # 同的路径。用「逐张取当前最优单卡」的贪心序列作第二个起点：它覆盖
+    # beam 剪枝漏掉的显见组合，且成本 O(limit × pool)。同时保证高档位
+    # 不劣于贪心口径（S07 的实际下界）。
+    greedy_cards: list[_Card] = []
+    greedy_used_families: set[str] = set()
+    for _ in range(limit):
+        greedy_pick: _Card | None = None
+        for card in pool:
+            if card.key in {c.key for c in greedy_cards}:
+                continue
+            if _mod_family(card) in greedy_used_families:
+                continue
+            greedy_pick = card
+            break
+        if greedy_pick is None:
+            break
+        candidate_cards = (*required_cards, *greedy_cards, greedy_pick)
+        if validate_build(
+            candidate_cards,
+            riven,
+            slot_count=slot_count,
+            capacity_limit=capacity_limit,
+            required_mod_keys=required_mod_keys,
+            forbidden_mod_keys=forbidden_mod_keys,
+            min_fill=min_fill,
+            max_fill=max_fill,
+        ) is not None:
+            break
+        greedy_cards.append(greedy_pick)
+        greedy_used_families.add(_mod_family(greedy_pick))
+    if greedy_cards:
+        greedy_eval = _evaluate(
+            weapon,
+            (*required_cards, *greedy_cards),
+            riven,
+            scenario=scenario,
+            metric=metric,
+            passives=passives,
+            slot_limit=slot_count,
+            capacity_limit=capacity_limit,
+            target_context=target_context,
+        )
+        if greedy_eval is not None and eligible(greedy_eval) and (
+            best is None or greedy_eval.score > best.score
+        ):
+            best = greedy_eval
+    # ── baseline 种子（携带紫卡的实际/最优搜索下界保证）─────────────────
+    # 紫卡占容量（~18）会改变 beam 的可行组合空间：fast/standard 档的剪枝
+    # 可能把「无紫卡时的最优配装家族」整体淘汰，导致 actual < baseline 的
+    # 假象（用户报告：加了紫卡评分反而崩）。把 baseline 的选卡作为种子
+    # 直接评估（按容量逐张保留，装不下就丢），确保带紫卡搜索不劣于
+    # 「baseline 配装去掉最贵的一张」这个自然下界。
+    if seed_cards:
+        # A scout/Arcane screen has already evaluated this legal build. Its
+        # cards may lose the new single-card shortlist (especially Galvanized
+        # family variants); that is no reason to discard the known floor.
+        admitted = {card.key: card for card in (*candidates, *required_cards)}
+        required_seed_keys = {card.key for card in required_cards}
+        seed_kept: list[_Card] = []
+        for previous in seed_cards:
+            card = admitted.get(previous.key)
+            if card is not None and card.key not in required_seed_keys:
+                if _mod_family(card) in {_mod_family(c) for c in (*required_cards,*seed_kept)}:
+                    continue
+                if validate_build(
+                    (*required_cards, *seed_kept, card),
+                    riven,
+                    slot_count=slot_count,
+                    capacity_limit=capacity_limit,
+                    required_mod_keys=required_mod_keys,
+                    forbidden_mod_keys=forbidden_mod_keys,
+                    min_fill=None,  # A prefix is not the completed seed.
+                    max_fill=max_fill,
+                ) is None:
+                    seed_kept.append(card)
+        if seed_kept and validate_build(
+            (*required_cards, *seed_kept), riven, slot_count=slot_count,
+            capacity_limit=capacity_limit, required_mod_keys=required_mod_keys,
+            forbidden_mod_keys=forbidden_mod_keys, min_fill=min_fill, max_fill=max_fill,
+        ) is None:
+            seed_eval = _evaluate(
+                weapon,
+                (*required_cards, *seed_kept),
+                riven,
+                scenario=scenario,
+                metric=metric,
+                passives=passives,
+                slot_limit=slot_count,
+                capacity_limit=capacity_limit,
+                target_context=target_context,
+            )
+            if seed_eval is not None and eligible(seed_eval) and (
+                best is None or seed_eval.score > best.score
+            ):
+                best = seed_eval
+    # One beam layer reaches the same MOD set from several parents, each time
+    # in a different slot order (AB+C, AC+B, BC+A: about half of a layer).
+    # _evaluate tries every element pairing, so without an elemental Riven
+    # the order does not change the score: replay each set once and share it.
+    # An elemental Riven is placed relative to the element cards' order, so
+    # there the order stays part of the key.
+    order_free = True  # _evaluate enumerates pairings with the Riven included.
+
+    def score_key(cards: Sequence[_Card]) -> tuple[str, ...]:
+        keys = tuple(card.key for card in cards)
+        return tuple(sorted(keys)) if order_free else keys
+
+    layer_scores: dict[tuple[str, ...], float | None] = {}
+    for _ in range(limit):
+        expanded: list[tuple[tuple[int, ...], _Evaluation]] = []
+        if expired(deadline):
+            break
+        # ── 并行层扩展（物理核进程池；串行回退=1 核或 WF_ANALYZER_SERIAL）──
+        # 每层数百次独立评估分发到 worker；worker 只回 score（避免 stats
+        # 的深 pickle），beam 幸存者与 incumbent 在父进程串行重评估以附上
+        # 完整 stats（确定性纯函数，~15 次/层）。
+        layer_jobs: list[tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]] = []
+        for selected, _previous in beam:
+            used = set(selected)
+            used_families = {_mod_family(pool[index]) for index in selected}
+            for index in range(len(pool)):
+                if index in used or _mod_family(pool[index]) in used_families:
+                    continue
+                layer_jobs.append(
+                    ((*selected, index), (*required_cards, *(
+                        pool[item] for item in (*selected, index)
+                    )))
+                )
+        scores: list[float | None] = []
+        if layer_jobs:
+            todo: dict[tuple[str, ...], tuple[_Card, ...]] = {}
+            for _sel, cards in layer_jobs:
+                todo.setdefault(score_key(cards), cards)
+            unique = list(todo.items())
+            if _pool_exec is not None and len(unique) >= 8:
+                # Keep only a bounded window in flight. A deadline must not
+                # leave thousands of queued replay jobs running after return;
+                # four jobs per worker, topped up as results come back in
+                # order, keep the pool busy (a batch-and-wait loop drained
+                # it at every batch boundary).
+                window = max(16, 4 * _parallel.worker_count())
+                in_flight: deque = deque()
+                submitted = 0
+                stopped = False
+                try:
+                    while True:
+                        while not stopped and submitted < len(unique) and len(in_flight) < window:
+                            if submitted % window == 0 and expired(deadline):
+                                stopped = True
+                                break
+                            key, cards = unique[submitted]
+                            in_flight.append((key, _pool_exec.submit(_parallel._score_job, (cards, riven, _pool_ctx))))
+                            submitted += 1
+                        if not in_flight:
+                            break
+                        key, future = in_flight.popleft()
+                        layer_scores[key] = future.result()
+                        heartbeat(1)
+                finally:
+                    for _key, future in in_flight:
+                        future.cancel()  # a cancelled request's queued jobs never start
+            else:
+                for key, cards in unique:
+                    if expired(deadline):
+                        break
+                    evaluated = _evaluate(
+                        weapon,
+                        cards,
+                        riven,
+                        scenario=scenario,
+                        metric=metric,
+                        passives=passives,
+                        slot_limit=slot_count,
+                        capacity_limit=capacity_limit,
+                        target_context=target_context,
+                    )
+                    layer_scores[key] = None if evaluated is None else evaluated.score
+            for _sel, cards in layer_jobs:
+                key = score_key(cards)
+                if key not in layer_scores:
+                    break  # the budget ran out: the rest of the layer is unscored
+                scores.append(layer_scores[key])
+            layer_scores.clear()
+        scored: list[tuple[tuple[int, ...], float]] = [
+            (sel, score)
+            for (sel, _cards), score in zip(layer_jobs, scores)
+            if score is not None
+        ]
+        scored.sort(key=lambda item: (-item[1], tuple(pool[i].key for i in item[0])))
+        if required_damage_type is None:
+            # Survivors carry their score only: the next layer reads their
+            # selections, and full stats are needed just for a new best,
+            # which is the first survivor (they are sorted) if it beats it.
+            survivors = scored[: beam_width + 1]
+            if not survivors:
+                break
+            beam = [(sel, score) for sel, score in survivors_of(scored, beam_width)]
+            top_sel, top_score = survivors[0]
+            if best is None or top_score > best.score:
+                evaluated = _evaluate(
+                    weapon,
+                    (*required_cards, *(pool[item] for item in top_sel)),
+                    riven,
+                    scenario=scenario,
+                    metric=metric,
+                    passives=passives,
+                    slot_limit=slot_count,
+                    capacity_limit=capacity_limit,
+                    target_context=target_context,
+                )
+                if evaluated is not None:
+                    best = evaluated
+            continue
+        # Beam 幸存者 + 全局最优候选在父进程重评估附 stats。
+        for sel, _score in survivors_of(scored, beam_width + 1):
+            evaluated = _evaluate(
+                weapon,
+                (*required_cards, *(pool[item] for item in sel)),
+                riven,
+                scenario=scenario,
+                metric=metric,
+                passives=passives,
+                slot_limit=slot_count,
+                capacity_limit=capacity_limit,
+                target_context=target_context,
+            )
+            if evaluated is not None:
+                expanded.append((sel, evaluated))
+        if not expanded:
+            break
+        expanded.sort(
+            key=lambda item: (
+                -item[1].score,
+                tuple(pool[index].key for index in item[0]),
+            )
+        )
+        beam = survivors_of(expanded, beam_width)
+        for _, evaluated in expanded:
+            if eligible(evaluated) and (best is None or evaluated.score > best.score):
+                best = evaluated
+    if best is None:
+        raise SimulationError(
+            f"no capacity-valid build satisfies damage type {required_damage_type}"
+        )
+    # 数量下限（min_fill）：beam 结束时若可选卡不足 fill_floor（相对必选+紫卡
+    # 之外的槽位），逐张补当前最优（保持容量合法；池已空则说明候选不足）。
+    if fill_floor > 0:
+        target_total = fill_floor + len(required_cards) + (1 if riven else 0)
+        while len(best.cards) + (1 if riven else 0) < target_total:
+            used_keys = {card.key for card in best.cards}
+            used_families = {_mod_family(card) for card in best.cards}
+            added = False
+            for card in pool:
+                if card.key in used_keys or _mod_family(card) in used_families:
+                    continue
+                filled = _evaluate(
+                    weapon,
+                    (*best.cards, card),
+                    riven,
+                    scenario=scenario,
+                    metric=metric,
+                    passives=passives,
+                    slot_limit=slot_count,
+                    capacity_limit=capacity_limit,
+                    target_context=target_context,
+                )
+                if filled is not None and eligible(filled):
+                    best = filled
+                    added = True
+                    break
+            if not added:
+                break
+    # ── Full 1-swap neighbourhood hill-climb (wfsim optimizer/search.rs) ──────
+    # After the beam pass the best build is locally refined by enumerating the
+    # COMPLETE single-mod neighbourhood: swap one equipped card for one pool
+    # card, add one, drop one — every candidate evaluated, keep the best,
+    # repeat until no single move improves.  Measured by wfsim over its shipped
+    # pools this reaches rank 1 with regret 0.000% where random mutation needs
+    # 3000 evaluations for rank 10, because a beam's shortlist ordering is
+    # greedy while a swap sees past it (the 8th-best card for the empty build
+    # may be the best partner for the 7 already chosen).
+    # ── F15（审计修复）：有序构建规范化去重 ──────────────────────────────
+    # 元素合成顺序有意义（项目口径）：同一组卡不同顺序不是等价构建。
+    # 旧实现 sig = tuple(sorted(card.key ...)) 把集合相同的顺序全部折叠，
+    # 爬山会跳过「同卡不同序」的真实候选。现在 sig 保留卡序（tuple 原序），
+    # 交换动作把新卡放进被移除卡的槽位（不再一律追加到末尾）。
+    seen_keys: set[tuple[str, ...]] = {tuple(card.key for card in best.cards)}
+    improved = True
+    climb_guard = 0
+
+    def _constraint_violation(candidate_cards: Sequence[_Card]) -> str | None:
+        """F07：邻域变动的统一约束验证（必选/禁选/数量/容量）。"""
+        return validate_build(
+            candidate_cards,
+            riven,
+            slot_count=slot_count,
+            capacity_limit=capacity_limit,
+            required_mod_keys=required_mod_keys,
+            forbidden_mod_keys=forbidden_mod_keys,
+            min_fill=min_fill,
+            max_fill=max_fill,
+        )
+
+    climb_seen: dict[tuple[str, ...], _Evaluation] = {}
+
+    def climb_evaluate(cards: Sequence[_Card]) -> _Evaluation:
+        cached = climb_seen.pop(tuple(card.key for card in cards), None)
+        if cached is not None:
+            return cached
+        return _evaluate(weapon, tuple(cards), riven, scenario=scenario, metric=metric, passives=passives,
+                         slot_limit=slot_count, capacity_limit=capacity_limit, target_context=target_context)
+
+    def climb_scores(candidates: Sequence[Sequence[_Card]]):
+        """(score, eligible) per candidate in order, or None for an invalid build.
+
+        Serially a lazy generator (a caller that stops early evaluates no
+        further, and the winner's evaluation is handed back); with a pool,
+        all candidates are scored as jobs.
+        """
+        climb_seen.clear()
+        if _pool_exec is None or len(candidates) < 8:
+            for cards in candidates:
+                evaluated = _evaluate(weapon, tuple(cards), riven, scenario=scenario, metric=metric,
+                                      passives=passives, slot_limit=slot_count, capacity_limit=capacity_limit,
+                                      target_context=target_context)
+                if evaluated is None:
+                    yield None
+                    continue
+                climb_seen.clear()
+                climb_seen[tuple(card.key for card in cards)] = evaluated
+                yield evaluated.score, eligible(evaluated)
+            return
+        futures = [_pool_exec.submit(_parallel._score_eligible_job, (tuple(cards), riven, _pool_ctx, required_damage_type))
+                   for cards in candidates]
+        try:
+            for future in futures:
+                outcome = future.result()
+                heartbeat(1)
+                yield outcome
+        finally:
+            for future in futures:
+                future.cancel()
+
+    while improved and climb_guard < climb_rounds and not expired(deadline):
+        improved = False
+        climb_guard += 1
+        base_cards = list(best.cards)
+        base_optional = [c for c in base_cards if not c.required]
+        best_score = best.score
+        # Swap: replace one optional card with one pool card.  F15：新卡放进
+        # 被移除卡的槽位（保持元素边界，不追加到末尾）。
+        swaps: list[list[_Card]] = []
+        for drop_pos, dropped in enumerate(base_optional):
+            for card in pool:
+                if expired(deadline):
+                    break
+                if card.key in {c.key for c in base_cards}:
+                    continue
+                if _mod_family(card) in {
+                    _mod_family(c) for c in base_cards if c.key != dropped.key
+                }:
+                    continue
+                drop_index = base_cards.index(dropped)
+                candidate_cards = list(base_cards)
+                candidate_cards[drop_index] = card
+                if _constraint_violation(candidate_cards):
+                    continue
+                sig = tuple(c.key for c in candidate_cards)
+                if sig in seen_keys:
+                    continue
+                seen_keys.add(sig)
+                swaps.append(candidate_cards)
+        # Every swap is measured against the round's base: score them all,
+        # then take improvements in order exactly as one-by-one would.
+        chosen_swap: list[_Card] | None = None
+        for candidate_cards, outcome in zip(swaps, climb_scores(swaps)):
+            if outcome is not None and outcome[1] and outcome[0] > best_score + 1e-9:
+                chosen_swap, best_score = candidate_cards, outcome[0]
+                improved = True
+        if chosen_swap is not None:
+            best = climb_evaluate(chosen_swap)
+        # Add: one more pool card while slots AND max_fill remain.
+        # ── F07（审计修复）：Add 同时检查 slot_count 与 max_fill（旧实现
+        # 只查 slot_count，beam 阶段的数量上限会被爬山的 Add 绕过）。
+        if len(best.cards) + (1 if riven else 0) < slot_count and (
+            max_fill is None
+            or len(best.cards) + (1 if riven else 0) < int(max_fill)
+        ):
+            used_keys = {c.key for c in best.cards}
+            used_families = {_mod_family(c) for c in best.cards}
+            adds: list[tuple[tuple[str, ...], list[_Card]]] = []
+            for card in pool:
+                if card.key in used_keys or _mod_family(card) in used_families:
+                    continue
+                if _constraint_violation((*best.cards, card)):
+                    continue
+                sig = tuple(c.key for c in (*best.cards, card))
+                if sig in seen_keys:
+                    continue
+                adds.append((sig, [*best.cards, card]))
+            # The first improving add wins; only the candidates up to it were
+            # tried (and so marked seen) one by one.
+            outcomes = climb_scores([cards for _, cards in adds])
+            for (sig, candidate_cards), outcome in zip(adds, outcomes):
+                seen_keys.add(sig)
+                if outcome is not None and outcome[1] and outcome[0] > best_score + 1e-9:
+                    best = climb_evaluate(candidate_cards)
+                    best_score = best.score
+                    improved = True
+                    break
+            outcomes.close()  # an early winner cancels the queued rest
+        # Drop: remove one optional card (frees capacity for nothing — only
+        # keeps builds whose score genuinely improves, e.g. set-bonus traps).
+        # ── F07（审计修复）：Drop 检查 min_fill（数量下限不被绕过）。
+        for dropped in base_optional:
+            candidate_cards = [c for c in best.cards if c.key != dropped.key]
+            if not candidate_cards:
+                continue
+            if _constraint_violation(candidate_cards):
+                continue
+            sig = tuple(c.key for c in candidate_cards)
+            if sig in seen_keys:
+                continue
+            seen_keys.add(sig)
+            evaluated = _evaluate(
+                weapon,
+                tuple(candidate_cards),
+                riven,
+                scenario=scenario,
+                metric=metric,
+                passives=passives,
+                slot_limit=slot_count,
+                capacity_limit=capacity_limit,
+                target_context=target_context,
+            )
+            if evaluated is not None and eligible(evaluated) and evaluated.score > best_score + 1e-9:
+                best, best_score = evaluated, evaluated.score
+                improved = True
+        # ── F15（双槽交换，deep 档）───────────────────────────────────────
+        # 成对协同替换：两个新卡必须一起换入才优于现状的组合（元素边界/容
+        # 量再分配）是单卡邻域的盲区。仅在 deep 档执行（成本 O(n²) 评估，
+        # 每轮最多 24 个最优对，预算受 climb_rounds 约束）。
+        if profile == "deep" and len(base_optional) >= 2:
+            pair_budget = 24
+            pair_candidates: list[tuple[float, list[_Card]]] = []
+            for first_pos in range(len(base_optional)):
+                for second_pos in range(first_pos + 1, len(base_optional)):
+                    dropped_a = base_optional[first_pos]
+                    dropped_b = base_optional[second_pos]
+                    for card_a in pool:
+                        if card_a.key in {c.key for c in base_cards}:
+                            continue
+                        for card_b in pool:
+                            if card_b.key in {c.key for c in base_cards} or card_b.key == card_a.key:
+                                continue
+                            if card_a.key == card_b.key:
+                                continue
+                            kept = [c for c in base_cards if c.key not in {dropped_a.key, dropped_b.key}]
+                            candidate_cards = [*kept, card_a, card_b]
+                            if _constraint_violation(candidate_cards):
+                                continue
+                            sig = tuple(c.key for c in candidate_cards)
+                            if sig in seen_keys:
+                                continue
+                            seen_keys.add(sig)
+                            evaluated = _evaluate(
+                                weapon,
+                                tuple(candidate_cards),
+                                riven,
+                                scenario=scenario,
+                                metric=metric,
+                                passives=passives,
+                                slot_limit=slot_count,
+                                capacity_limit=capacity_limit,
+                                target_context=target_context,
+                            )
+                            if evaluated is not None and eligible(evaluated):
+                                pair_candidates.append((evaluated.score, candidate_cards))
+                                if len(pair_candidates) >= pair_budget * 8:
+                                    break
+                        if len(pair_candidates) >= pair_budget * 8:
+                            break
+                    if len(pair_candidates) >= pair_budget * 8:
+                        break
+                if len(pair_candidates) >= pair_budget * 8:
+                    break
+            pair_candidates.sort(key=lambda item: (-item[0], tuple(c.key for c in item[1])))
+            for score_value, candidate_cards in pair_candidates[:pair_budget]:
+                if score_value > best_score + 1e-9:
+                    evaluated = _evaluate(
+                        weapon,
+                        tuple(candidate_cards),
+                        riven,
+                        scenario=scenario,
+                        metric=metric,
+                        passives=passives,
+                        slot_limit=slot_count,
+                        capacity_limit=capacity_limit,
+                        target_context=target_context,
+                    )
+                    if evaluated is not None and eligible(evaluated) and evaluated.score > best_score + 1e-9:
+                        best, best_score = evaluated, evaluated.score
+                        improved = True
+                        break
+    # Fill otherwise-neutral slots as long as the loadout remains legal.  The
+    # damage score alone cannot distinguish an empty slot from a useful utility
+    # card whose modeled contribution is zero (range, ammo mutation, etc.).
+    # 用户显式给出配卡数量范围时不做中性填充——尊重 min/max 语义。
+    if (
+        min_fill is None
+        and max_fill is None
+        and len(best.cards) + (1 if riven else 0) < slot_count
+    ):
+        used_keys = {card.key for card in best.cards}
+        used_families = {_mod_family(card) for card in best.cards}
+        for card in pool:
+            family = _mod_family(card)
+            if card.key in used_keys or family in used_families:
+                continue
+            filled = _evaluate(
+                weapon,
+                (*best.cards, card),
+                riven,
+                scenario=scenario,
+                metric=metric,
+                passives=passives,
+                slot_limit=slot_count,
+                capacity_limit=capacity_limit,
+                target_context=target_context,
+            )
+            if filled is None or not eligible(filled) or filled.score < best.score:
+                continue
+            best = filled
+            used_keys.add(card.key)
+            used_families.add(family)
+            if len(best.cards) + (1 if riven else 0) >= slot_count:
+                break
+    # ── F07（审计修复）：最终输出统一验证。任何阶段的旁路（缓存候选、
+    # beam、爬山、中性填充、floor）到这里都会被同一验证器拦截——不可行
+    # 的构建宁可报错也不返回。
+    final_violation = _constraint_violation(best.cards)
+    if final_violation is not None:
+        raise SimulationError(
+            f"optimizer produced an infeasible build ({final_violation})"
+        )
+    return best
+
+
+@memoized_search
+def _best_fixed(
+    weapon: Mapping[str, Any],
+    base_cards: Sequence[_Card],
+    riven: _Card,
+    *,
+    scenario: Scenario,
+    metric: str,
+    passives: _Card | None = None,
+    capacity_limit: int = 60,
+    target_context: Mapping[str, Any] | None = None,
+    max_keep_cap: int | None = None,
+    preserve_base: bool = False,
+) -> _Evaluation:
+    required = tuple(card for card in base_cards if card.required)
+    optional = tuple(card for card in base_cards if not card.required)
+    max_keep = min(len(optional), 7 - len(required))
+    preserved = None
+    if preserve_base:
+        preserved = _evaluate(
+            weapon, base_cards, riven, scenario=scenario, metric=metric,
+            passives=passives, capacity_limit=capacity_limit,
+            target_context=target_context,
+        )
+    # A search budget cannot mean forcibly deleting equipped mods. Start at
+    # the largest legal subset (usually only 1 or 8 candidates), preserving
+    # the available build and avoiding C(8,5) repeated replay explosions.
+    from wfarsenal import parallel as _parallel
+
+    def evaluate(cards: Sequence[_Card]) -> _Evaluation | None:
+        return _evaluate(weapon, cards, riven, scenario=scenario, metric=metric, passives=passives,
+                         capacity_limit=capacity_limit, target_context=target_context)
+
+    for keep in range(max_keep, -1, -1):
+        subsets = [(*required, *(optional[index] for index in indexes))
+                   for indexes in itertools.combinations(range(len(optional)), keep)]
+        pool = _parallel.get_pool() if len(subsets) >= 4 else None
+        if pool is None:
+            evaluated = [value for cards in subsets if (value := evaluate(cards)) is not None]
+        else:
+            # Score the subsets on the pool, keep the first best (as max()
+            # does), and evaluate only that one here for its full stats.
+            context = _parallel.shared({
+                "weapon": weapon, "metric": metric, "passives": passives, "slot_limit": 8,
+                "capacity_limit": capacity_limit, "target_context": target_context,
+                "scenario": scenario if isinstance(scenario.conditional_stacks, dict)
+                else replace(scenario, conditional_stacks=dict(scenario.conditional_stacks)),
+            })
+            futures = [pool.submit(_parallel._score_job, (cards, riven, context)) for cards in subsets]
+            chosen: int | None = None
+            chosen_score = 0.0
+            try:
+                for index, future in enumerate(futures):
+                    score = future.result()
+                    heartbeat(1)
+                    if score is not None and (chosen is None or score > chosen_score):
+                        chosen, chosen_score = index, score
+            finally:
+                for future in futures:
+                    future.cancel()
+            evaluated = [] if chosen is None else [value for value in (evaluate(subsets[chosen]),) if value is not None]
+        if evaluated:
+            candidate = max(evaluated, key=lambda value: value.score)
+            if preserved is None:
+                return candidate
+            return max((preserved, candidate), key=lambda value: value.score)
+    if preserved is not None:
+        return preserved
+    raise SimulationError("no capacity-valid build can equip the Riven")
+
+
+def _best_fixed_scores(
+    weapon: Mapping[str, Any],
+    items: Sequence[tuple[Sequence[_Card], _Card]],
+    **kwargs: Any,
+) -> list[float | Exception]:
+    """``_best_fixed(weapon, base_cards, riven, **kwargs).score`` for each
+    (base_cards, riven) item, or the exception it raised.
+
+    On the pool, every item's subsets of one keep level go out as one batch
+    (one item has only 1-8 subsets: most workers would wait), and an item is
+    settled at the first level where a subset fits, as ``_best_fixed`` does.
+    """
+    from wfarsenal import parallel as _parallel
+
+    pool = _parallel.get_pool() if len(items) > 1 else None
+    if pool is None:
+        results: list[float | Exception] = []
+        for base_cards, riven in items:
+            try:
+                results.append(_best_fixed(weapon, base_cards, riven, **kwargs).score)
+            except Exception as exc:
+                results.append(exc)
+        return results
+    scenario = kwargs["scenario"]
+    context = _parallel.shared({
+        "weapon": weapon, "metric": kwargs["metric"], "passives": kwargs.get("passives"), "slot_limit": 8,
+        "capacity_limit": kwargs.get("capacity_limit", 60), "target_context": kwargs.get("target_context"),
+        "scenario": scenario if isinstance(scenario.conditional_stacks, dict)
+        else replace(scenario, conditional_stacks=dict(scenario.conditional_stacks)),
+    })
+    splits = []
+    for base_cards, _riven in items:
+        required = tuple(card for card in base_cards if card.required)
+        optional = tuple(card for card in base_cards if not card.required)
+        splits.append((required, optional, min(len(optional), 7 - len(required))))
+    settled: dict[int, float | Exception] = {}
+    for step in itertools.count():
+        level = [(index, splits[index][2] - step) for index in range(len(items))
+                 if index not in settled and splits[index][2] - step >= 0]
+        if not level:
+            break
+        futures = []
+        for index, keep in level:
+            required, optional, _max_keep = splits[index]
+            futures.append([pool.submit(_parallel._score_job, ((*required, *(optional[i] for i in indexes)),
+                                                               items[index][1], context))
+                            for indexes in itertools.combinations(range(len(optional)), keep)])
+        try:
+            for (index, _keep), row in zip(level, futures):
+                best: float | None = None
+                try:
+                    for future in row:
+                        score = future.result()
+                        heartbeat(1)
+                        if score is not None and (best is None or score > best):
+                            best = score
+                except Exception as exc:
+                    settled[index] = exc
+                    continue
+                if best is not None:
+                    settled[index] = best
+        finally:
+            for row in futures:
+                for future in row:
+                    future.cancel()
+    return [settled.get(index, SimulationError("no capacity-valid build can equip the Riven"))
+            for index in range(len(items))]
+
+
+def validate_build(
+    cards: Sequence[_Card],
+    riven: _Card | None,
+    *,
+    slot_count: int,
+    capacity_limit: int,
+    required_mod_keys: Sequence[str] | None = None,
+    forbidden_mod_keys: Sequence[str] | None = None,
+    min_fill: int | None = None,
+    max_fill: int | None = None,
+) -> str | None:
+    """F07（审计修复）：统一可行域校验器。
+
+    检查一份配卡（不含紫卡本体）是否满足请求的全部搜索约束：
+    必选卡在场、禁选卡不在场、配卡数量范围（含紫卡与必选）、槽位与
+    容量上限。返回 ``None`` 表示合法；返回字符串为拒绝原因。
+
+    所有搜索阶段（种子、缓存候选、邻域变动、floor 修正、最终输出）
+    都应通过同一验证器，约束不再依赖临时卡对象的 ``required`` 布尔
+    标记（旧实现里用户必选卡进 ``required_cards`` 后没有标
+    ``required=True``，爬山 Drop/Swap 仍可能把它当可移除卡删掉）。
+    """
+    keys = [card.key for card in cards]
+    key_set = set(keys)
+    if len(key_set) != len(keys):
+        return "duplicate-mod"
+    total = len(cards) + (1 if riven is not None else 0)
+    if total > slot_count:
+        return f"slot-count-{total}>{slot_count}"
+    required = {str(key) for key in (required_mod_keys or ()) if str(key)}
+    missing = required - key_set
+    if missing:
+        return "missing-required:" + ",".join(sorted(missing))
+    forbidden = {str(key) for key in (forbidden_mod_keys or ()) if str(key)}
+    present_forbidden = key_set & forbidden
+    if present_forbidden:
+        return "forbidden-mod:" + ",".join(sorted(present_forbidden))
+    if min_fill is not None and total < int(min_fill):
+        return f"under-min-fill-{total}<{int(min_fill)}"
+    if max_fill is not None and total > int(max_fill):
+        return f"over-max-fill-{total}>{int(max_fill)}"
+    capacity = _capacity(list(cards) + ([riven] if riven is not None else []))
+    if capacity > capacity_limit:
+        return f"over-capacity-{capacity}>{capacity_limit}"
+    return None
+
+
+def _mark_required_cards(
+    cards: Sequence[_Card], required_keys: Sequence[str]
+) -> tuple[_Card, ...]:
+    """F07：把用户必选卡物化为 ``required=True`` 的卡对象。
+
+    爬山的 Swap/Drop 阶段按 ``card.required`` 判定可移除集合；用户必选
+    卡必须进入该标记通道，否则 beam 之后的局部搜索可能把它删掉（旧
+    实现的旁路之一）。返回新元组，不修改原卡对象。
+    """
+    required = {str(key) for key in required_keys if str(key)}
+    if not required:
+        return tuple(cards)
+    return tuple(
+        replace(card, required=True) if card.key in required else card
+        for card in cards
+    )
+
+
+# Riven stat values (wiki, Riven Mods, Attribute Value Formula): base value x
+# a uniform roll of 90-110% x Riven disposition x the card's weight. A max roll
+# is nominal x 1.1, shown in game as a +10% grade.
+RIVEN_ROLL_LOW = 0.9
+RIVEN_ROLL_HIGH = 1.1
+_RIVEN_BONUS_WEIGHTS = {(2, False): 0.99, (2, True): 1.2375, (3, False): 0.75, (3, True): 0.9375}
+_RIVEN_MALUS_WEIGHTS = {2: 0.495, 3: 0.75}
+
+
+def theoretical_structure_scale(
+    positive_count: int, has_negative: bool, *, negative: bool = False
+) -> float:
+    """紫卡词条结构的数值权重（wiki 口径，app 校验、前端与 Bot 同一套）。
+
+    正面词条：2 正 = 0.99；2 正 1 负 = 1.2375；3 正 = 0.75；3 正 1 负 = 0.9375。
+    负面词条：2 正 1 负 = 0.495；3 正 1 负 = 0.75。
+    """
+    positives = 3 if positive_count == 3 else 2
+    if negative:
+        return _RIVEN_MALUS_WEIGHTS[positives]
+    return _RIVEN_BONUS_WEIGHTS[(positives, bool(has_negative))]
+
+
+def riven_stat_window(
+    base: float, disposition: float, positive_count: int, negative_count: int, *, negative: bool = False
+) -> tuple[float, float, float]:
+    """(nominal, lowest roll, highest roll) of one Riven stat on this card shape."""
+    nominal = abs(base * disposition * theoretical_structure_scale(positive_count, bool(negative_count), negative=negative))
+    return nominal, nominal * RIVEN_ROLL_LOW, nominal * RIVEN_ROLL_HIGH
+
+
+def _structure_full_roll_factor() -> float:
+    """理论满值相对 nominal 的上浮系数（wiki：roll 上限 110%）。"""
+    return RIVEN_ROLL_HIGH
+
+
+def _fusion_codes_from_templates(
+    templates: Mapping[str, Any], weapon_type: str
+) -> frozenset[str]:
+    """Read advanced-trait availability; recipe completeness is separate."""
+    return _available_fusion_codes(templates, weapon_type)
+
+
+
+def _riven_allowed_codes(
+    templates: Mapping[str, Any], weapon_type: str, weapon: Mapping[str, Any], *, negative: bool
+) -> frozenset[str]:
+    """Template roll flags and weapon restrictions, independent of effect support."""
+    rows = {code: stat for code, _unit, stat, _upgrade in
+            _template_stats(templates, weapon_type, lenient=True)}
+    # These special upgrade shapes retain their existing wire rules.
+    for template in templates.get("templates") or ():
+        if template.get("weaponType") == weapon_type:
+            for stat in template.get("stats") or ():
+                code = _FACE_TAG_CODES.get(str(stat.get("tag") or ""))
+                if code and code not in rows:
+                    rows[code] = stat
+    sentinel = str(weapon.get("slot") or "").casefold() == "companion"
+    allowed = set()
+    for code in set(RIVEN_BASE_VALUES.get(weapon_type, {})) | rows.keys():
+        rule = RIVEN_RULES.get(code)
+        if not rule or not rule[8 if negative else 7]:
+            continue
+        stat = rows.get(code)
+        if stat is not None:
+            if not stat.get("canBeCurse" if negative else "canBeBuff", True):
+                continue
+            restrictions = stat.get("curseRestrictions" if negative else "buffRestrictions") or ()
+            if "NotSentinel" in restrictions and sentinel:
+                continue
+        allowed.add(code)
+    return frozenset(allowed)
+
+
+def _candidate_lines(
+    weapon_type: str,
+    disposition: float,
+    actual: Sequence[_RivenLine],
+    *,
+    negative: bool,
+    bases: Mapping[str, float] | None = None,
+    structure_scale: float | None = None,
+    available_fusion_codes: frozenset[str] | None = None,
+    allowed_codes: frozenset[str] | None = None,
+) -> tuple[list[_RivenLine], bool]:
+    bases = dict(bases or RIVEN_BASE_VALUES[weapon_type])
+    ratios = []
+    for line in actual:
+        base = bases.get(line.code)
+        if line.negative == negative and base and disposition > 0 and line.high > 0:
+            ratios.append(line.high / (base * disposition))
+    calibrated = bool(ratios)
+    if structure_scale is not None:
+        # 显式结构系数（理论口径）：3+1 求解/上限计算用，不依赖实际紫卡
+        # 的 roll 指纹校准。×1.1 满值上浮（wiki：roll 上限 110%）。
+        roll_scale = float(structure_scale) * _structure_full_roll_factor()
+    elif ratios:
+        roll_scale = median(ratios)
+    else:
+        positive_count = sum(not line.negative for line in actual)
+        has_curse = any(line.negative for line in actual)
+        # Widely used nominal structure factors; the response marks this fallback
+        # as heuristic because the randomized fingerprint formula is not decoded.
+        roll_scale = (
+            theoretical_structure_scale(
+                positive_count or 2, has_curse, negative=negative
+            )
+            * _structure_full_roll_factor()
+        )
+
+    lines: list[_RivenLine] = []
+    # Candidate availability follows advanced-trait templates, not recipe coverage.
+    for code, base in bases.items():
+        if allowed_codes is not None and code not in allowed_codes:
+            continue
+        rule = RIVEN_RULES.get(code)
+        if rule is None:
+            continue
+        can_roll = rule[8] if negative else rule[7]
+        if not can_roll:
+            continue
+        if (
+            code in _FUSION_LINE_CODES
+            and available_fusion_codes is not None
+            and code not in available_fusion_codes
+        ):
+            continue
+        value = base * disposition * roll_scale
+        effect = _effect_from_code(
+            code, value, negative=negative, source=f"riven:theoretical:{code}"
+        )
+        lines.append(
+            _RivenLine(
+                code=code,
+                label=rule[0],
+                value=value,
+                low=0.0,
+                high=value,
+                negative=negative,
+                unit=rule[5],
+                effect=effect,
+            )
+        )
+    return lines, calibrated
+
+
+def _neutral_negative_codes(weapon: Mapping[str, Any]) -> frozenset[str]:
+    """Negative affixes that are neutral under the current scoring model.
+
+    These are deliberately model-scoped: zoom, reserve ammo, recoil and the
+    slide-crit gate are not represented by the single-target damage reducer.
+    They must be preferred over damage-reducing negatives when a Riven solver
+    is choosing a 3+1 structure, but they are not claimed to be universally
+    harmless in every live gameplay situation.
+    """
+    slot = str(weapon.get("slot") or "").casefold()
+    if slot in MELEE_SLOTS:
+        return frozenset({"X", "E"})
+    return frozenset({"Z", "H", "M", "E"})
+
+
+# A malus that still costs more than this after the build re-adapts around it
+# is "fatal" (致命负面).
+FATAL_NEGATIVE_LOSS = 0.35
+
+
+def _assess_negatives(
+    weapon: Mapping[str, Any],
+    mod_pool: Sequence[_Card],
+    baseline: _Evaluation,
+    positive_lines: Sequence[_RivenLine],
+    ranked: Sequence[tuple[float, _RivenLine]],
+    negative_map: Mapping[str, _RivenLine],
+    neutral_codes: frozenset[str],
+    *,
+    scenario: Scenario,
+    metric: str,
+    passives: _Card | None,
+    capacity_limit: int,
+    target_context: Mapping[str, Any] | None,
+    keep_cap: int | None,
+    classification_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Every negative stat of the weapon, judged on its best build.
+
+    ``ranked`` holds each candidate malus scored on the baseline build with
+    the recommended bonuses (fixed cards, the best kept subset). A malus that
+    loses more than ``FATAL_NEGATIVE_LOSS`` there gets a second chance: the
+    build page's search (element niches, panel-proxy seeds, and one seeded
+    with the baseline) lets the build follow the malus -- a status malus moves
+    the build to crit, a magazine malus feeds a first-shot card -- and both
+    sides of the comparison are searched the same way. Only a malus that
+    still loses that much is fatal.
+
+    Calibrated 2026-10-16 on the user's gold standards (2 bonuses + malus at
+    the theoretical roll, Lv170 hardness-integrated target): a Status Chance
+    malus below 95% is not fatal on Furis (-14%), Burston (-34%) or Burston
+    Prime (-31%) once the build moves to crit; Vectis Prime's Magazine malus
+    costs 0% on its baseline and ~22% with Primed Chamber; Base Damage stays
+    fatal (Furis -49%, Boltor Prime -83%).
+    """
+    # Windowed DPS, not kills per minute: KPM saturates on an easy target
+    # (a fast-profile reference read exactly 48.0) and hides what a malus costs.
+    if metric == "killsPerMinute" and target_context is not None:
+        metric = "windowedDps"
+    common = dict(scenario=scenario, metric=metric, passives=passives, capacity_limit=capacity_limit,
+                  target_context=target_context)
+    codes = [code for code in dict.fromkeys(line.code for _score, line in ranked) if code in negative_map]
+    fixed = _best_fixed_scores(
+        weapon, [(baseline.cards, _card_from_lines(list(positive_lines)))]
+        + [(baseline.cards, _card_from_lines([*positive_lines, negative_map[code]])) for code in codes],
+        max_keep_cap=keep_cap, **common)
+    reference = fixed[0]
+    if isinstance(reference, Exception) or not reference:
+        return []
+    rows = []
+    for code, score in zip(codes, fixed[1:]):
+        if isinstance(score, Exception):
+            continue
+        line = negative_map[code]
+        rows.append(dict(code=code, label=line.label, value=line.value, neutral=code in neutral_codes,
+                         fixedDelta=score / reference - 1.0, reoptimizedDelta=None, fatal=False, fatalAbove=None))
+    suspects = [row for row in rows if not row["neutral"] and row["fixedDelta"] < -FATAL_NEGATIVE_LOSS]
+    if suspects:
+        witnesses: OrderedDict = OrderedDict()
+        state = SESSION.get()
+        work = (state.setdefault('negativeWork', {}) if state is not None else {})
+
+        def count(name):
+            work[name] = work.get(name, 0) + 1
+
+        def remember(best):
+            cards = tuple(getattr(best, "cards", ()))
+            if cards:
+                key = tuple((card.key, card.rank) for card in cards)
+                witnesses[key] = cards
+                witnesses.move_to_end(key)
+                while len(witnesses) > 8:
+                    witnesses.popitem(last=False)
+            return best.score
+
+        def search(lines, proof_reference=None):
+            riven = _card_from_lines(list(lines))
+            def proves_safe(found):
+                return (proof_reference is not None and proof_reference > 0
+                        and found.score / proof_reference - 1.0 >= -FATAL_NEGATIVE_LOSS)
+
+            count('fastSearches')
+            seeded = _optimize(weapon, mod_pool, riven, profile="fast", seed_cards=tuple(baseline.cards), **common)
+            if proves_safe(seeded):
+                count('fastProofs')
+                return remember(seeded), False
+            if proof_reference is not None:
+                # Cheap proxy seeds often recover a status/crit alternative
+                # before the expensive event-scored standard beam is needed.
+                count('proxyScreens')
+                screened = proxy_seed_best(weapon, mod_pool, riven, seeded, profile="standard", **common)
+                if proves_safe(screened):
+                    count('proxyProofs')
+                    return remember(screened), False
+            count('standardSearches')
+            fresh = _optimize(weapon, mod_pool, riven, profile="standard", element_niches=2, **common)
+            best = max((seeded, fresh), key=lambda found: found.score)
+            if proves_safe(best):
+                count('standardProofs')
+                return remember(best), False
+            count('proxySearches')
+            best = proxy_seed_best(weapon, mod_pool, riven, best, profile="standard", **common)
+            return remember(best), True
+        # The denominator always receives the complete original search.
+        reference_score, _ = search(positive_lines)
+        searched_reference = max(reference_score, reference)
+        for row in suspects:
+            lines = [*positive_lines, negative_map[row["code"]]]
+            score, complete = None, False
+            if classification_only:
+                riven = _card_from_lines(lines)
+                for cards in tuple(witnesses.values()):
+                    found = _evaluate(weapon, cards, riven, **common)
+                    if found is not None and found.score / searched_reference - 1.0 >= -FATAL_NEGATIVE_LOSS:
+                        score = found.score
+                        count('classificationWitnessProofs')
+                        break
+            if score is None:
+                score, complete = search(lines, searched_reference if classification_only else None)
+            best = max(score, (1.0 + row["fixedDelta"]) * reference)
+            row["reoptimizedDelta"] = best / searched_reference - 1.0
+            if not complete:
+                row["reoptimizedDeltaIsLowerBound"] = True
+            row["fatal"] = row["reoptimizedDelta"] < -FATAL_NEGATIVE_LOSS
+
+        def fixed_delta(line):
+            score = _best_fixed_scores(weapon, [(baseline.cards, _card_from_lines([*positive_lines, line]))],
+                                       max_keep_cap=keep_cap, **common)[0]
+            if isinstance(score, Exception):
+                raise score
+            return score / reference - 1.0
+
+        def fatal_at(line, delta):
+            """The same two-step judgement as above, for one roll of a malus."""
+            if delta >= -FATAL_NEGATIVE_LOSS:
+                return False
+            riven = _card_from_lines([*positive_lines, line])
+            witnessed = 0.0
+            for cards in tuple(witnesses.values()):
+                found = _evaluate(weapon, cards, riven, **common)
+                if found is not None:
+                    witnessed = max(witnessed, found.score)
+                    # One legal build above the cutoff proves non-fatal. A
+                    # score below it cannot prove fatal: keep the full search.
+                    if witnessed / searched_reference - 1.0 >= -FATAL_NEGATIVE_LOSS:
+                        count('witnessProofs')
+                        return False
+            score, _ = search([*positive_lines, line], searched_reference)
+            best = max(score, witnessed, (1.0 + delta) * reference)
+            return best / searched_reference - 1.0 < -FATAL_NEGATIVE_LOSS
+
+        for row in suspects:
+            if row["fatal"]:
+                row["fatalAbove"] = _fatal_roll_threshold(negative_map[row["code"]], fixed_delta, fatal_at)
+    rows.sort(key=lambda row: (row["reoptimizedDelta"] if row["reoptimizedDelta"] is not None else row["fixedDelta"]))
+    return rows
+
+
+# Resolution of a roll-dependent fatal threshold, in the stat's percent points.
+FATAL_THRESHOLD_STEP = 0.1
+
+
+def _fatal_roll_threshold(top: _RivenLine, fixed_delta, fatal_at) -> float | None:
+    """The highest roll of a fatal malus that is still not fatal, or None.
+
+    A malus judged fatal at its theoretical (highest) roll can be harmless or
+    even the best malus at lower rolls: a 3+1 Status Duration window that
+    crosses -100% (Dual Decurion 87.7-107.2%) speeds up Heat's armour strip
+    until statuses expire between shots and then vanish at -100%. When the
+    lowest roll is not fatal, the boundary is bisected to
+    ``FATAL_THRESHOLD_STEP``: first on the fixed build (cheap), then the roll
+    just above that boundary gets the re-search, and only if the re-search
+    rescues it does the bisection continue with re-searches. Rounded down, so
+    every roll up to the returned value is not fatal.
+    """
+    def rolled(value):
+        return replace(top, value=value, effect=_effect_from_code(top.code, value, negative=True,
+                                                                  source="riven:theoretical:" + top.code))
+
+    def shown(value):  # one decimal, as cards show it, rounded towards the safe side
+        return math.floor(value * 10.0 + 1e-9) / 10.0
+
+    low, high = top.value * RIVEN_ROLL_LOW / RIVEN_ROLL_HIGH, top.value
+    line = rolled(low)
+    low_delta = fixed_delta(line)
+    if fatal_at(line, low_delta):
+        return None
+    ok = low
+    if low_delta >= -FATAL_NEGATIVE_LOSS:
+        # Phase 1: the fixed-build boundary (low passes, high fails on the fixed build).
+        bad = high
+        while bad - ok > FATAL_THRESHOLD_STEP:
+            middle = (ok + bad) / 2.0
+            if fixed_delta(rolled(middle)) >= -FATAL_NEGATIVE_LOSS:
+                ok = middle
+            else:
+                bad = middle
+        line = rolled(bad)
+        if fatal_at(line, fixed_delta(line)):
+            return shown(ok)
+        ok = bad
+    # Phase 2: the re-search rescues rolls past the fixed boundary.
+    while high - ok > FATAL_THRESHOLD_STEP:
+        middle = (ok + high) / 2.0
+        line = rolled(middle)
+        if fatal_at(line, fixed_delta(line)):
+            high = middle
+        else:
+            ok = middle
+    return shown(ok)
+
+
+def _recommend_positive(
+    weapon: Mapping[str, Any],
+    baseline: _Evaluation,
+    candidates: Sequence[_RivenLine],
+    count: int,
+    *,
+    scenario: Scenario,
+    metric: str,
+    passives: _Card | None = None,
+    capacity_limit: int = 60,
+    target_context: Mapping[str, Any] | None = None,
+    profile: str = "deep",
+    extra_bases: Sequence[Sequence[_Card]] = (),
+) -> tuple[list[_RivenLine], _Evaluation, list[dict[str, Any]]]:
+    # 档位缩水（wfsim 优化器预算思想的移植）：
+    #   fast     — 单词条粗排后直接取头部组合，跳过组合枚举与边际贡献分层，
+    #               tiers 退化为按单词条粗排分数归一化（仍然给出 T0–T3 标签）。
+    #   standard — 单词条粗排 + 头部组合枚举（shortlist 8）+ 边际贡献，
+    #               _best_fixed 的子集枚举上限压到 5（2^5=32 而非 2^7=128）。
+    #   deep     — 完整口径（现状）。
+    # No wall-clock cutoff: these rankings are weapon-level statics shared by
+    # every card, so they must not depend on machine load.
+    deadline = float("inf")
+    keep_cap = {"fast": 3, "standard": 5, "deep": None}[profile]
+    # Archetype bases: a stat is worth what the build that uses it best makes
+    # of it. Scoring every line on the no-Riven optimum alone undervalues
+    # stats that would flip the build (status on a direct base, or reverse).
+    bases: list[tuple[_Card, ...]] = [tuple(baseline.cards)]
+    for extra in extra_bases:
+        if tuple(extra) not in bases:
+            bases.append(tuple(extra))
+
+    def fit(riven_card: _Card) -> _Evaluation:
+        best: _Evaluation | None = None
+        for base in bases:
+            try:
+                result = _best_fixed(
+                    weapon, base, riven_card, scenario=scenario, metric=metric,
+                    passives=passives, capacity_limit=capacity_limit,
+                    target_context=target_context, max_keep_cap=keep_cap,
+                )
+            except SimulationError:
+                continue
+            if best is None or result.score > best.score:
+                best = result
+        if best is None:
+            raise SimulationError("no capacity-valid build can equip the Riven")
+        return best
+
+    # ── 单词条粗排并行化（每词条一次 _best_fixed 的子集枚举——40+ 次
+    # 独立的重量评估；物理核 worker 池，串行回退）──────────────────────
+    _supported_lines = [
+        line for line in candidates
+        if line.effect is not None and line.effect.supported
+    ]
+    from wfarsenal import parallel as _parallel
+
+    _pool_exec = _parallel.get_pool()
+    fixed_kwargs = dict(scenario=scenario, metric=metric, passives=passives, capacity_limit=capacity_limit,
+                        target_context=target_context, max_keep_cap=keep_cap)
+
+    def fit_rows(riven_cards: Sequence[_Card]) -> list[list[float | Exception]]:
+        """``_best_fixed(base, card).score`` (or its exception) for every
+        base, per card, scored together on the pool."""
+        values = _best_fixed_scores(weapon, [(base, card) for card in riven_cards for base in bases],
+                                    **fixed_kwargs)
+        return [values[row * len(bases):(row + 1) * len(bases)] for row in range(len(riven_cards))]
+
+    # ── 单词条粗排并行化（每词条一次 _best_fixed 的子集枚举——40+ 次
+    # 独立的重量评估；物理核 worker 池，串行回退）──────────────────────
+    _line_scores: list[float | None] | None = None
+    if _pool_exec is not None and len(_supported_lines) >= 4:
+        # A line whose fit fails any way is left out, as before.
+        _line_scores = []
+        for row in fit_rows([_card_from_lines([line]) for line in _supported_lines]):
+            values = [value for value in row if not isinstance(value, Exception)]
+            _line_scores.append(max(values) if values else None)
+
+    def fit_scores(riven_cards: Sequence[_Card]) -> list[float]:
+        """``fit(card).score`` for each card, scored together on the pool.
+
+        Same choice as ``fit``: the first base with the highest score, bases
+        that cannot equip the Riven skipped, SimulationError when none can.
+        """
+        if _pool_exec is None or len(riven_cards) * len(bases) < 4:
+            return [fit(card).score for card in riven_cards]
+        scores: list[float] = []
+        for row in fit_rows(riven_cards):
+            best: float | None = None
+            for value in row:
+                if isinstance(value, SimulationError):
+                    continue
+                if isinstance(value, Exception):
+                    raise value
+                if best is None or value > best:
+                    best = value
+            if best is None:
+                raise SimulationError("no capacity-valid build can equip the Riven")
+            scores.append(best)
+        return scores
+
+    ranked: list[tuple[float, _RivenLine]] = []
+    if _line_scores is not None:
+        for line, score in zip(_supported_lines, _line_scores):
+            if score is not None:
+                ranked.append((score, line))
+    else:
+        for line in _supported_lines:
+            try:
+                result = fit(_card_from_lines([line]))
+            except SimulationError:
+                # 与并行口径一致：单词条无可行配装时跳过（worker 侧
+                # 捕获后返回 None）。
+                continue
+            ranked.append((result.score, line))
+    ranked.sort(key=lambda item: (-item[0], item[1].code))
+    shortlist = [line for _, line in ranked[: max(8, count)]]
+    if len(shortlist) < count:
+        raise SimulationError("not enough supported Riven stats for this weapon")
+    # One fusion stat per card: a top eight of seven fusion stats holds no legal
+    # three-stat card, so top it up with the best ordinary stats below it.
+    ordinary = sum(line.code not in _FUSION_LINE_CODES for line in shortlist)
+    if ordinary < count - 1:
+        shortlist += [line for _, line in ranked[len(shortlist):]
+                      if line.code not in _FUSION_LINE_CODES][: count - 1 - ordinary]
+    best_lines: tuple[_RivenLine, ...] | None = None
+    best_result: _Evaluation | None = None
+    if profile == "fast":
+        # 头部组合 = 粗排前 count 名直接组合，不枚举 C(8,count)。
+        # 融合词条每卡限 1 条：跳过第二条及以后的融合词条顺延取非融合。
+        fast_combo: list[_RivenLine] = []
+        fusion_used = False
+        for line in shortlist:
+            if len(fast_combo) >= count:
+                break
+            if line.code in _FUSION_LINE_CODES:
+                if fusion_used:
+                    continue
+                fusion_used = True
+            fast_combo.append(line)
+        best_lines = tuple(fast_combo)
+        best_result = fit(_card_from_lines(best_lines))
+    else:
+        # 融合词条每卡限 1 条（游戏规则）：含 2+ 融合的组合非法。
+        # Every combination is an independent fit (no deadline here): score
+        # them on the pool, keep the first best, then rebuild that one.
+        combos = [combo for combo in itertools.combinations(shortlist, count) if _combo_allows_fusion(combo)]
+        best_score: float | None = None
+        for combo, score in zip(combos, fit_scores([_card_from_lines(combo) for combo in combos])):
+            if best_score is None or score > best_score:
+                best_lines, best_score = combo, score
+        if best_lines is not None:
+            best_result = fit(_card_from_lines(best_lines))
+    assert best_lines is not None and best_result is not None
+
+    # Score each affix in a full-card context. A one-line Riven can lose to the
+    # mod slot it replaces even when that affix is valuable on a complete card.
+    # 快速档跳过边际贡献阶段：单词条粗排已有分数，直接归一化出分层。
+    marginal: list[tuple[float, _RivenLine]] = []
+    if profile == "fast" or expired(deadline):
+        # 单词条分数相对「同一基装配紫卡（空词条组）」归一化：粗排口径，
+        # 分层只作参考（无组合上下文），但零组合枚举成本。
+        bare_base = fit(_card_from_lines([]))
+        for score, line in ranked:
+            gain = _percent_gain(score, bare_base.score)
+            if gain > 0:
+                marginal.append((gain, line))
+        marginal.sort(key=lambda item: (-item[0], item[1].code))
+    else:
+        anchors: dict[tuple[str, ...], tuple[_RivenLine, ...]] = {}
+        pairs: list[tuple[_RivenLine, tuple[str, ...], tuple[_RivenLine, ...]]] = []
+        for _, line in ranked:
+            anchor = tuple(item for item in best_lines if item.code != line.code)[: count - 1]
+            if len(anchor) < count - 1:
+                anchor = tuple(best_lines[: count - 1])
+            anchor_key = tuple(item.code for item in anchor)
+            anchors.setdefault(anchor_key, anchor)
+            pairs.append((line, anchor_key, (*anchor, line)))
+        scores = fit_scores([_card_from_lines(anchor) for anchor in anchors.values()]
+                            + [_card_from_lines(lines) for _, _, lines in pairs])
+        without = dict(zip(anchors, scores[:len(anchors)]))
+        for (line, anchor_key, _), with_score in zip(pairs, scores[len(anchors):]):
+            gain = _percent_gain(with_score, without[anchor_key])
+            if gain > 0:
+                marginal.append((gain, line))
+        marginal.sort(key=lambda item: (-item[0], item[1].code))
+    best_gain = marginal[0][0] if marginal else 0.0
+    tiers: list[dict[str, Any]] = []
+    for tier, ceiling, floor in (
+        ("T0", math.inf, 80.0),
+        ("T1", 80.0, 60.0),
+        ("T2", 60.0, 40.0),
+        ("T3", 40.0, 0.0),
+    ):
+        stats = []
+        for gain, line in marginal:
+            score = gain / best_gain * 100.0
+            if floor <= score < ceiling:
+                stats.append(
+                    {"code": line.code, "label": line.label, "gain": gain, "score": score}
+                )
+                if len(stats) == 3:
+                    break
+        if stats:
+            tiers.append({"tier": tier, "stats": stats})
+    return list(best_lines), best_result, tiers
+
+
+# ── 最优紫卡词条求解（anytime 预算驱动）────────────────────────────────
+# 用户在配装页紫卡构建器请求「计算最优」：在当前武器/基准配装的语境下，
+# 搜出 KPM 最高的紫卡词条组合（2-3 正 + 0-1 负，理论满数值口径），
+# 返回 top-N。预算由调用方传入（用户选 10/20/30/60 秒），算法分三阶段
+# 单调改进，时间耗尽即返回当前最优——结果完整性随预算增加而提高。
+
+def _riven_combo_key(lines: Sequence[_RivenLine]) -> tuple[str, ...]:
+    return tuple(sorted(('-' if line.negative else '+') + line.code for line in lines))
+
+
+def recommend_optimal_riven(
+    weapon: Mapping[str, Any],
+    baseline: _Evaluation,
+    positive_candidates: Sequence[_RivenLine],
+    negative_candidates: Sequence[_RivenLine],
+    *,
+    scenario: Scenario,
+    metric: str,
+    passives: _Card | None = None,
+    capacity_limit: int = 60,
+    target_context: Mapping[str, Any] | None = None,
+    budget_seconds: float = 10.0,
+    top_limit: int = 10,
+    slot_count: int = 8,
+    min_fill: int | None = None,
+    max_fill: int | None = None,
+    required_damage_type: str | None = None,
+    special_cards: Sequence[_Card] = (),
+    special_capacity_cost: int = 0,
+) -> dict[str, Any]:
+    from .riven_recommendation import recommend
+    return recommend(weapon, baseline, positive_candidates, negative_candidates,
+        scenario=scenario, metric=metric, passives=passives, capacity_limit=capacity_limit,
+        target_context=target_context, budget_seconds=budget_seconds, top_limit=top_limit,
+        slot_count=slot_count, min_fill=min_fill, max_fill=max_fill,
+        required_damage_type=required_damage_type, special_cards=special_cards,
+        special_capacity_cost=special_capacity_cost)
+
+
+def _metric(requested: Any, weapon_type: str) -> tuple[str, str | None]:
+    raw = str(requested or "").strip()
+    aliases = {
+        "": "attackDps" if weapon_type == "melee" else "sustainedDps",
+        "sustained": "sustainedDps",
+        "sustained_dps": "sustainedDps",
+        "burst": "burstDps",
+        "burst_dps": "burstDps",
+        "shot": "shotDamage",
+        "normal": "attackDps",
+        "heavy": "heavyAttackDps",
+        "heavy_attack": "heavyAttackDps",
+    }
+    metric = aliases.get(raw.casefold(), raw)
+    allowed = {
+        "shotDamage",
+        "burstDps",
+        "sustainedDps",
+        "attackDps",
+        "heavyAttackDps",
+        "heavyDamage",
+    }
+    if metric not in allowed:
+        fallback = "attackDps" if weapon_type == "melee" else "sustainedDps"
+        return fallback, f"unknown-metric-{raw}-using-{fallback}"
+    if weapon_type != "melee" and metric in {
+        "attackDps",
+        "heavyAttackDps",
+        "heavyDamage",
+    }:
+        return "sustainedDps", f"metric-{metric}-requires-melee"
+    return metric, None
+
+
+def _objective_metric(metric: str) -> str:
+    return "heavyDamage" if metric in {"heavyAttackDps", "heavyDamage"} else metric
+
+
+def _scenario(metric: str, *, incarnon_cycle: bool = False, aiming: bool = False) -> Scenario:
+    return Scenario(
+        heavy_attack=metric in {"heavyAttackDps", "heavyDamage"},
+        incarnon_cycle=incarnon_cycle,
+        aiming=aiming,
+        trigger_policy="emergent",
+    )
+
+
+def _requested_scenario(request: Mapping[str, Any], metric: str) -> Scenario:
+    """Shared public request parser for builds, manual replay and Riven analysis.
+
+    Nested explicit values win, including false/0/null. Distance remains damage
+    falloff/arming input; deferred spread is never consulted here.
+    """
+    nested = request.get('scenario')
+    if nested is not None and not isinstance(nested, Mapping):
+        raise SimulationError('scenario must be an object')
+    nested = nested or {}
+    if 'conditionalStacks' in request or 'conditionalStacks' in nested:
+        raise SimulationError('conditionalStacks is derived from equipped MODs and cannot be overridden')
+    def value(key, default=None):
+        return nested.get(key, request.get(key, default))
+    def boolean(key):
+        raw = value(key, False)
+        if not isinstance(raw, bool):
+            raise SimulationError(f'{key} must be a boolean')
+        return raw
+    def distance(key):
+        raw = value(key)
+        if raw is None:
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw) or raw < 0:
+            raise SimulationError(f'{key} must be a finite non-negative number')
+        return float(raw)
+    combo = value('comboTier', 0)
+    if isinstance(combo, bool) or not isinstance(combo, int) or not 0 <= combo <= 11:
+        raise SimulationError('comboTier must be an integer between 0 and 11')
+    policy = str(value('triggerPolicy', 'emergent') or 'emergent')
+    if policy not in {'emergent', 'assumed_max'}:
+        raise SimulationError('triggerPolicy must be emergent or assumed_max')
+    delay = distance('detonationDelaySeconds')
+    batch = value('detonationBatchSize', 1)
+    if isinstance(batch, bool) or not isinstance(batch, int) or not 1 <= batch <= 8:
+        raise SimulationError('detonationBatchSize must be an integer between 1 and 8')
+    try:
+        return Scenario(aiming=boolean('aiming'), incarnon_cycle=boolean('incarnonCycle'),
+            heavy_attack=boolean('heavyAttack') or _scenario(metric).heavy_attack,
+            distance=distance('distance'), nearest_enemy_distance=distance('nearestEnemyDistance'),
+            cloaked=boolean('cloaked'), combo_tier=combo, trigger_policy=policy,
+            detonation_delay_seconds=delay or 0., detonation_batch_size=batch,
+            combat_state=value('combatState',{}))
+    except (TypeError,ValueError) as exc:
+        raise SimulationError(str(exc)) from exc
+
+
+def _scenario_context(scenario: Scenario) -> dict[str, Any]:
+    return dict(aiming=scenario.aiming, incarnonCycle=scenario.incarnon_cycle,
+                heavyAttack=scenario.heavy_attack, triggerPolicy=scenario.trigger_policy,
+                distance=scenario.distance, cloaked=scenario.cloaked,
+                nearestEnemyDistance=scenario.nearest_enemy_distance, comboTier=scenario.combo_tier,
+                detonationDelaySeconds=scenario.detonation_delay_seconds,
+                detonationBatchSize=scenario.detonation_batch_size,
+                combatState=dict(scenario.combat_state))
+
+
+def _default_analysis_scenario(scenario: Scenario, metric: str) -> bool:
+    # Existing baked statics describe only this state. Non-default scenarios must
+    # not read them, including the fallback that only changes enemy level.
+    # Melee route / stance keys are part of the cache key (benchmark "melee").
+    state = {k: v for k, v in scenario.combat_state.items() if not str(k).startswith("melee")}
+    return _scenario_context(replace(scenario, combat_state=state)) == _scenario_context(_scenario(metric))
+
+
+def _percent_gain(value: float, baseline: float) -> float:
+    return (value / baseline - 1.0) * 100.0 if baseline > 0 else 0.0
+
+
+def _statics_weapon_identity(weapon: Mapping[str, Any]) -> str:
+    """Cache identity of a weapon record: an assembled Kitgun / Zaw adds its parts.
+
+    Assemblies share their base record's path (every Zaw is LotusModularWeapon),
+    so the path alone would let one assembly read another's baked statics.
+    """
+    path = str(weapon.get("path") or "")
+    if weapon.get("exaltedStrength") is not None:
+        # Exalted weapons scaled by the linked frame's Ability Strength.
+        path += f"#strength={weapon['exaltedStrength']:g}"
+    cast = weapon.get("exaltedCast")
+    if isinstance(cast, Mapping) and cast.get("castingSpeed") not in (None, 1, 1.0):
+        path += f"#cast={cast['castingSpeed']:g}"
+    parts = weapon.get("kitgunParts") or weapon.get("zawParts")
+    if not parts:
+        return path
+    return path + "#" + "+".join(sorted(str(part) for part in parts))
+
+
+def _statics_cache_key(
+    weapon_path: Any,
+    innate_elements: Any,
+    fire_mode: int,
+    element_target: str,
+    profile: str,
+    disposition: float,
+    capacity_limit: int,
+    metric: str,
+    benchmark: Mapping[str, Any] | None,
+    *,
+    scoring_level: int | None = None,
+) -> str:
+    """Return a canonical key for one complete static-analysis context.
+
+    The old key omitted disposition and several target toggles.  That allowed
+    a result baked for one target/weapon context to be reused for another one
+    whenever the first few textual fields happened to match.
+    """
+    raw = benchmark if isinstance(benchmark, Mapping) else {}
+    benchmark_key = {
+        "enemy": raw.get("enemy") or raw.get("path") or "-",
+        "level": scoring_level if scoring_level is not None else raw.get("level"),
+        "steelPath": bool(raw.get("steelPath")),
+        "eximus": bool(raw.get("eximus")),
+        "archimedea": bool(raw.get("archimedea")),
+        "empowered": bool(raw.get("empowered")),
+        "armourStrip": raw.get("armourStrip", 0.0),
+        "elementalArmourStrip": raw.get("elementalArmourStrip", 0.0),
+        "headshotChance": raw.get("headshotChance", 0.0),
+        "hitLocation": raw.get("hitLocation", "body"),
+        "stanceMultiplier": raw.get("stanceMultiplier", 1.0),
+        "statusRateMultiplier": raw.get("statusRateMultiplier", 1.0),
+        "heavyAttack": bool(raw.get("heavyAttack")),
+        "windowSeconds": raw.get("windowSeconds", 30.0),
+        "enemyEnhancements": raw.get("enemyEnhancements"),
+        "playerCount": raw.get("playerCount", 1),
+        "eventScoringVersion": "loadout-events-v1",
+    }
+    if raw.get("scenario"):
+        # Only non-default (preset) scenarios carry this, so default-scenario
+        # keys and existing caches are unchanged.
+        benchmark_key["scenario"] = raw["scenario"]
+    if raw.get("melee"):
+        benchmark_key["melee"] = raw["melee"]
+    if raw.get("incarnon"):
+        benchmark_key["incarnon"] = raw["incarnon"]
+    return json.dumps(
+        {
+            "weapon": str(weapon_path or ""),
+            "fireMode": int(fire_mode),
+            "innateElements": innate_elements or (),
+            "elementTarget": element_target or "-",
+            "profile": profile,
+            "disposition": round(float(disposition), 8),
+            "capacityLimit": int(capacity_limit),
+            "metric": metric,
+            "calibrationVersion": TARGET_CALIBRATION_VERSION,
+            "benchmark": benchmark_key,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _evaluation_context_hash(context: Mapping[str, Any]) -> str:
+    """Hash the complete immutable context used for baseline/actual/bestFound."""
+    payload = json.dumps(
+        context,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:20]
+
+
+def _quality(line: _RivenLine) -> float:
+    if line.high <= line.low:
+        return 0.0
+    quality = (line.value - line.low) / (line.high - line.low) * 100.0
+    if line.negative:
+        quality = 100.0 - quality
+    return max(0.0, min(100.0, quality))
+
+
+def _grade(score: float) -> str:
+    for threshold, grade in (
+        (90, "EX"),
+        (80, "S+"),
+        (70, "S"),
+        (60, "A"),
+        (50, "B"),
+        (40, "C"),
+        (30, "D"),
+        (20, "E"),
+    ):
+        if score >= threshold:
+            return grade
+    return "F"
+
+
+def _apply_selected(
+    weapon: Mapping[str, Any],
+    evaluation: _Evaluation,
+    riven: _Card | None,
+    scenario: Scenario,
+    passives: _Card | None = None,
+) -> Any:
+    return apply_mods(
+        weapon,
+        _selected_effects(evaluation, riven, scenario, passives),
+        scenario=scenario,
+    )
+
+
+def _selected_effects(
+    evaluation: _Evaluation,
+    riven: _Card | None,
+    scenario: Scenario,
+    passives: _Card | None = None,
+) -> ModEffectList:
+    ordered = list(evaluation.cards)
+    if riven is not None:
+        ordered.insert(evaluation.riven_index if evaluation.riven_index is not None else len(ordered), riven)
+    resolved: list[_Card] = []
+    for card in ordered:
+        if card.record is not None:
+            current = mod_effects(
+                card.record,
+                card.rank,
+                _steady_state_scenario((card.record,), scenario),
+            )
+            card = replace(
+                card,
+                effects=tuple(current),
+                skipped=tuple(current.skipped),
+            )
+        resolved.append(card)
+    if passives is not None:
+        resolved.append(passives)
+    return _effects(resolved, scenario)
+
+
+def _alternate_mode_payloads(
+    weapon: Mapping[str, Any],
+    evaluation: _Evaluation,
+    riven: _Card | None,
+    passives: _Card | None = None,
+    *,
+    selected_fire_mode: int = 0,
+) -> list[dict[str, Any]]:
+    from .event_profiles import is_incarnon_mode
+    if _weapon_type(None, weapon) == "melee":
+        return []
+    effects = _selected_effects(evaluation, riven, Scenario(), passives)
+    result: list[dict[str, Any]] = []
+    all_modes = weapon.get("fireModes") or ()
+    mode_count = len(all_modes)
+    for index, mode in enumerate(all_modes):
+        if index == selected_fire_mode:
+            continue
+        if not isinstance(mode, Mapping) or not mode.get("trigger"):
+            continue
+        payload: dict[str, Any] = {
+            "fireMode": index,
+            "trigger": mode.get("trigger"),
+            "isAlternateFire": bool(mode.get("isAlternateFire")),
+            "isIncarnonForm": is_incarnon_mode(weapon,index),
+        }
+        unsupported: list[str] = []
+        events: dict[str, Any] | None = None
+        try:
+            events = evaluate_projectile_events(
+                weapon, effects, fire_mode=index, scenario=Scenario()
+            )
+        except (TypeError, ValueError) as exc:
+            unsupported.append(f"alternate-fire-mode-{index}-events-unavailable: {exc}")
+        try:
+            stats = apply_mods(weapon, effects, fire_mode=index)
+        except (TypeError, ValueError) as exc:
+            unsupported.append(f"alternate-fire-mode-{index}-stats-unavailable: {exc}")
+        else:
+            metrics = _metrics(stats, events)
+            payload.update(
+                shotDamage=metrics["shotDamage"],
+                burstDps=metrics["burstDps"],
+                sustainedDps=metrics["sustainedDps"],
+                attackDps=metrics["attackDps"],
+            )
+            unsupported.extend(stats.unsupported)
+        if events is not None:
+            payload["projectileEvents"] = events
+            safe_hit = (
+                (events.get("totals") or {})
+                .get("averageHit", {})
+                .get("minimum", 0.0)
+            )
+            if (
+                "shotDamage" not in payload
+                and isinstance(safe_hit, (int, float))
+                and not isinstance(safe_hit, bool)
+                and safe_hit > 0
+            ):
+                payload["shotDamage"] = float(safe_hit)
+            if safe_hit:
+                payload["damageBasis"] = "projectileEvents.minimum"
+        if unsupported:
+            payload["unsupported"] = sorted(set(unsupported))
+        if any(
+            key in payload
+            for key in ("shotDamage", "burstDps", "sustainedDps", "attackDps")
+        ):
+            result.append(payload)
+    return result
+
+
+def _build_payload(
+    weapon: Mapping[str, Any],
+    evaluation: _Evaluation,
+    riven: _Card | None,
+    passives: _Card | None = None,
+) -> dict[str, Any]:
+    normal_scenario = replace(evaluation.scenario, heavy_attack=False)
+    normal_effects = _selected_effects(
+        evaluation, riven, normal_scenario, passives
+    )
+    normal = apply_mods(weapon, normal_effects, scenario=normal_scenario)
+    projectile_events = evaluate_projectile_events(
+        weapon, normal_effects, scenario=normal_scenario
+    )
+    heavy = _apply_selected(
+        weapon,
+        evaluation,
+        riven,
+        replace(evaluation.scenario, heavy_attack=True),
+        passives,
+    )
+    normal_metrics = _metrics(normal, projectile_events)
+    heavy_metrics = _metrics(heavy)
+    mods = []
+    set_counts: dict[str, int] = {}
+    for card in evaluation.cards:
+        if card.record is not None and (set_id := _set_key(card.record.get("modSet"))):
+            set_counts[set_id] = set_counts.get(set_id, 0) + 1
+    for card_index, card in enumerate(evaluation.cards):
+        assert card.record is not None
+        set_id = _set_key(card.record.get("modSet"))
+        pieces = set_counts.get(set_id, 0)
+        display_effects = []
+        multiplier = _buff_set_multiplier(card.record, pieces) if pieces else 1.0
+        for effect in card.effects:
+            if not effect.supported or _qualifier_rejection(effect, weapon, normal_scenario):
+                continue
+            value = effect.value * multiplier
+            if effect.upgrade_type == "WEAPON_DAMAGE_IF_VICTIM_PROC_ACTIVE":
+                value *= evaluation.scenario.victim_status_count
+            display_effects.append(
+                {
+                    "upgradeType": effect.upgrade_type,
+                    "damageType": effect.damage_type,
+                    "operation": effect.operation,
+                    "value": value,
+                }
+            )
+        steady_stacks = []
+        for conditional in card.record.get("conditionalEffects") or ():
+            if not isinstance(conditional, Mapping):
+                continue
+            tag = str(conditional.get("conditionTag") or "")
+            max_stacks = conditional.get("maxStacks")
+            if "killcondition" in tag.casefold() and isinstance(max_stacks, int):
+                steady_stacks.append({"conditionTag": tag, "stacks": max_stacks})
+        mods.append(
+            {
+                **record_identity(card.record),
+                "rank": card.rank,
+                "slot": card_index + int(riven is not None and card_index >= evaluation.riven_index),
+                "maxRank": card.record.get("maxRank"),
+                "compatibility": card.record.get("compatibility"),
+                "compatibilityTags": list(card.record.get("compatibilityTags") or ()),
+                "compatible": True,
+                "displayEffects": display_effects,
+                **({"setPieces": pieces} if set_id else {}),
+                **({"steadyStacks": steady_stacks} if steady_stacks else {}),
+            }
+        )
+    safe_event_hit = (
+        ((projectile_events or {}).get("totals") or {})
+        .get("averageHit", {})
+        .get("minimum", 0.0)
+    )
+    unsupported_set = {
+        *normal.unsupported,
+        *heavy.unsupported,
+        *evaluation.stats.unsupported,
+        *((projectile_events or {}).get("unsupported") or ()),
+    }
+    if isinstance(safe_event_hit, (int, float)) and safe_event_hit > 0:
+        unsupported_set.discard("projectile-component-damage-unapplied")
+    unsupported = sorted(unsupported_set)
+    heavy_route = weapon.get("heavyAttack")
+    heavy_support = (
+        dict(heavy_route.get("support") or {})
+        if isinstance(heavy_route, Mapping)
+        and isinstance(heavy_route.get("support"), Mapping)
+        else None
+    )
+    if heavy_support is not None and unsupported:
+        # Route metadata is static, while these reasons are build/effect specific.
+        # Keep them together so offline consumers can explain a partial snapshot.
+        heavy_support["reasons"] = list(
+            dict.fromkeys(
+                [*(heavy_support.get("reasons") or ()), *unsupported]
+            )
+        )
+    result = {
+        "mods": mods,
+        "includesRiven": riven is not None,
+        "victimStatusCount": evaluation.scenario.victim_status_count,
+        "shotDamage": normal_metrics["shotDamage"],
+        "burstDps": normal_metrics["burstDps"],
+        "sustainedDps": normal_metrics["sustainedDps"],
+        "attackDps": normal_metrics["attackDps"],
+        "heavyDamage": heavy_metrics["heavyDamage"],
+        "heavyComponents": heavy.heavy_components,
+        "heavySupport": heavy_support,
+        # Legacy wire field. New callers should use heavyDamage.
+        "heavyAttackDps": heavy_metrics["heavyDamage"],
+        "unsupported": unsupported,
+    }
+    if riven is not None:
+        result['riven'] = {
+            'slot':evaluation.riven_index,
+            'polarity': riven.polarity,
+            'stats':[{'code':line.code,'value':line.value,'negative':line.negative} for line in riven.riven_lines],
+        }
+        result["rivenLines"] = [
+            {
+                "code": line.code,
+                "label": line.label,
+                "value": line.value,
+                "low": line.low,
+                "high": line.high,
+                "negative": line.negative,
+                "unit": line.unit,
+            }
+            for line in riven.riven_lines
+        ]
+    if projectile_events is not None:
+        result["projectileEvents"] = projectile_events
+        if isinstance(safe_event_hit, (int, float)) and safe_event_hit > 0:
+            result["damageBasis"] = "projectileEvents.minimum"
+    return result
+
+
+def _requested_timeline_seconds(request: Mapping[str, Any]) -> float | None:
+    value = request.get("timelineSeconds")
+    if value is None:
+        arcanes = request.get("arcanes")
+        if not isinstance(arcanes, list) or not any(
+            isinstance(item, Mapping) and item.get("triggerRate") is not None
+            for item in arcanes
+        ):
+            return None
+        return 10.0
+    seconds = _number("timeline seconds", value)
+    if not 0 < seconds <= 300:
+        raise SimulationError("timeline seconds must be greater than zero and at most 300")
+    return seconds
+
+
+def _arcane_timeline(
+    records: Sequence[Mapping[str, Any]],
+    requested_arcanes: Any,
+    weapon: Mapping[str, Any],
+    incarnon: _Card | None,
+    baseline: _Evaluation,
+    actual: _Evaluation,
+    optimal: _Evaluation,
+    actual_riven: _Card,
+    optimal_riven: _Card,
+    *,
+    scenario: Scenario,
+    metric: str,
+    seconds: float,
+) -> dict[str, Any]:
+    point_count = 41
+    step = seconds / (point_count - 1)
+    cumulative = [0.0, 0.0, 0.0]
+    previous: list[float] | None = None
+    points: list[dict[str, Any]] = []
+    for index in range(point_count):
+        elapsed = seconds if index == point_count - 1 else index * step
+        arcane, states, _ = _arcane_card(
+            records, requested_arcanes, weapon, elapsed=elapsed
+        )
+        passives = _merge_passives(incarnon, arcane)
+        values = []
+        for evaluation, riven in (
+            (baseline, None),
+            (actual, actual_riven),
+            (optimal, optimal_riven),
+        ):
+            effects = _selected_effects(evaluation, riven, scenario, passives)
+            stats = apply_mods(weapon, effects, scenario=scenario)
+            events = evaluate_projectile_events(
+                weapon, effects, scenario=scenario
+            )
+            values.append(_score(stats, metric, events))
+        if previous is not None:
+            for value_index in range(3):
+                cumulative[value_index] += (
+                    previous[value_index] + values[value_index]
+                ) * step / 2.0
+        previous = values
+        points.append(
+            {
+                "time": elapsed,
+                "baselineDps": values[0],
+                "actualDps": values[1],
+                "optimalDps": values[2],
+                "baselineDamage": cumulative[0],
+                "actualDamage": cumulative[1],
+                "optimalDamage": cumulative[2],
+                "arcanes": [
+                    {
+                        "query": state["query"],
+                        "expectedStacks": state["expectedStacks"],
+                        "uptime": state["expectedUptime"],
+                    }
+                    for state in states
+                ],
+            }
+        )
+    return {
+        "model": "expected-objective-dps-envelope",
+        "durationSeconds": seconds,
+        "points": points,
+        "assumptions": [
+            "trigger events follow a Poisson process at each supplied triggerRate",
+            "Arcane stack expiry uses a capped duration-window approximation",
+            "selected mods stay fixed at the steady-state optimum",
+            "individual shots, reload gaps, target defenses and status ticks are not scheduled",
+        ],
+    }
+
+
+@session_request
+def analyze_riven_request(
+    export_dir: str | Path,
+    request: Mapping[str, Any],
+    weapon_record: Mapping[str, Any] | None = None,
+    stance: Mapping[str, Any] | None = None,
+    statics_cache: dict[str, Any] | None = None,
+    progress_hook: Any = None,
+) -> dict[str, Any]:
+    """Score one wire-format Riven and return baseline/actual/optimal builds.
+
+    面板口径（不挂固定目标，避免派系歧视卡扭曲配卡与词条推荐）：枪械主指标
+    为目标中立的「触发+直伤合计持续 DPS」，并给出「触发 / 直伤」双路推荐
+    词条（8 槽预留紫卡位，两条路线都是含紫卡口径，用于比较同一张紫卡下
+    触发配卡还是直伤配卡伤害更高）；近战/组合近战默认使用普通攻击 DPS
+    倍率最高的架势（容量收益计入解算），投掷重击维持重击口径。
+    weapon_record 可传入预先装配好的组合枪/组合近战记录，缺省按路径解析；
+    stance 传入与配装页同口径的架势信息；statics_cache 为按武器缓存的静态
+    解算结果（基准配装/双路推荐/理论上限），组合装配、显式灵化/赋能与时间线
+    请求不读不写缓存。
+    实卡可随请求附 rivenCard（满级 rank=8 和它的固定 polarity）。
+
+    progress_hook(stage: str)：阶段边界回调（"baseline" / "calibration" /
+    "actual" / "recommendation" / "optimal" / "quality" / "payload"），
+    供 HTTP 层向前端报告分析进度；None 时零开销。
+    """
+    def _progress(stage: str) -> None:
+        if SESSION.get() is not None:
+            SESSION.get()['stage'] = stage
+        if progress_hook is not None:
+            try:
+                progress_hook(stage)
+            except Exception:
+                # 进度上报绝不影响解算。
+                pass
+
+    if not isinstance(request, Mapping):
+        raise SimulationError("riven request must be a JSON object")
+    actual_polarity = "AP_ATTACK"
+    physical_card = request.get("rivenCard")
+    if "rivenCard" in request:
+        if not isinstance(physical_card, Mapping) or (
+            type(physical_card.get("rank")) is not int or physical_card["rank"] != 8
+        ):
+            raise SimulationError("rivenCard requires a max-rank Riven (rank 8)")
+        actual_polarity = physical_card.get("polarity")
+        if actual_polarity not in ("AP_ATTACK", "AP_DEFENSE", "AP_TACTIC"):
+            raise SimulationError("rivenCard requires a valid fixed polarity")
+    record_overridden = weapon_record is not None
+    exports = load_exports(export_dir)
+    weapon_query = str(request.get("weapon") or "").strip()
+    if weapon_record is None and not weapon_query:
+        raise SimulationError("riven request weapon is empty")
+    if weapon_record is not None and not isinstance(weapon_record, Mapping):
+        raise SimulationError("weapon record override must be an object")
+    weapon_record = (
+        dict(weapon_record)
+        if weapon_record is not None
+        else resolve_record(exports["weapons"], weapon_query, kind="weapon")
+    )
+    requested_type = request.get("weaponType")
+    if requested_type not in (None, "") and not isinstance(requested_type, str):
+        raise SimulationError("weaponType must be a string")
+    weapon_type = _weapon_type(request.get("weaponType"), weapon_record)
+    inferred_type = _weapon_type(None, weapon_record)
+    statics_weapon = _statics_weapon_identity(weapon_record)
+    riven_type = _riven_type(request.get("weaponType"), weapon_record)
+    if requested_type not in (None, "") and weapon_type != inferred_type:
+        raise SimulationError(
+            f"weaponType {weapon_type} does not match exported weapon type {inferred_type}"
+        )
+    requested_choices = request.get("incarnonChoices")
+    if requested_choices is not None:
+        if not isinstance(requested_choices, Mapping):
+            raise SimulationError("incarnonChoices must be an object")
+        for key, value in requested_choices.items():
+            tier = _tier_number(key)
+            if tier not in {2, 3, 4, 5}:
+                raise SimulationError(
+                    f"incarnon choice tier {key!r} must select Evo II, III, IV or V"
+                )
+            if not isinstance(value, str) or not value.strip():
+                raise SimulationError("incarnon choices require non-empty string values")
+    requested_fire_mode = request.get("fireMode")
+    if requested_fire_mode is not None:
+        _select_fire_mode(
+            weapon_record, requested_fire_mode, weapon_type=weapon_type
+        )
+    # 灵化武器的主用形态是灵化形态（导出中恒为最后一个开火模式），
+    # 分析与配卡默认挂灵化形态，与黑猫口径一致；显式 fireMode 可覆盖。
+    _available_modes = weapon_record.get("fireModes") or ()
+    default_fire_mode = (
+        len(_available_modes) - 1
+        if requested_fire_mode is None
+        and weapon_record.get("isIncarnon")
+        and len(_available_modes) > 1
+        else 0
+    )
+    weapon, fire_mode = _select_fire_mode(
+        weapon_record,
+        requested_fire_mode if requested_fire_mode is not None else default_fire_mode,
+        weapon_type=weapon_type,
+    )
+    heavy_route = weapon.get("heavyAttack")
+    throw_components = [
+        component
+        for component in (
+            heavy_route.get("components") or ()
+            if isinstance(heavy_route, Mapping)
+            else ()
+        )
+        if isinstance(component, Mapping)
+        and component.get("kind") in {"projectileDirect", "heavyRecall"}
+    ]
+    throwable = (
+        weapon_type == "melee"
+        and isinstance(heavy_route, Mapping)
+        and heavy_route.get("kind") == "projectileRecall"
+        and {"projectileDirect", "heavyRecall"}
+        <= {component.get("kind") for component in throw_components}
+    )
+    if throwable:
+        weapon = {
+            **weapon,
+            "heavyAttack": {**heavy_route, "components": throw_components},
+        }
+    # 标准靶 KPM 口径（近战与枪械统一）：170 级钢铁之路卓越者超宏凶魂百夫长，
+    # 30 秒窗口击杀数。近战按攻击路线逐次命中回放（melee_sequence）：
+    # 战刃走「蓄力重投 + 引爆」，不再用单发重投伤害。
+    metric = "killsPerMinute"
+    requested_metric, requested_metric_warning = _metric(
+        request.get("metric"), weapon_type
+    )
+    metric_warning = requested_metric_warning
+    if (
+        request.get("metric") not in (None, "")
+        and _objective_metric(requested_metric) != metric
+    ):
+        metric_warning = (
+            f"requested-metric-{request.get('metric')}-ignored-using-{metric}"
+        )
+    objective_metric = metric
+    scenario = _requested_scenario(request, metric)
+    # 偏好复合元素（elementTarget）：软约束——最终配装必须包含该元素
+    # （与配装页的元素限制同一套伤害类型映射）。空值/未知值保持无约束。
+    element_target_raw = str(request.get("elementTarget") or "").strip()
+    required_damage_type: str | None = None
+    if element_target_raw:
+        required_damage_type = _ELEMENT_TARGET_TYPES.get(element_target_raw)
+        if required_damage_type is None:
+            raise SimulationError(
+                "elementTarget must be empty or one of "
+                + ", ".join(_ELEMENT_TARGET_TYPES)
+            )
+    # 架势（近战/组合近战，与配装页同口径）：默认普通攻击 DPS 倍率最高的架势；
+    # 容量收益计入解算（无限极化口径下按匹配极性计），倍率是全局常数、只影响
+    # 展示数值，不改变配卡排序。投掷重击口径下架势倍率不适用（容量仍计入）。
+    stance_info = stance if isinstance(stance, Mapping) and weapon_type == "melee" else None
+    stance_capacity = (
+        max(0, int(stance_info.get("capacityGain") or 0)) if stance_info else 0
+    )
+    capacity_limit = 60 + stance_capacity
+    stance_multiplier = (
+        float(stance_info.get("dpsMultiplier") or 1.0)
+        if stance_info and not throwable
+        else 1.0
+    )
+    status_rate_multiplier = float(stance_info.get("statusRateMultiplier") or 1.0) if stance_info else 1.0
+    melee_context: dict[str, Any] | None = None
+    melee_schedule: dict[str, Any] | None = None
+    route_sensitive = False  # a melee slam / glaive route: the panel proxy cannot rank for it
+    if weapon_type == "melee":
+        # Melee hit schedule: the stance and route travel with the scenario;
+        # the replay uses discrete hits and ignores the stance multipliers.
+        state = dict(scenario.combat_state)
+        if stance_info and stance_info.get("path"):
+            state.setdefault("meleeStance", str(stance_info["path"]))
+        from .melee_sequence import ROUTES as _MELEE_ROUTES
+        if request.get("meleeRoute") and str(request["meleeRoute"]) not in _MELEE_ROUTES:
+            raise SimulationError("meleeRoute must be one of " + ", ".join(_MELEE_ROUTES))
+        for key in ("meleeRoute", "meleeCombo"):
+            if request.get(key):
+                state[key] = str(request[key])
+        scenario = replace(scenario, combat_state=state)
+        melee_schedule = build_schedule(weapon, state.get("meleeRoute"), stance=state.get("meleeStance"),
+                                        combo=state.get("meleeCombo"), target_distance=state.get("meleeTargetDistance"))
+        if melee_schedule:
+            route_sensitive = melee_schedule["route"] != "combo"
+            melee_context = {"route": melee_schedule["route"], "label": melee_schedule.get("label"),
+                             "stance": melee_schedule.get("stance"), "combo": melee_schedule.get("combo")}
+            stance_multiplier = status_rate_multiplier = 1.0
+    # 标准靶上下文（KPM 口径）：app 层注入 benchmarkTarget（enemy/level/
+    # steelPath/eximus/windowSeconds），引擎解出真实目标记录参与窗口解算。
+    benchmark = request.get("benchmarkTarget")
+    benchmark_context: dict[str, Any] | None = None
+    if isinstance(benchmark, Mapping):
+        benchmark_enemy = benchmark.get("enemy") or benchmark.get("path")
+        resolved_enemy = None
+        if isinstance(benchmark_enemy, str) and benchmark_enemy.strip():
+            try:
+                resolved_enemy = resolve_record(
+                    exports.get("enemies") or (), benchmark_enemy.strip(), kind="enemy"
+                )
+            except SimulationError:
+                resolved_enemy = None
+        if resolved_enemy is not None:
+            benchmark_context = {
+                "target": resolved_enemy,
+                "level": benchmark.get("level"),
+                "armour_strip": float(benchmark.get("armourStrip") or 0.0),
+                "elemental_armour_strip": float(benchmark.get("elementalArmourStrip") or 0.0),
+                "steel_path": bool(benchmark.get("steelPath")),
+                "enemy_enhancements": (
+                    benchmark.get("enemyEnhancements") or {k: benchmark[k] for k in ("eximus", "archimedea", "empowered", "playerCount") if k in benchmark}
+                ),
+                "hit_location": str(benchmark.get("hitLocation") or "body"),
+                "headshotChance": float(benchmark.get("headshotChance") or 0.0),
+                "windowSeconds": float(benchmark.get("windowSeconds") or 30.0),
+                "stanceMultiplier": stance_multiplier,
+                "statusRateMultiplier": status_rate_multiplier,
+            }
+    requested_target_payload = (
+        dict(benchmark) if isinstance(benchmark, Mapping) else None
+    )
+    target_calibration: dict[str, Any] = {
+        "version": TARGET_CALIBRATION_VERSION,
+        "status": "not-applicable" if benchmark_context is None else "pending",
+        "requestedLevel": (
+            requested_target_payload.get("level")
+            if requested_target_payload is not None
+            else None
+        ),
+        "evaluationLevel": (
+            benchmark_context.get("level") if benchmark_context is not None else None
+        ),
+        "iterations": [],
+        "maxIterations": TARGET_CALIBRATION_MAX_ITERATIONS,
+    }
+    # 解算档位（profile）：fast/standard/deep，控制 beam 宽度、候选池与
+    # 爬山轮数；也作为静态缓存 key 的一部分（不同档位的推荐/上限不同）。
+    profile_raw = str(request.get("profile") or "standard").strip().casefold()
+    if profile_raw not in {"ultra", "fast", "standard", "deep"}:
+        raise SimulationError("profile must be one of ultra, fast, standard, deep")
+    # ultra 与 fast 共用搜索参数与武器静态缓存；只跳过推荐/负面词条的新计算
+    # （有缓存才显示），并改用面板近似 + 元素起点 + 回放复核的有限搜索。
+    ultra = profile_raw == "ultra"
+    profile = "fast" if ultra else profile_raw
+    if benchmark_context is not None and profile == "fast":
+        # 4 条分层分支：KPM 平均误差 0.25%，耗时为 16 条的 1/3（见
+        # docs/RIVEN-ANALYSIS-REWORK-2026-10-05-floor.md 击杀反馈分支数）。
+        benchmark_context["killBranches"] = FAST_KILL_BRANCHES
+
+    # ── 搜索约束（wfsim 优化器 scope 模型）────────────────────────────
+    # requiredMods/forbiddenMods：必选/禁选卡（引擎 card key 或 mod path）。
+    # minFill/maxFill：配卡数量范围（0-8，含紫卡与必选卡；显式 0 = 裸枪基线）。
+    # 显式约束存在时绕过静态缓存（缓存是「无约束最优」口径）。
+    def _constraint_keys(value: Any, label: str) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, (list, tuple)) or not all(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            raise SimulationError(f"{label} must be an array of non-empty strings")
+        return [str(item).strip() for item in value]
+
+    search_required_keys = _constraint_keys(request.get("requiredMods"), "requiredMods")
+    search_forbidden_keys = _constraint_keys(request.get("forbiddenMods"), "forbiddenMods")
+    overlap = set(search_required_keys) & set(search_forbidden_keys)
+    if overlap:
+        raise SimulationError(
+            "mods cannot be both required and forbidden: " + ", ".join(sorted(overlap))
+        )
+
+    def _fill_bound(value: Any, label: str) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 8:
+            raise SimulationError(f"{label} must be an integer between 0 and 8")
+        return value
+
+    search_min_fill = _fill_bound(request.get("minFill"), "minFill")
+    search_max_fill = _fill_bound(request.get("maxFill"), "maxFill")
+    if (
+        search_min_fill is not None
+        and search_max_fill is not None
+        and search_min_fill > search_max_fill
+    ):
+        raise SimulationError("minFill must not exceed maxFill")
+    has_search_constraints = bool(
+        search_required_keys or search_forbidden_keys
+        or search_min_fill is not None or search_max_fill is not None
+    )
+
+    timeline_seconds = _requested_timeline_seconds(request)
+    heavy_default_state = weapon_type == "melee" and isinstance(
+        weapon.get("heavyAttack"), Mapping
+    )
+    if timeline_seconds is not None and (
+        heavy_default_state or objective_metric == "heavyDamage"
+    ):
+        raise SimulationError(
+            "timeline seconds are not supported for single heavy/throw damage"
+        )
+    if timeline_seconds is not None and objective_metric == "shotDamage":
+        raise SimulationError("an Arcane timeline requires a DPS metric")
+    source_disposition_raw = request.get("sourceDisposition")
+    source_disposition = None
+    if source_disposition_raw is not None:
+        source_disposition = _number(
+            "riven source disposition", source_disposition_raw
+        )
+        if source_disposition <= 0:
+            raise SimulationError(
+                "riven source disposition must be finite and positive"
+            )
+
+    disposition = _number("riven disposition", request.get("disposition"), 0.0)
+    if disposition < 0:
+        raise SimulationError("riven disposition must be finite and non-negative")
+    if disposition <= 0:
+        exported_disposition = _number(
+            "weapon omegaAttenuation", weapon.get("omegaAttenuation"), 0.0
+        )
+        if exported_disposition > 0:
+            disposition = exported_disposition
+        elif source_disposition is not None:
+            raise SimulationError(
+                "target weapon disposition is required for Riven projection"
+            )
+        else:
+            disposition = 1.0
+
+    disposition_scale = (
+        disposition / source_disposition
+        if source_disposition is not None
+        else 1.0
+    )
+    if not math.isfinite(disposition_scale):
+        raise SimulationError("riven disposition scale must be finite")
+    actual_lines, riven_unsupported = _wire_lines(
+        request.get("stats"), disposition_scale
+    )
+    # A missing handler means the card is only partially represented.  Do not
+    # turn that partial card into an apparently authoritative score.
+    legal_positive = _riven_allowed_codes(exports.get("rivenTemplates") or {}, riven_type, weapon_record, negative=False)
+    legal_negative = _riven_allowed_codes(exports.get("rivenTemplates") or {}, riven_type, weapon_record, negative=True)
+    for line in actual_lines:
+        if line.code not in (legal_negative if line.negative else legal_positive):
+            raise SimulationError(f"Riven stat {line.code} is not allowed for this weapon")
+    fatal_riven_unsupported = [
+        item for item in riven_unsupported if not item.endswith("-not-evaluated")
+    ]
+    if fatal_riven_unsupported:
+        raise SimulationError(
+            "unsupported Riven stat(s): " + ", ".join(fatal_riven_unsupported)
+        )
+    # Known utility properties may be valid card lines even when the selected
+    # objective cannot express their effect; preserve the score with a visible
+    # diagnostic instead of silently treating them as damage.
+    unsupported: list[str] = list(riven_unsupported)
+    # skipped（口径说明诊断）提前初始化：评分靶自适应等中途模块会追加。
+    skipped_early: list[str] = []
+    if not actual_lines:
+        unsupported.append("riven-request-has-no-usable-stats")
+    if not weapon.get("omegaAttenuation") and request.get("disposition") in (None, 0):
+        unsupported.append("riven-disposition-missing-using-1.0")
+    if metric_warning:
+        unsupported.append(metric_warning)
+    template_bases = _template_bases(exports.get("rivenTemplates") or {}, riven_type)
+    template_build = str((exports.get("rivenTemplates") or {}).get("buildLabel") or RIVEN_TEMPLATE_BUILD)
+    if not template_bases and exports["buildLabel"] != RIVEN_TEMPLATE_BUILD:
+        unsupported.append(
+            f"riven-template-values-pinned-to-{RIVEN_TEMPLATE_BUILD}"
+        )
+    if any(line.code in {"C", "G", "I"} for line in actual_lines):
+        unsupported.append("faction-riven-stats-excluded-from-target-neutral-objective")
+    if required_damage_type:
+        skipped_hint = (
+            f"element-target: 偏好复合元素约束已生效（最终配装必须包含 "
+            f"{required_damage_type}）"
+        )
+    else:
+        skipped_hint = ""
+
+    incarnon_card, resolved_choices, incarnon_unsupported, incarnon_policy = _incarnon_card(
+        weapon,
+        request.get("incarnonChoices"),
+        scenario=scenario,
+        metric=objective_metric,
+        policy=exports.get("incarnonDefaults"),
+        build_label=exports["buildLabel"],
+    )
+    unsupported.extend(incarnon_unsupported)
+    arcane_card, arcane_states, arcane_unsupported = _arcane_card(
+        exports.get("arcanes") or (),
+        request.get("arcanes"),
+        weapon,
+        default_heavy_state=heavy_default_state,
+    )
+    unsupported.extend(arcane_unsupported)
+    passives = _merge_passives(incarnon_card, arcane_card)
+
+    mod_pool, rejected_mods = _candidate_mods(exports, weapon, scenario)
+
+    # 流派钳制已移除（用户确认实战就是双修混搭，只是细节不同）：全量池
+    # 单次求解，词条推荐与配装均为算法最优，不再区分触发/直伤流派。
+
+    # 静态解算结果缓存：基准配装、双路推荐与理论上限都不随单张紫卡的数值
+    # 变化（推荐候选恒为理论满数值口径），仅依赖武器/开火模式/倾向/容量上限
+    # 与默认灵化策略；组合装配、显式灵化/赋能、时间线请求与显式搜索约束
+    # （必选/禁选/数量范围）绕过缓存——缓存是「无约束最优」口径。
+    # Standard/deep previously selected the final displayed builds by DPS in
+    # a second full pass. Rank on that final metric from the start instead;
+    # KPM remains a separately measured combat KPI for these same builds.
+    ranking_metric = ('windowedDps' if objective_metric == 'killsPerMinute'
+                      and benchmark_context is not None and profile != 'fast'
+                      else objective_metric)
+    cacheable = (
+        statics_cache is not None
+        and (not record_overridden or bool(request.get("_cacheDefaultInnate"))
+             # A default-element Kitgun / Zaw assembly caches under its parts.
+             or (bool(request.get("_cacheAssembly")) and statics_weapon != weapon_record.get("path")))
+        # A caller that fixes the route per weapon (the Bot's baked best route)
+        # may cache it: the route then joins the cache key below.
+        and (request.get("incarnonChoices") is None or bool(request.get("_cacheIncarnon")))
+        and request.get("arcanes") is None
+        # A fixed caller preset (the Bot) may cache its own scenario; the
+        # scenario then joins the cache key below.
+        and (_default_analysis_scenario(scenario, metric) or bool(request.get("_cacheScenario")))
+        and timeline_seconds is None
+        and not has_search_constraints
+    )
+    _bm = dict(request.get("benchmarkTarget")) if isinstance(request.get("benchmarkTarget"), Mapping) else {}
+    _bm.update(
+        {
+            "hitLocation": "body",
+            "stanceMultiplier": stance_multiplier,
+            "statusRateMultiplier": status_rate_multiplier,
+            "heavyAttack": bool(scenario.heavy_attack),
+        }
+    )
+    if not _default_analysis_scenario(scenario, metric):
+        _bm["scenario"] = _scenario_context(scenario)
+    if melee_context:
+        _bm["melee"] = melee_context
+    if request.get("incarnonChoices") is not None and request.get("_cacheIncarnon"):
+        _bm["incarnon"] = {str(k): str(v) for k, v in sorted(dict(request["incarnonChoices"]).items())}
+    # A read-only ultra caller (the Bot) may read the statics a deeper profile
+    # baked: the card is still placed and scored by the ultra profile, on that
+    # profile's baseline, hardness nodes and recommendation ranking. Writes
+    # always use the request's own profile. (Scored on common hardness nodes,
+    # deep baselines were never below fast ones, 2026-10-16; standard ones
+    # were on Lex Prime -10%: its DPS ranking can cost kills per minute.)
+    statics_profile, statics_metric = profile, ranking_metric
+    if ultra and request.get("_staticsProfile") in ("standard", "deep"):
+        statics_profile = str(request["_staticsProfile"])
+        statics_metric = ('windowedDps' if objective_metric == 'killsPerMinute' and benchmark_context is not None
+                          else objective_metric)
+    cache_key = _statics_cache_key(
+        statics_weapon,
+        weapon.get("innateElements"),
+        fire_mode,
+        element_target_raw,
+        statics_profile,
+        disposition,
+        capacity_limit,
+        statics_metric,
+        _bm,
+    )
+    statics: dict[str, Any] | None = None
+    if cacheable:
+        candidate_entry = statics_cache.get(cache_key)
+        if (
+            isinstance(candidate_entry, dict)
+            and candidate_entry.get("disposition") == disposition
+            and candidate_entry.get("metric") == statics_metric
+            and candidate_entry.get("capacityLimit") == capacity_limit
+        ):
+            statics = candidate_entry
+        fallback_disposition = request.get("_cacheDisposition")
+        if statics is None and ultra and isinstance(fallback_disposition, (int, float)) and fallback_disposition > 0:
+            # Read-only callers (the Bot) may keep a card's own disposition yet
+            # read the entry baked at the catalog disposition: the baseline and
+            # hardness nodes do not depend on it and the recommendation ranking
+            # hardly does. Nothing is written back under this key.
+            fallback_key = _statics_cache_key(
+                statics_weapon, weapon.get("innateElements"), fire_mode, element_target_raw, statics_profile,
+                float(fallback_disposition), capacity_limit, statics_metric, _bm,
+            )
+            fallback_entry = statics_cache.get(fallback_key)
+            if (
+                isinstance(fallback_entry, dict)
+                and fallback_entry.get("metric") == statics_metric
+                and fallback_entry.get("capacityLimit") == capacity_limit
+            ):
+                statics = fallback_entry
+                skipped_early.append(
+                    f"cache: 读取按目录倾向 {float(fallback_disposition):g} 烘焙的武器缓存（本卡倾向 {disposition:g}）"
+                )
+        if statics is None:
+            # 升靶缓存命中：同武器曾因秒杀饱和升级评分靶（缓存键已迁移到
+            # #bm{scoringLevel}）。本请求的 benchmark level 落后于记录时，
+            # 直接沿用升级后的等级（同武器所有请求一致），从概念键取回。
+            # ── F11（审计修复）：回退查找必须匹配「除等级外的全部战斗上
+            # 下文」。旧实现只比 weapon/mode/profile/metric/capacity/
+            # disposition + 4 个派生字段——敌人、窗口、钢铁之路、卓越者、
+            # 削甲、爆头率任一不同都会命中同一旧条目，把别的场景的数值
+            # （quality 缓存）直接复用到本场景。现在整个 benchmark 子键
+            # （除 level）必须逐字段相等。
+            def _benchmark_matches_except_level(
+                key_benchmark: Any,
+            ) -> bool:
+                if not isinstance(key_benchmark, Mapping):
+                    return False
+                expected = dict(_bm)
+                for field, value in expected.items():
+                    if field == "level":
+                        continue
+                    if key_benchmark.get(field) != value:
+                        return False
+                # 反向：缓存键里多出的 benchmark 字段（旧版本写入的
+                # archimedea/empowered 等）也必须与本请求的默认值一致，
+                # 否则视为不同场景。本请求未提供的字段按 _bm 的默认口径
+                # 比较（缺失 = 与 None/默认不等即拒绝，宁缺勿错）。
+                for field in (
+                    "enemy", "steelPath", "eximus", "archimedea", "empowered",
+                    "armourStrip", "elementalArmourStrip", "headshotChance",
+                    "hitLocation", "stanceMultiplier", "statusRateMultiplier",
+                    "heavyAttack", "windowSeconds",
+                ):
+                    if field in key_benchmark and field not in expected:
+                        return False
+                return True
+
+            cached_level = None
+            for key, entry in statics_cache.items():
+                if not isinstance(key, str) or not isinstance(entry, dict):
+                    continue
+                try:
+                    parsed_key = json.loads(key)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    isinstance(parsed_key, dict)
+                    and parsed_key.get("weapon") == statics_weapon
+                    and parsed_key.get("innateElements") == list(weapon.get("innateElements") or ())
+                    and parsed_key.get("fireMode") == fire_mode
+                    and parsed_key.get("elementTarget") == (element_target_raw or "-")
+                    and parsed_key.get("profile") == statics_profile
+                    and parsed_key.get("metric") == statics_metric
+                    and parsed_key.get("capacityLimit") == capacity_limit
+                    and parsed_key.get("disposition") == round(float(disposition), 8)
+                    and _benchmark_matches_except_level(parsed_key.get("benchmark"))
+                    and isinstance(entry.get("scoringLevel"), int)
+                ):
+                    cached_level = entry["scoringLevel"]
+                    statics = entry
+                    break
+            if (
+                statics is not None
+                and cached_level is not None
+                and benchmark_context is not None
+                and benchmark_context.get("level") != cached_level
+            ):
+                benchmark_context = dict(benchmark_context, level=cached_level)
+    if ultra:
+        # 超快档只读快速档的武器缓存、从不回写：近似搜索得到的基线与倍率
+        # 不能污染快速档；缓存缺失时推荐与负面词条直接留空。
+        statics = json.loads(json.dumps(statics)) if statics is not None else None
+    elif cacheable and statics is None:
+        statics = {}
+        statics_cache[cache_key] = statics
+    pool_by_key = {card.key: card for card in mod_pool}
+
+    def _reconstruct(
+        card_keys: Any, riven_card: _Card | None, *, active_passives: _Card | None = passives
+    ) -> _Evaluation | None:
+        if (
+            not isinstance(card_keys, list)
+            or any(not isinstance(key, str) for key in card_keys)
+            or any(key not in pool_by_key for key in card_keys)
+        ):
+            return None
+        evaluate = lambda: _evaluate(
+            weapon,
+            tuple(pool_by_key[key] for key in card_keys),
+            riven_card,
+            scenario=scenario,
+            metric=ranking_metric,
+            passives=active_passives,
+            capacity_limit=capacity_limit,
+            target_context=benchmark_context,
+            reorder_elements=False,  # stored in its evaluated (best) order
+        )
+        if riven_card is not None:
+            return evaluate()
+        # The cached no-Riven baseline is re-scored by every request of the
+        # weapon; keep the scored build per exact inputs for the process.
+        try:
+            key = hashlib.sha256(pickle.dumps((statics_weapon, tuple(card_keys), replace(scenario, conditional_stacks=dict(scenario.conditional_stacks)),
+                                               ranking_metric, active_passives, capacity_limit, benchmark_context), protocol=5)).digest()
+        except (TypeError, pickle.PicklingError, AttributeError):
+            return evaluate()
+        if key in _BASELINE_EVALUATIONS:
+            _BASELINE_EVALUATIONS.move_to_end(key)
+            return _BASELINE_EVALUATIONS[key]
+        result = evaluate()
+        _BASELINE_EVALUATIONS[key] = result
+        while len(_BASELINE_EVALUATIONS) > 64:
+            _BASELINE_EVALUATIONS.popitem(last=False)
+        return result
+
+    def _optimize_with_element_fallback(
+        weapon: Mapping[str, Any],
+        candidates: Sequence[_Card],
+        riven: _Card | None,
+        **kwargs: Any,
+    ) -> _Evaluation:
+        # 偏好元素约束下无可行配装时（元素 mod 与容量/家族互斥冲突），回退到
+        # 无约束解算并记录诊断——默认「腐蚀」对部分武器（如自带元素武器、
+        # 近战）不可达，不应让整个分析失败。
+        if not required_damage_type:
+            return _optimize(weapon, candidates, riven, **kwargs)
+        try:
+            return _optimize(
+                weapon, candidates, riven, required_damage_type=required_damage_type, **kwargs
+            )
+        except SimulationError as exc:
+            if f"damage type {required_damage_type}" not in str(exc):
+                raise
+        # A narrow beam ranks by score and may never keep a pure two-element
+        # combination (melee fast profile + viral); seed the strongest mod of
+        # each component, as the ultra seeds do, before giving up.
+        parts = ELEMENT_SEEDS.get(required_damage_type, ())
+        seeded = list(kwargs.get("required_mod_keys") or ())
+        forbidden = set(kwargs.get("forbidden_mod_keys") or ())
+        for part in parts:
+            options = [(sum(float(e.value) for e in c.effects if e.damage_type == part), c.key)
+                       for c in candidates if any(e.damage_type == part for e in c.effects)
+                       and c.key not in forbidden and c.key not in seeded]
+            if options:
+                seeded.append(max(options)[1])
+        if parts and len(seeded) > len(kwargs.get("required_mod_keys") or ()):
+            try:
+                return _optimize(weapon, candidates, riven, required_damage_type=required_damage_type,
+                                 **dict(kwargs, required_mod_keys=seeded))
+            except SimulationError as exc:
+                if f"damage type {required_damage_type}" not in str(exc):
+                    raise
+        unsupported.append(
+            f"element-target-infeasible-{required_damage_type}-using-unconstrained"
+        )
+        return _optimize(weapon, candidates, riven, **kwargs)
+
+    def _optimize_archetype(
+        weapon: Mapping[str, Any],
+        riven: _Card | None,
+        **kwargs: Any,
+    ) -> _Evaluation:
+        """全量池单次求解（流派钳制已按用户要求移除：实战即双修混搭）。
+
+        ``__escalated_context``（可选）：评分靶升级时覆盖 benchmark_context
+        （自适应等级逻辑用；正常调用不传）。``search_profile``（可选）：
+        覆盖本次搜索的档位（灵化路线筛选用快速档）。
+        """
+        escalated = kwargs.pop("__escalated_context", None)
+        search_profile = kwargs.pop("search_profile", None) or profile
+        phase_seconds = kwargs.pop("event_phase_seconds", None)
+        provisional_route = kwargs.pop("provisional_route", False)
+        context = escalated if escalated is not None else search_context
+        common = dict(target_context=context, profile=search_profile, forbidden_mod_keys=search_forbidden_keys,
+                      min_fill=search_min_fill, max_fill=search_max_fill)
+        results = []
+        # The panel proxy the ultra profile ranks with knows nothing about a
+        # melee attack route: on a slam or glaive route it picks the combo
+        # build (Blood Rush, Weeping Wounds). Those routes get the replay
+        # search as well, like the deeper profiles.
+        if not ultra or route_sensitive:
+            results.append(_optimize_with_element_fallback(
+                weapon, mod_pool, riven, required_mod_keys=search_required_keys,
+                **({"phase_seconds": phase_seconds} if phase_seconds is not None else {}),
+                **common, **kwargs))
+            if provisional_route:
+                # The caller supplies a scored build from the current route.
+                # Keep the normal beam and all element seeds for the finalist.
+                return _rescore(results[0], riven, kwargs)
+        seeds: tuple[tuple[str | None, tuple[str, ...]], ...] = ((None, ()), *ELEMENT_SEEDS.items())
+        if required_damage_type:
+            if not ultra or route_sensitive:
+                return _rescore(results[0], riven, kwargs)
+            # Ultra with a fixed element (the Bot's viral policy): only that
+            # element's seed; the open seed is the fallback when infeasible.
+            seeds = ((required_damage_type, ELEMENT_SEEDS.get(required_damage_type, ())),)
+        # Element seeds (open / viral / corrosive): searched on the cheap panel
+        # proxy, then re-scored with the real metric. They can only add
+        # candidates; the replay decides. Every profile runs all three, so a
+        # deeper profile never ends below the ultra one.
+        proxy = dict(kwargs, metric="statusSustainedDps", beam_width=4, shortlist=24)
+        # A seed's score is a pool job that runs while the next seed is
+        # searched; only the best seed is evaluated here, for its stats.
+        from wfarsenal import parallel as _parallel
+        pool = _parallel.get_pool()
+        seed_kwargs = dict(scenario=kwargs["scenario"], metric=kwargs["metric"], passives=kwargs.get("passives"),
+                           capacity_limit=kwargs.get("capacity_limit", 60), target_context=context)
+        seed_contexts: dict[int | None, Any] = {}
+        pending: list[tuple[tuple[_Card, ...], int | None, Any]] = []
+        for element, parts in seeds:
+            seeded = list(search_required_keys)
+            for part in parts:
+                options = [(sum(float(e.value) for e in c.effects if e.damage_type == part), c.key)
+                           for c in mod_pool if any(e.damage_type == part for e in c.effects)
+                           and c.key not in search_forbidden_keys]
+                if options:
+                    seeded.append(max(options)[1])
+            try:
+                found = _optimize(weapon, mod_pool, riven, required_mod_keys=seeded, required_damage_type=element,
+                                  **common, **proxy)
+            except SimulationError:
+                continue
+            cards = tuple(pool_by_key.get(card.key, card) for card in found.cards)
+            # Ultra ranks the seeds with the Riven last and places it only
+            # in the winner (an element Riven multiplies replays by the
+            # element boundaries).
+            fixed = len(cards) if ultra and riven is not None else None
+            if pool is None:
+                pending.append((cards, fixed, _evaluate(weapon, cards, riven, fixed_riven_index=fixed, **seed_kwargs)))
+                continue
+            if fixed not in seed_contexts:
+                scenario_wire = seed_kwargs["scenario"]
+                if not isinstance(scenario_wire.conditional_stacks, dict):
+                    scenario_wire = replace(scenario_wire, conditional_stacks=dict(scenario_wire.conditional_stacks))
+                seed_contexts[fixed] = _parallel.shared({
+                    "weapon": weapon, "scenario": scenario_wire, "metric": seed_kwargs["metric"],
+                    "passives": seed_kwargs["passives"], "slot_limit": 8,
+                    "capacity_limit": seed_kwargs["capacity_limit"], "target_context": context,
+                    "fixed_riven_index": fixed,
+                })
+            pending.append((cards, fixed, pool.submit(_parallel._score_job, (cards, riven, seed_contexts[fixed]))))
+        seed_results: list[tuple[float, tuple[_Card, ...], int | None, _Evaluation | None]] = []
+        try:
+            for cards, fixed, outcome in pending:
+                if pool is None:
+                    if outcome is not None:
+                        seed_results.append((outcome.score, cards, fixed, outcome))
+                    continue
+                score = outcome.result()
+                if score is not None:
+                    seed_results.append((score, cards, fixed, None))
+        finally:
+            if pool is not None:
+                for _cards, _fixed, outcome in pending:
+                    outcome.cancel()
+        # Each seed is a finalist. A middle-node winner need not win the
+        # three-node objective, so none is discarded before final scoring.
+        for score, cards, fixed, evaluation in seed_results:
+            if evaluation is None:
+                evaluation = _evaluate(weapon, cards, riven, fixed_riven_index=fixed, **seed_kwargs)
+            if evaluation is not None:
+                results.append(evaluation)
+        if not results and required_damage_type and ultra:
+            unsupported.append(f"element-target-infeasible-{required_damage_type}-using-unconstrained")
+            found = _optimize(weapon, mod_pool, riven, required_mod_keys=list(search_required_keys), **common, **proxy)
+            scored = _evaluate(weapon, tuple(pool_by_key.get(c.key, c) for c in found.cards), riven,
+                               scenario=kwargs["scenario"], metric=kwargs["metric"], passives=kwargs.get("passives"),
+                               capacity_limit=kwargs.get("capacity_limit", 60), target_context=context,
+                               fixed_riven_index=len(found.cards) if riven is not None else None)
+            if scored is not None:
+                results.append(scored)
+        if not results:
+            raise SimulationError("no capacity-valid build found")
+        if ultra and riven is not None:
+            results = [_evaluate(weapon, result.cards, riven, scenario=kwargs["scenario"], metric=kwargs["metric"],
+                                 passives=kwargs.get("passives"), capacity_limit=kwargs.get("capacity_limit", 60),
+                                 target_context=context) or result for result in results]
+        return _best_finalist(results, lambda result: _rescore(result, riven, kwargs))
+
+    def _rescore(result: _Evaluation, riven: _Card | None, kwargs: Mapping[str, Any]) -> _Evaluation:
+        # Searches run on the middle hardness node; the chosen build is scored
+        # on all nodes like every displayed number.
+        if benchmark_context is None or not benchmark_context.get("hardnessNodes"):
+            return result
+        scored = _evaluate(weapon, result.cards, riven, scenario=kwargs["scenario"], metric=kwargs["metric"],
+                           passives=kwargs.get("passives"), capacity_limit=kwargs.get("capacity_limit", 60),
+                           target_context=benchmark_context, fixed_riven_index=result.riven_index,
+                           reorder_elements=False)
+        return scored or result
+
+    def _apply_riven_floor_profiled(result: _Evaluation, riven_card: _Card, *, floor_metric: str | None = None,
+                                    route_passives: Any = None) -> _Evaluation:
+        # The floor checks the highest capacity-valid keep layer, including
+        # every two-drop choice when one dropped card cannot fit the Riven.
+        # This protects against a narrow beam losing the known baseline family.
+        return _apply_riven_floor(result, riven_card, floor_metric=floor_metric, route_passives=route_passives)
+
+    _progress("baseline")
+    # ── 硬度积分靶（hardness-integrated）──────────────────────────────
+    # 不挑单一血量：以本武器无紫卡基线身体命中的击杀时间 T ∈ [1, 20] s（对数
+    # 均匀，三点高斯积分 1.4/4.5/14.3 s）换算三个血量节点；评分 = 三节点多击杀回放 KPM 的
+    # 几何平均；搜索只用中心节点。节点随武器缓存，提交的紫卡永不改变靶子；
+    # 身体命中计数，0% 与 100% 弱点共用同一组节点。
+    fixed_target = (benchmark_context is not None and objective_metric == "killsPerMinute")
+    raw_context = benchmark_context
+    search_context = benchmark_context
+    hardness_nodes = statics.get("hardnessNodes") if statics else None
+    nodes_cached = fixed_target and _valid_hardness_nodes(hardness_nodes)
+    if nodes_cached:
+        search_context = _center_context(raw_context, hardness_nodes)
+        benchmark_context = dict(raw_context, hardnessNodes=hardness_nodes)
+    baseline = _reconstruct(statics.get("baselineCards"), None) if statics else None
+    baseline_fresh = baseline is None
+    if baseline_fresh and ultra:
+        # 面板近似的无紫卡基线偏弱，实际增益只是估算；读到快速档缓存后才可比。
+        unsupported.append("ultra-profile-baseline-approximate")
+    if baseline_fresh:
+        baseline = _optimize_archetype(
+            weapon,
+            None,
+            scenario=scenario,
+            metric=ranking_metric,
+            passives=passives,
+            capacity_limit=capacity_limit,
+        )
+    if fixed_target and not nodes_cached:
+        hardness_nodes = _hardness_nodes(baseline.stats, raw_context)
+        if hardness_nodes is None:
+            unsupported.append("hardness-nodes-unavailable-single-target")
+        else:
+            searched_scale = float((search_context.get("enemy_enhancements") or {}).get("healthScale") or 1.0)
+            search_context = _center_context(raw_context, hardness_nodes)
+            center = float(hardness_nodes[len(hardness_nodes) // 2]["healthScale"])
+            if abs(math.log(center / searched_scale)) > math.log(2.0) and not ultra:
+                # The build was chosen on a target of very different hardness;
+                # choose it again on the middle node and re-derive the nodes.
+                baseline = _optimize_archetype(
+                    weapon, None, scenario=scenario, metric=ranking_metric,
+                    passives=passives, capacity_limit=capacity_limit,
+                )
+                hardness_nodes = _hardness_nodes(baseline.stats, raw_context) or hardness_nodes
+                search_context = _center_context(raw_context, hardness_nodes)
+            benchmark_context = dict(raw_context, hardnessNodes=hardness_nodes)
+            # Same build, scored on all nodes like every later build.
+            baseline = _reconstruct([card.key for card in baseline.cards], None) or baseline
+            if statics is not None:
+                statics["hardnessNodes"] = hardness_nodes
+    if fixed_target and benchmark_context.get("hardnessNodes"):
+        target_calibration.update(
+            status="hardness-integrated",
+            evaluationLevel=benchmark_context.get("level"),
+            hardnessNodes=benchmark_context["hardnessNodes"],
+            ttkRange=list(HARDNESS_TTK_RANGE),
+            ttkBasis="no-riven-baseline-body-shot-ttk",
+            aggregation="geometric-mean-kpm",
+            searchHealthScale=(search_context.get("enemy_enhancements") or {}).get("healthScale", 1.0),
+        )
+
+    def _apply_riven_floor(result: _Evaluation, riven_card: _Card, *, floor_metric: str | None = None,
+                           route_passives: Any = None) -> _Evaluation:
+        # ``route_passives``: the passives of the route ``result`` was searched
+        # on (Incarnon route screening); the default route's otherwise.
+        floor_passives = passives if route_passives is None else route_passives
+        # 梁搜索在强制含紫卡时可能中途剪掉「无紫卡最优 − 最弱卡 + 紫卡」这条
+        # 显而易见的路径（部分配装在前几层协同未成形就被淘汰）。用它做下限，
+        # 避免「带紫卡反而比不带差」的假性负收益。required 卡（剑风 Prime）
+        # 不可被下限路径移除——floor 只从非必需卡中减一张。
+        # ── F07（审计修复）：floor 路径同样过统一可行域验证（必选卡必须
+        # 保留、数量范围不得越界）。旧实现只查容量，riven-floor 可以把用户
+        # 必选卡换掉或把配卡数压到 min_fill 之下。
+        # ── 容量修复（2026-09-24）：紫卡 18 耗经常要求丢 2 张卡（8 张满配
+        # 60 耗 + 18 超限）；旧 floor 只枚举单卡丢弃，装不下就整条 floor
+        # 失效——actual 于是回退到 beam 的劣解（用户报告的 actual < baseline
+        # 崩坏）。现在枚举最高合法保留层，完整覆盖同层的一删或两删组合。
+        floor_candidates = _riven_seed_subsets(
+            baseline.cards, riven_card, capacity_limit=capacity_limit,
+            required_mod_keys=search_required_keys, forbidden_mod_keys=search_forbidden_keys,
+            min_fill=search_min_fill, max_fill=search_max_fill)
+        floors: list[_Evaluation] = []
+        for kept in floor_candidates:
+            if validate_build(
+                kept,
+                riven_card,
+                slot_count=8,  # analyze_riven_request 固定 8 槽口径
+                capacity_limit=capacity_limit,
+                required_mod_keys=search_required_keys,
+                forbidden_mod_keys=search_forbidden_keys,
+                min_fill=search_min_fill,
+                max_fill=search_max_fill,
+            ) is not None:
+                continue
+            evaluated = _evaluate(
+                weapon,
+                kept,
+                riven_card,
+                scenario=scenario,
+                metric=floor_metric or ranking_metric,
+                passives=floor_passives,
+                capacity_limit=capacity_limit,
+                target_context=search_context,
+                reorder_elements=False,  # the baseline's element order is already chosen
+                fixed_riven_index=len(kept) if ultra and not required_damage_type else None,
+                required_damage_type=required_damage_type,
+            )
+            if evaluated is not None and (not required_damage_type or
+                    evaluated.stats.damage_types.get(required_damage_type, 0.0) > 0.0):
+                floors.append(evaluated)
+
+        def final_floor(candidate):
+            if ultra:
+                placed = _evaluate(weapon, candidate.cards, riven_card, scenario=scenario,
+                    metric=floor_metric or ranking_metric, passives=floor_passives, capacity_limit=capacity_limit,
+                    target_context=search_context, reorder_elements=False,
+                    required_damage_type=required_damage_type)
+                if placed is not None and (not required_damage_type or
+                        placed.stats.damage_types.get(required_damage_type, 0.0) > 0.0):
+                    candidate = placed
+            if search_context is not benchmark_context:
+                candidate = _evaluate(weapon, candidate.cards, riven_card, scenario=scenario,
+                    metric=floor_metric or ranking_metric, passives=floor_passives, capacity_limit=capacity_limit,
+                    target_context=benchmark_context, fixed_riven_index=candidate.riven_index,
+                    reorder_elements=False, required_damage_type=required_damage_type) or candidate
+            return candidate
+
+        floor = _best_finalist(floors, final_floor) if floors else None
+        return floor if floor is not None and floor.score > result.score else result
+
+    _progress("actual")
+    actual_card = _card_from_lines(actual_lines, polarity=actual_polarity)
+    # A statics bake keeps only what every card of the weapon shares; the
+    # trigger card's own build, floor and contributions are not part of it
+    # (nothing below writes them to the statics).
+    statics_only = bool(request.get("_bakeStaticsOnly")) and not ultra
+    route_statics_eligible = (
+        cacheable and statics is not None and profile == "standard"
+        and ranking_metric == "windowedDps"
+        and bool(benchmark_context and benchmark_context.get("hardnessNodes"))
+        and bool(resolved_choices) and "tier5" not in resolved_choices
+        and request.get("incarnonChoices") is None and not required_damage_type
+    )
+    route_baselines = statics.get("incarnonBaselines") if route_statics_eligible else None
+    use_route_baselines = (
+        request.get("_useBakedIncarnonBaselines") is True
+        and nodes_cached and not baseline_fresh
+        and isinstance(route_baselines, dict) and bool(route_baselines)
+    )
+
+    def _route_key(route):
+        return json.dumps(dict(route), sort_keys=True, separators=(",", ":"))
+
+    def _route_incarnon_card(route):
+        return _incarnon_card(
+            weapon, dict(route), scenario=scenario, metric=objective_metric,
+            policy=exports.get("incarnonDefaults"), build_label=exports["buildLabel"])
+
+    def _baked_route_baseline(route, route_passives):
+        row = route_baselines.get(_route_key(route)) if use_route_baselines else None
+        if not isinstance(row, dict):
+            return None
+        build = _reconstruct(row.get("mods"), None, active_passives=route_passives)
+        score = row.get("score")
+        if (
+            build is None or validate_build(build.cards, None, slot_count=8, capacity_limit=capacity_limit)
+            or not isinstance(score, (int, float)) or not math.isclose(build.score, score, rel_tol=1e-12)
+        ):
+            return None
+        return build
+
+    bake_routes = request.get("_bakeIncarnonBaselines")
+    if bake_routes is not None:
+        if not (statics_only and route_statics_eligible and isinstance(bake_routes, list)):
+            raise SimulationError("Incarnon baseline baking requires cacheable automatic standard statics")
+        baked = dict(route_baselines) if isinstance(route_baselines, dict) else {}
+        for route in bake_routes:
+            if not isinstance(route, dict) or set(route) != set(resolved_choices):
+                raise SimulationError("a baked Incarnon baseline needs one valid choice per tier")
+            card, selected, _, _ = _route_incarnon_card(route)
+            if selected != route:
+                raise SimulationError("a baked Incarnon baseline has invalid choices")
+            build = _optimize_archetype(
+                weapon, None, scenario=scenario, metric=ranking_metric,
+                passives=_merge_passives(card, arcane_card), capacity_limit=capacity_limit)
+            baked[_route_key(route)] = {"mods": [mod.key for mod in build.cards], "score": build.score}
+        statics["incarnonBaselines"] = baked
+        statics_cache["__dirty__"] = True
+
+    route_options = (_route_options(weapon, resolved_choices)
+                     if not statics_only and not ultra and timeline_seconds is None
+                     and request.get("incarnonChoices") is None and resolved_choices else [])
+    prioritize_winner = (
+        bool(route_options) and use_route_baselines and request.get("_reuseIncarnonWitness") is True
+    )
+    full_card_search = {}
+    if prioritize_winner and (state := SESSION.get()) is not None:
+        # Preparation removes the later baseline search on a covered route.
+        # Let the finalist finish within the remaining absolute request budget.
+        full_card_search["event_phase_seconds"] = state["deadline"] - state["start"]
+
+    def _search_actual(route_passive, **options):
+        return _apply_riven_floor_profiled(_optimize_archetype(
+            weapon,
+            actual_card,
+            scenario=scenario,
+            metric=ranking_metric,
+            passives=route_passive,
+            capacity_limit=capacity_limit,
+            **options,
+        ), actual_card, route_passives=route_passive)
+
+    actual = None if statics_only else _search_actual(
+        passives, **({"search_profile": "fast", **full_card_search} if prioritize_winner else {}))
+
+    if ultra and actual is not None and search_context is not None:
+        # Cached builds are witnesses, never cached scores for this Riven. Keep
+        # the original ultra answer even if a middle-node improvement loses
+        # on the complete three-node objective.
+        old_actual = actual
+        seed_keys = []
+        if statics:
+            seed_keys.extend((statics.get("archetypeBases") or {}).values()
+                             if isinstance(statics.get("archetypeBases"), dict) else ())
+            # Bot reference witnesses are stored under this already matched
+            # weapon/scenario cache key. Reuse their MODs, never their old KPM.
+            reference_seeds = []
+            counts = statics.get("counts")
+            if isinstance(counts, dict):
+                for n in ("2", "3"):
+                    bundle = counts.get(n)
+                    reference = bundle.get("reference") if isinstance(bundle, dict) else None
+                    candidates = reference.get("candidates") if isinstance(reference, dict) else None
+                    for candidate in candidates if isinstance(candidates, list) else ():
+                        build = candidate.get("build") if isinstance(candidate, dict) else None
+                        keys = build.get("mods") if isinstance(build, dict) else None
+                        if isinstance(keys, list) and keys not in reference_seeds:
+                            reference_seeds.append(keys)
+            seed_keys.extend(reference_seeds[:4])
+        seeds = [tuple(baseline.cards), tuple(actual.cards)]
+        for keys in seed_keys:
+            if (isinstance(keys, list) and 0 < len(keys) <= 8
+                    and all(isinstance(k, str) and k in pool_by_key for k in keys)
+                    and len(set(keys)) == len(keys)):
+                seeds.append(tuple(pool_by_key[k] for k in keys))
+        warm_deadline = phase_deadline()
+        starts = []
+        seen_warm = set()
+        witness_keys = set()
+        warm_evaluations = 0
+        constraints = dict(capacity_limit=capacity_limit, required_mod_keys=search_required_keys,
+                           forbidden_mod_keys=search_forbidden_keys, min_fill=search_min_fill,
+                           max_fill=search_max_fill)
+        layers = []
+        for seed in seeds:
+            witness_keys.update(c.key for c in seed)
+            layers.append(_riven_seed_subsets(seed, actual_card, **constraints))
+        # A capacity-heavy witness must not consume the whole allowance before
+        # the other cached archetypes get even one current-card evaluation.
+        for row in itertools.zip_longest(*layers):
+            if expired(warm_deadline) or warm_evaluations >= 64:
+                break
+            for cards in row:
+                if cards is None:
+                    continue
+                signature = tuple(c.key for c in cards)
+                if signature in seen_warm:
+                    continue
+                if expired(warm_deadline) or warm_evaluations >= 64:
+                    break
+                seen_warm.add(signature)
+                warm_evaluations += 1
+                value = _evaluate(weapon, cards, actual_card, scenario=scenario,
+                    metric=ranking_metric, passives=passives, capacity_limit=capacity_limit,
+                    target_context=search_context, required_damage_type=required_damage_type)
+                if value is not None and (not required_damage_type or
+                        value.stats.damage_types.get(required_damage_type, 0.0) > 0.0):
+                    starts.append(value)
+        # Prioritize deep witnesses and their family variants; other candidates
+        # remain available. The refiner interleaves slots under its fixed cap.
+        witness_families = {_mod_family(pool_by_key[k]) for k in witness_keys if k in pool_by_key}
+        warm_pool = sorted(mod_pool, key=lambda c: (c.key not in witness_keys,
+                           _mod_family(c) not in witness_families, c.key))
+        finalists = [old_actual]
+        for start in sorted(starts, key=lambda value: -value.score)[:2]:
+            # A scored witness remains a finalist if its screening used the
+            # phase allowance; only the optional neighbourhood work stops.
+            value = start if expired(warm_deadline) else refine_final_build(weapon, warm_pool, actual_card, start,
+                scenario=scenario, metric=ranking_metric, passives=passives,
+                capacity_limit=capacity_limit, required_damage_type=required_damage_type,
+                target_context=search_context, profile='ultra', max_evaluations=64,
+                max_rounds=2, full_neighbourhood=True, deadline_limit=warm_deadline,
+                required_mod_keys=search_required_keys,
+                forbidden_mod_keys=search_forbidden_keys, min_fill=search_min_fill,
+                max_fill=search_max_fill)
+            finalists.append(_rescore(value, actual_card, dict(scenario=scenario,
+                              metric=ranking_metric, passives=passives, capacity_limit=capacity_limit)))
+        actual = max(finalists, key=lambda value: value.score)
+
+    # ── 灵化路线随紫卡筛选（2026-10-17）──────────────────────────────────
+    # 默认路线（社区策略或裸枪逐阶择优）在看到紫卡之前就定了，紫卡会让最优
+    # 路线翻转：奏凯无紫卡时 5-3 强袭损耗更强，配负暴击紫卡后 5-1 压制损耗
+    # 高 14–24%。基准、推荐与致命负仍按默认路线（武器级缓存，与紫卡无关）；
+    # 当前紫卡的配装先用快速档逐阶筛选（坐标下降，最多两轮），胜出路线再按
+    # 本档位精算，精算后仍胜过默认路线才采用。各路线在同一组硬度节点上评分。
+    # 显式路线、超快档与时间线请求不筛选。
+    actual_passives, actual_choices, route_screen = passives, dict(resolved_choices), None
+    route_baseline: _Evaluation | None = None
+    route_baseline_source = None
+    if route_options:
+        import time as _time
+        screen_started = _time.perf_counter()
+        route_cards: dict[tuple[tuple[str, str], ...], tuple[Any, list[str]]] = {}
+        screened: dict[tuple[tuple[str, str], ...], _Evaluation | None] = {}
+
+        def _passives_for(route: Mapping[str, str]) -> tuple[Any, list[str]]:
+            key = tuple(sorted(route.items()))
+            if key not in route_cards:
+                card, _choices, card_unsupported, _policy = _route_incarnon_card(route)
+                route_cards[key] = (_merge_passives(card, arcane_card), card_unsupported)
+            return route_cards[key]
+
+        reuse_route_witness = (
+            request.get("_reuseIncarnonWitness") is True
+            and profile == "standard"
+            and ranking_metric == "windowedDps"
+            and bool(benchmark_context and benchmark_context.get("hardnessNodes"))
+            and not has_search_constraints
+            and not required_damage_type
+            # Evo V can change which earlier-tier combination wins (e.g.
+            # Laetum's non-critical trigger). Keep its full scout search.
+            and "tier5" not in resolved_choices
+        )
+
+        def _screen(route: Mapping[str, str], witness: _Evaluation | None = None, *, provisional: bool) -> float:
+            key = tuple(sorted(route.items()))
+            if key not in screened:
+                if key == tuple(sorted(resolved_choices.items())) and (profile == "fast" or provisional):
+                    screened[key] = actual
+                else:
+                    try:
+                        route_passive = _passives_for(route)[0]
+                        # Re-evaluate the current route's build on the challenger.
+                        # The existing fast search still supplies new candidates
+                        # and element seeds. Keep the default and finalist searches
+                        # at their original breadth.
+                        scout = {}
+                        if reuse_route_witness and witness is not None and witness.cards:
+                            scout = dict(seed_cards=witness.cards, beam_width=4, shortlist=24)
+                            if provisional:
+                                scout.update(beam_width=2, provisional_route=True, **full_card_search)
+                        screened[key] = _search_actual(route_passive, search_profile="fast", **scout)
+                    except SimulationError:
+                        screened[key] = None  # no valid build on this route: it cannot win
+            return screened[key].score if screened[key] is not None else -math.inf
+
+        probes: dict[tuple[tuple[tuple[str, str], ...], tuple[str, ...]], float | None] = {}
+
+        def _probe(route: Mapping[str, str], build: _Evaluation) -> float | None:
+            # One replay of a fixed build under ``route`` (middle node).
+            key = (tuple(sorted(route.items())), tuple(card.key for card in build.cards))
+            if key not in probes:
+                probe = _evaluate(weapon, build.cards, actual_card, scenario=scenario, metric=ranking_metric,
+                                  passives=_passives_for(route)[0], capacity_limit=capacity_limit,
+                                  target_context=search_context, fixed_riven_index=build.riven_index,
+                                  reorder_elements=False)
+                probes[key] = probe.score if probe is not None else None
+            return probes[key]
+
+        def _pick_route(*, provisional: bool):
+            screened.clear()
+            probes.clear()
+            current = dict(resolved_choices)
+            current_score = _screen(current, provisional=provisional)
+            inert: list[dict[str, str]] = []
+            for _round in range(2):
+                changed = False
+                for tier_key, branch_ids in route_options:
+                    for branch_id in branch_ids:
+                        if current.get(tier_key) == branch_id:
+                            continue
+                        trial = {**current, tier_key: branch_id}
+                        build = screened[tuple(sorted(current.items()))]
+                        if tuple(sorted(trial.items())) not in screened:
+                            # A branch that leaves the current build's score
+                            # unchanged is inert on this replay.
+                            before = _probe(current, build) if build is not None else None
+                            after = _probe(trial, build) if before is not None else None
+                            if before is not None and after is not None and abs(after - before) <= 1e-12 * max(abs(before), 1.0):
+                                inert.append(trial)
+                                continue
+                        trial_score = _screen(trial, build, provisional=provisional)
+                        if trial_score > current_score * (1.0 + 1e-6):
+                            current, current_score, changed = trial, trial_score, True
+                if not changed:
+                    break
+            return current, inert
+
+        current, inert = _pick_route(provisional=prioritize_winner)
+        adopted = False
+        default_verified = not prioritize_winner
+        scout_fallback = False
+        if prioritize_winner:
+            if current != resolved_choices:
+                route_baseline = _baked_route_baseline(current, _passives_for(current)[0])
+            if route_baseline is None:
+                # A narrow scout can miss the stronger prepared branch.
+                # Re-enter the ordinary screen before trusting its selection.
+                actual = _search_actual(passives, **full_card_search)
+                current, inert = _pick_route(provisional=False)
+                default_verified = scout_fallback = True
+        if current != resolved_choices:
+            route_passive, route_unsupported = _passives_for(current)
+            final = screened[tuple(sorted(current.items()))]
+            if profile != "fast":
+                try:
+                    searched = _search_actual(route_passive, **full_card_search)
+                except SimulationError:
+                    searched = None
+                if searched is not None and searched.score >= final.score:
+                    final = searched
+            if not default_verified:
+                # Compare on the same target using both the default scout and
+                # the winning build replayed with the default route's passives.
+                default_replay = _rescore(final, actual_card, dict(
+                    scenario=scenario, metric=ranking_metric, passives=passives,
+                    capacity_limit=capacity_limit))
+                if final.score <= 1.10 * max(actual.score, default_replay.score):
+                    actual = _search_actual(passives, **full_card_search)
+                    default_verified = True
+            if final.score > actual.score * (1.0 + 1e-6):
+                actual, actual_passives, actual_choices, adopted = final, route_passive, dict(current), True
+                unsupported.extend(route_unsupported)
+                # The no-Riven build on the new route: when the route alone is
+                # stronger, the gain is measured against it, so actualGain counts
+                # only what the Riven adds (searched at the request's profile).
+                if route_baseline is None:
+                    route_baseline = _baked_route_baseline(current, route_passive)
+                if route_baseline is not None:
+                    route_baseline_source = "statics"
+                else:
+                    try:
+                        route_baseline = _optimize_archetype(weapon, None, scenario=scenario, metric=ranking_metric,
+                                                             passives=route_passive, capacity_limit=capacity_limit)
+                        route_baseline_source = "search"
+                    except SimulationError:
+                        route_baseline = None
+            else:
+                route_baseline = None
+        route_screen = {
+            "defaultRoute": dict(resolved_choices),
+            "chosenRoute": dict(actual_choices),
+            "adopted": adopted,
+            "screenProfile": "fast-seeded" if reuse_route_witness else "fast",
+            "screened": [{"route": dict(key), "score": evaluation.score if evaluation is not None else None}
+                         for key, evaluation in screened.items()],
+            "inert": inert,
+            "seconds": round(_time.perf_counter() - screen_started, 2),
+        }
+        if prioritize_winner:
+            route_screen["defaultVerified"] = default_verified
+            route_screen["scoutFallback"] = scout_fallback
+
+    # Reverse floor (ultra without a cached baseline only): the actual build
+    # without its Riven, the slot refilled, is a no-Riven build too; when it
+    # beats the approximate baseline it is used for the gain, so actualGain is
+    # not inflated by a weak baseline. Cached baselines stay fixed per weapon:
+    # every card of a weapon is measured against the same baseline.
+    gain_baseline = baseline
+    if ultra and baseline_fresh and not search_required_keys and not search_forbidden_keys and search_min_fill is None and search_max_fill is None:
+        kept = tuple(pool_by_key.get(card.key, card) for card in actual.cards)
+        families = {_mod_family(card) for card in kept}
+        fillers = [card for card in mod_pool if card.key not in {c.key for c in kept} and _mod_family(card) not in families]
+        panel = []
+        for card in fillers:
+            probe = _evaluate(weapon, (*kept, card), None, scenario=scenario, metric="statusSustainedDps",
+                              passives=passives, capacity_limit=capacity_limit, target_context=search_context,
+                              reorder_elements=False)
+            if probe is not None:
+                panel.append((probe.score, card.key, card))
+        candidates = [kept] + [(*kept, card) for _, _, card in sorted(panel, key=lambda x: (-x[0], x[1]))[:6]]
+        best = None
+        for cards in candidates:
+            evaluated = _evaluate(weapon, cards, None, scenario=scenario, metric=ranking_metric, passives=passives,
+                                  capacity_limit=capacity_limit, target_context=search_context,
+                                  reorder_elements=False)
+            if evaluated is not None and (best is None or evaluated.score > best.score):
+                best = evaluated
+        if best is not None:
+            best = _reconstruct([card.key for card in best.cards], None) or best
+            if best.score > baseline.score * (1.0 + 1e-9):
+                gain_baseline = best
+                unsupported.append("baseline-raised-by-reverse-floor")
+    baseline_passives, baseline_choices = passives, dict(resolved_choices)
+    if route_screen is not None:
+        if use_route_baselines:
+            route_screen["baselineSource"] = route_baseline_source
+        route_screen["baselineScores"] = {"defaultRoute": gain_baseline.score,
+                                          "chosenRoute": route_baseline.score if route_baseline is not None else None}
+        route_screen["baselineRaised"] = False
+    if route_baseline is not None and route_baseline.score > gain_baseline.score * (1.0 + 1e-9):
+        gain_baseline, baseline_passives, baseline_choices = route_baseline, actual_passives, dict(actual_choices)
+        route_screen["baselineRaised"] = True
+
+    _fusable = _fusion_codes_from_templates(
+        exports.get("rivenTemplates") or {}, riven_type
+    )
+    positive_candidates, _ = _candidate_lines(
+        riven_type, disposition, (), negative=False, bases=template_bases,
+        available_fusion_codes=_fusable, allowed_codes=legal_positive,
+    )
+    candidate_by_code = {line.code: line for line in positive_candidates}
+    negative_candidates, _ = _candidate_lines(
+        riven_type, disposition, (), negative=True, bases=template_bases,
+        available_fusion_codes=_fusable, allowed_codes=legal_negative,
+    )
+    negative_by_code = {line.code: line for line in negative_candidates}
+
+    _progress("recommendation")
+
+    def _archetype_bases() -> list[tuple[_Card, ...]]:
+        """Full builds around a representative crit card and status card.
+
+        Cached per weapon with the other statics; independent of the card
+        being analysed.
+        """
+        cached = statics.get("archetypeBases") if statics else None
+        if isinstance(cached, dict):
+            rebuilt = [tuple(pool_by_key[key] for key in keys) for keys in cached.values()
+                       if isinstance(keys, list) and all(key in pool_by_key for key in keys)]
+            if len(rebuilt) == len(cached):
+                return rebuilt
+        filler = "S" if "S" in candidate_by_code else "D"
+        elements = [code for code in ("4", "5", "6", "7") if code in candidate_by_code]
+        element = None
+        if elements:
+            values = _best_fixed_scores(
+                weapon, [(baseline.cards, _card_from_lines([candidate_by_code[code]])) for code in elements],
+                scenario=scenario, metric=ranking_metric, passives=passives,
+                capacity_limit=capacity_limit, target_context=search_context,
+                max_keep_cap={"fast": 3, "standard": 5, "deep": None}[profile])
+            for value in values:
+                if isinstance(value, Exception) and not isinstance(value, SimulationError):
+                    raise value
+            element_values = dict(zip(elements, (-math.inf if isinstance(value, Exception) else value
+                                                 for value in values)))
+            element = max(elements, key=element_values.__getitem__)
+        archetypes = {"crit": ["0", "1", filler], "status": ["2", element or "D", filler]}
+        built: dict[str, list[str]] = {}
+        result: list[tuple[_Card, ...]] = []
+        for name, codes in archetypes.items():
+            lines = [candidate_by_code[code] for code in dict.fromkeys(codes) if code in candidate_by_code]
+            if len(lines) < 2:
+                continue
+            try:
+                evaluation = _optimize_archetype(weapon, _card_from_lines(lines), scenario=scenario,
+                                                 metric=ranking_metric, passives=passives,
+                                                 capacity_limit=capacity_limit)
+            except SimulationError:
+                continue
+            built[name] = [card.key for card in evaluation.cards]
+            result.append(tuple(evaluation.cards))
+        if statics is not None:
+            statics["archetypeBases"] = built
+        return result
+    positive_count = sum(not line.negative for line in actual_lines)
+    if positive_count not in {2, 3}:
+        positive_count = 3
+        unsupported.append("partial-riven-positive-count-using-three-stat-optimum")
+    count_key = str(positive_count)
+    bundle: dict[str, Any] | None = None
+    if statics is not None and isinstance(statics.get("counts"), dict):
+        cached_bundle = statics["counts"].get(count_key)
+        if isinstance(cached_bundle, dict):
+            bundle = cached_bundle
+    cached_recommended = (
+        [
+            candidate_by_code[code]
+            for code in bundle.get("recommended") or ()
+            if code in candidate_by_code
+        ]
+        if bundle is not None
+        else None
+    )
+    recommended_fresh = not (
+        cached_recommended is not None
+        and len(cached_recommended) == positive_count
+        and isinstance(bundle.get("tiers"), list)
+    )
+    if recommended_fresh and ultra:
+        # 超快档不做推荐搜索：没有快速档缓存时推荐留空。
+        recommended, recommended_result, recommended_tiers = [], None, []
+        recommended_fresh = False
+        unsupported.append("ultra-profile-recommendation-not-cached")
+    elif recommended_fresh:
+        recommended, recommended_result, recommended_tiers = _recommend_positive(
+            weapon,
+            baseline,
+            positive_candidates,
+            positive_count,
+            scenario=scenario,
+            metric=ranking_metric,
+            passives=passives,
+            capacity_limit=capacity_limit,
+            target_context=search_context,
+            profile=profile,
+            extra_bases=_archetype_bases(),
+        )
+    else:
+        recommended = cached_recommended
+        recommended_result = None
+        recommended_tiers = bundle["tiers"]
+
+    # 双路推荐已移除（用户确认实战即双修混搭）：推荐词条就是算法在当前
+    # KPM 口径下的最优组合，不再区分触发/直伤流派。保留 recommendedRoutes
+    # 字段为空以兼容旧前端。
+
+    # ── 负面词条排序：无伤负面 + 已建模负面统一评估 ─────────────────────
+    # 无伤负面（当前 KPM 口径零影响）：枪械 Z 后坐力/H 变焦/M 弹药上限/
+    # E 滑行暴击，近战 X 处决/N 连击持续/U 重击效率（普攻口径）。
+    # 已建模负面（真实影响，可为正收益——如膛室 Prime 配负弹匣）：
+    # L 弹匣/3 触发时间/F 装填/R 射速等——全部参与排序，让求解器自己
+    # 找到「代价最小/收益最大」的负面（不再人工限定中立池）。
+    neutral_negative_codes = _neutral_negative_codes(weapon)
+    negative_keep_cap = {"fast": 3, "standard": 5, "deep": None}[profile]
+    negative_ranked: list[tuple[float, _RivenLine]] = []
+    from .riven_recommendation import negative_rolls
+    ranked_positive, _ = _candidate_lines(riven_type,disposition,(),negative=False,bases=template_bases,
+        structure_scale=theoretical_structure_scale(positive_count,True),available_fusion_codes=_fusable,allowed_codes=legal_positive)
+    ranked_negative, _ = _candidate_lines(riven_type,disposition,(),negative=True,bases=template_bases,
+        structure_scale=theoretical_structure_scale(positive_count,True,negative=True),available_fusion_codes=_fusable,allowed_codes=legal_negative)
+    positive_map = {line.code:line for line in ranked_positive}
+    negative_seed = [positive_map[line.code] for line in recommended]
+    negative_map = {line.code: line for line in ranked_negative}
+    cached_negative = (bundle or {}).get("negative") if not recommended_fresh else None
+    negative_fresh = not isinstance(cached_negative, list)
+    if negative_fresh and ultra:
+        unsupported.append("ultra-profile-negative-ranking-not-cached")
+    negative_lines = [
+        line for line in (negative_rolls(ranked_negative) if negative_fresh and not ultra else ())
+        if line.code not in {p.code for p in negative_seed}
+        and (line.code in neutral_negative_codes or (line.effect is not None and line.effect.supported))
+    ]
+    # Independent lines: scored together so the pool stays full.
+    negative_scores = _best_fixed_scores(
+        weapon,
+        [(baseline.cards, _card_from_lines([*negative_seed, line])) for line in negative_lines],
+        scenario=scenario,
+        metric=ranking_metric,
+        passives=passives,
+        capacity_limit=capacity_limit,
+        target_context=search_context,
+        max_keep_cap=negative_keep_cap,
+    )
+    for line, score in zip(negative_lines, negative_scores):
+        if isinstance(score, Exception):
+            raise score
+        negative_ranked.append((score, line))
+    negative_ranked.sort(key=lambda item: (-item[0],item[1].code not in neutral_negative_codes,item[1].code))
+    recommended_negative = []
+    for _,line in negative_ranked:
+        if line.code not in {l.code for l in recommended_negative}:recommended_negative.append(line)
+        if len(recommended_negative)==3:break
+    if not negative_fresh:
+        recommended_negative = [negative_map[code] for code in cached_negative if code in negative_map]
+    # ── 致命负面（武器级）──────────────────────────────────────────────
+    # 每个可作负面的词条按理论负值放进推荐正面的紫卡：先在基准配装上固定
+    # 配卡评估；亏损超过 FATAL_NEGATIVE_LOSS 的，再以基准配装为种子重搜一次
+    # 配卡——配装可以围绕负面调整（负触发转暴击、负弹匣喂首发伤害卡），
+    # 重搜后仍亏损超过阈值才算致命。与 WFSim 一样让战斗决定每个负面，
+    # 不按词条写死规则；不参与伤害的词条（变焦、后坐力…）恒为无伤。
+    negative_assessment: list[dict[str, Any]] = []
+    cached_fatal = (bundle or {}).get("fatal") if not recommended_fresh else None
+    if negative_fresh and not ultra:
+        negative_assessment = _assess_negatives(
+            weapon, mod_pool, baseline, negative_seed, negative_ranked, negative_map, neutral_negative_codes,
+            scenario=scenario, metric=ranking_metric, passives=passives, capacity_limit=capacity_limit,
+            target_context=search_context, keep_cap=negative_keep_cap,
+            classification_only=statics_only or bool(request.get('_bakeNegativeClassificationOnly')))
+        fatal_codes = [row["code"] for row in negative_assessment if row["fatal"]]
+        fatal_above = {row["code"]: row["fatalAbove"] for row in negative_assessment
+                       if row["fatal"] and row["fatalAbove"] is not None}
+    elif isinstance(cached_fatal, list):
+        fatal_codes = [code for code in cached_fatal if code in negative_map]
+        cached_above = (bundle or {}).get("fatalAbove")
+        fatal_above = ({code: float(value) for code, value in cached_above.items() if code in fatal_codes}
+                       if isinstance(cached_above, Mapping) else {})
+    else:
+        fatal_codes = []
+        fatal_above = {}
+        if not ultra:
+            unsupported.append("fatal-negative-not-assessed")
+    negative_fresh = negative_fresh and not ultra
+    if not recommended_negative and "ultra-profile-negative-ranking-not-cached" not in unsupported:
+        unsupported.append("no-objective-neutral-supported-negative-stat")
+
+    # All final builds, recommendations and ablations share the ranking metric.
+    # KPM is measured separately for display; never repeat the entire search
+    # solely to change the quality unit after it already selected these builds.
+    _progress("quality")
+    # Recommendations and negatives above used the searched baseline (card
+    # independent, cached); gain and the displayed baseline use the stronger.
+    searched_baseline, baseline = baseline, gain_baseline
+    score_metric = ranking_metric
+    quality_scores = {"baseline":baseline.score, "actual":actual.score if actual is not None else None}
+    quality_detail_cache: dict[str, float] = {}
+    quality_cache_hit = False
+    if score_metric != objective_metric:
+        skipped_early.append("评分与配装从一开始使用同靶窗口 DPS；KPM 为同一配装的独立战斗指标，无重复复评搜索")
+
+    def _context_identity() -> tuple[dict[str, Any] | None, str]:
+        """The evaluation target and the context hash the statics record."""
+        evaluation_target = None
+        if benchmark_context is not None:
+            target_record = benchmark_context.get("target")
+            evaluation_target = {
+                "enemyPath": target_record.get("path") if isinstance(target_record, Mapping) else None,
+                "enemyName": (
+                    (target_record.get("nameEn") or target_record.get("name"))
+                    if isinstance(target_record, Mapping)
+                    else None
+                ),
+                "level": benchmark_context.get("level"),
+                "steelPath": bool(benchmark_context.get("steel_path")),
+                "enemyEnhancements": benchmark_context.get("enemy_enhancements"),
+                "armourStrip": benchmark_context.get("armour_strip", 0.0),
+                "elementalArmourStrip": benchmark_context.get("elemental_armour_strip", 0.0),
+                "hitLocation": benchmark_context.get("hit_location", "body"),
+                "headshotChance": benchmark_context.get("headshotChance", 0.0),
+                "windowSeconds": benchmark_context.get("windowSeconds"),
+            }
+        context_payload = {
+            "version": TARGET_CALIBRATION_VERSION,
+            "buildLabel": exports.get("buildLabel"),
+            "weapon": weapon.get("path"),
+            "fireMode": fire_mode,
+            "weaponType": weapon_type,
+            "innateElements": weapon.get("innateElements") or (),
+            "requestedTarget": requested_target_payload,
+            "evaluationTarget": evaluation_target,
+            "objectiveMetric": objective_metric,
+            "scoreMetric": score_metric,
+            "profile": profile_raw,
+            "capacityLimit": capacity_limit,
+            "disposition": disposition,
+            "scenario": {
+                **_scenario_context(scenario),
+                "throwable": throwable,
+                "incarnonChoices": resolved_choices,
+                "arcanes": request.get("arcanes"),
+            },
+            "stance": (
+                {
+                    "path": stance_info.get("path"),
+                    "dpsMultiplier": stance_multiplier,
+                    "statusRateMultiplier": status_rate_multiplier,
+                    "capacityGain": stance_capacity,
+                }
+                if stance_info
+                else None
+            ),
+            "targetCalibration": {
+                'version':TARGET_CALIBRATION_VERSION,
+                'status':target_calibration.get('status'),
+                'requestedLevel':target_calibration.get('requestedLevel'),
+                'evaluationLevel':target_calibration.get('evaluationLevel'),
+            },
+        }
+        context_hash = _evaluation_context_hash(context_payload)
+        return evaluation_target, context_hash
+
+    # 回写静态缓存（仅本次新算的部分；高数值/当前紫卡反超修正不影响缓存）。
+    if cacheable and not ultra and statics is not None and (
+        baseline_fresh or recommended_fresh or negative_fresh
+    ):
+        statics["disposition"] = disposition
+        statics["metric"] = ranking_metric
+        statics["capacityLimit"] = capacity_limit
+        if baseline_fresh:
+            statics["baselineCards"] = [card.key for card in searched_baseline.cards]
+        counts = statics.get("counts")
+        if not isinstance(counts, dict):
+            counts = {}
+            statics["counts"] = counts
+        write_bundle = counts.get(count_key)
+        if not isinstance(write_bundle, dict):
+            write_bundle = {}
+            counts[count_key] = write_bundle
+        if recommended_fresh:
+            write_bundle["recommended"] = [line.code for line in recommended]
+            write_bundle["tiers"] = recommended_tiers
+        if negative_fresh:
+            write_bundle["negative"] = [line.code for line in recommended_negative]
+            write_bundle["fatal"] = list(fatal_codes)
+            write_bundle["fatalAbove"] = dict(fatal_above)
+        statics_cache["__dirty__"] = True
+    if statics_only:
+        evaluation_target, context_hash = _context_identity()
+        if cacheable and statics is not None:
+            statics["contextHash"] = context_hash
+            statics["evaluationTarget"] = evaluation_target
+            statics["targetCalibration"] = target_calibration
+            statics["scoreMetric"] = score_metric
+            statics["qualityCalibrated"] = False  # a bake never calibrates quality
+            statics_cache["__dirty__"] = True
+        return {"bakeStaticsOnly": True, "contextHash": context_hash,
+                "recommended": [line.code for line in recommended],
+                "negative": [line.code for line in recommended_negative],
+                "fatal": list(fatal_codes), "fatalAbove": dict(fatal_above)}
+
+    # 不再计算「理论上限」与 0–100 评分（上限本身是近似搜索，其误差会传给
+    # 所有评分）。保留：相对无紫卡基线的实际增益、逐词条贡献与推荐词条排序。
+    actual_gain = _percent_gain(quality_scores["actual"], quality_scores["baseline"])
+
+    recommended_codes = {line.code for line in recommended}
+    negative_codes = {line.code for line in recommended_negative}
+    details = []
+    fatal_negative: list[str] = []
+    details_keep_cap = {"fast": 3, "standard": 5, "deep": None}[profile]
+    reoptimized_contributions = bool(request.get("includeReoptimizedContributions"))
+    ablation_scores: dict[str, float] = {}
+    # Ultra: stat contributions compare the build with and without each stat
+    # on the middle hardness node only (one replay each instead of a full
+    # node integration); the relative change is what is shown.
+    ablation_context = benchmark_context
+    ablation_reference = quality_scores["actual"]
+    if ultra and search_context is not benchmark_context:
+        ablation_context = search_context
+        center = _evaluate(weapon, actual.cards, actual_card, scenario=scenario, metric=score_metric, passives=actual_passives,
+                           capacity_limit=capacity_limit, target_context=search_context,
+                           fixed_riven_index=actual.riven_index, reorder_elements=False)
+        if center is not None:
+            ablation_reference = center.score
+            unsupported.append("ultra-profile-contributions-center-node")
+        else:
+            ablation_context = benchmark_context
+    if score_metric == objective_metric and os.environ.get("WF_ANALYZER_SERIAL") != "1":
+        from wfarsenal import parallel as _parallel
+        _pool = _parallel.get_pool()
+        if _pool is not None:
+            _ctx = _parallel.shared({"weapon": weapon, "scenario": scenario, "metric": objective_metric,
+                    "passives": actual_passives, "slot_limit": 8, "capacity_limit": capacity_limit,
+                    "target_context": ablation_context, "fixed_riven_index": actual.riven_index,
+                    "reorder_elements": False})
+            _jobs = {}
+            for _line in actual_lines:
+                if _line.code in {'W','Y'} and benchmark_context is not None and not float(benchmark_context.get('headshotChance') or 0.):
+                    continue
+                _without = _card_from_lines(
+                    [item for item in actual_lines if item.code != _line.code],
+                    polarity=actual_polarity,
+                )
+                _jobs[_line.code] = _pool.submit(_parallel._score_job, (actual.cards, _without, _ctx))
+            for _code, _future in _jobs.items():
+                _value = _future.result()
+                if _value is not None:
+                    ablation_scores[_code] = float(_value)
+    for line in actual_lines:
+        if reoptimized_contributions and score_metric != objective_metric and line.code in quality_detail_cache:
+            delta = quality_detail_cache[line.code]
+        elif reoptimized_contributions:
+            without = _card_from_lines(
+                [item for item in actual_lines if item.code != line.code],
+                polarity=actual_polarity,
+            )
+            removed = _best_fixed(
+                weapon,
+                actual.cards,
+                without,
+                scenario=scenario,
+                metric=score_metric,
+                passives=actual_passives,
+                capacity_limit=capacity_limit,
+                target_context=benchmark_context,
+                max_keep_cap=details_keep_cap,
+                preserve_base=True,
+            )
+            removed_score = removed.score
+            if score_metric != objective_metric:
+                removed_score = _score(
+                    removed.stats,
+                    score_metric,
+                    target_context=benchmark_context,
+                )
+            delta = _percent_gain(quality_scores["actual"], removed_score)
+        else:
+            # Fixed-build ablation is the default contribution contract. The
+            # second "remove then re-optimize" search is opt-in because it is
+            # the dominant source of multi-minute first requests.
+            delta = None
+            if score_metric != objective_metric:
+                quality_detail_cache[line.code] = delta
+        # ── F08（审计修复）：词条贡献拆成两个明确口径 ─────────────────────
+        # ablationDelta —— 固定配卡消融：保持其他卡、槽位顺序、数值、目标
+        #   和指标完全不变，只把该词条从紫卡里移除后重放同一配卡。这是
+        #   「同一配卡移除此词条后的目标伤害变化」的字面合同。
+        # delta（保留字段，含义=重优化收益）—— 移除词条后允许重新搜配卡
+        #   （_best_fixed 子集枚举）的收益上限。用户需要区分「词条本身的
+        #   价值」与「删词条+换卡后的联合收益」。
+        # 旧实现只返回 delta 但解释文案写成消融口径——零作用词条可能因
+        #   子集重优化删掉其他 MOD 而显示巨大「贡献」。
+        without_line = _card_from_lines(
+            [item for item in actual_lines if item.code != line.code],
+            polarity=actual_polarity,
+        )
+        if line.code in ablation_scores:
+            ablated_score = ablation_scores[line.code]
+            ablated = True
+        else:
+            ablated = _evaluate(
+                weapon, actual.cards, without_line, scenario=scenario,
+                metric=score_metric, passives=actual_passives,
+                capacity_limit=capacity_limit, target_context=ablation_context,
+                fixed_riven_index=actual.riven_index, reorder_elements=False,
+            )
+            ablated_score = ablated.score if ablated is not None else None
+        if ablated_score is not None:
+            if score_metric != objective_metric:
+                ablated_score = _score(
+                    ablated.stats if hasattr(ablated, 'stats') else actual.stats,
+                    score_metric,
+                    target_context=benchmark_context,
+                )
+            ablation_delta = _percent_gain(ablation_reference, ablated_score)
+        else:
+            ablation_delta = None
+        inactive_reason = None
+        condition = None
+        if line.code in {'W','Y'}:
+            condition = '弱点命中时'
+            if benchmark_context is not None and float(benchmark_context.get('headshotChance') or 0.) == 0.:
+                inactive_reason = '当前评价靶弱点命中率为 0%'
+        elif line.code == 'HR':
+            condition = '武器收起时自动装填'
+            inactive_reason = '当前持续持枪，没有收起装填事件'
+        # 提交紫卡的负面是否致命：看它是否在武器级致命负面里（重搜配卡后
+        # 仍亏损超过阈值）；固定配卡消融的亏损仍在 details 里给出数值。
+        # 随数值变化的致命负（fatalAbove）只在超过阈值时致命。
+        fatal = bool(line.negative and line.code in fatal_codes
+                     and not (line.code in fatal_above and line.value <= fatal_above[line.code] + 1e-9))
+        if fatal:
+            fatal_negative.append(line.label)
+        details.append(
+            {
+                "code": line.code,
+                "label": line.label,
+                "value": line.value,
+                "low": line.low,
+                "high": line.high,
+                "quality": _quality(line),
+                # F08：主口径改为固定配卡消融（字面合同：同一配卡移除此
+                # 词条）；重优化收益单独成字段。delta 保留为消融口径以
+                # 兼容旧前端，reoptimizedDelta 是「删词条后重搜配卡」的
+                # 联合收益上限。
+                "delta": ablation_delta if ablation_delta is not None else delta,
+                "ablationDelta": ablation_delta,
+                "reoptimizedDelta": delta,
+                "contributionMetric": score_metric,
+                "condition": condition,
+                "inactiveReason": inactive_reason,
+                "contributionStatus": 'inactive' if inactive_reason else ('computed' if ablation_delta is not None else 'unavailable'),
+                "recommended": (
+                    line.code in negative_codes if line.negative else line.code in recommended_codes
+                ),
+                "fatalNegative": fatal,
+                "explanation": (
+                    "消融口径（delta/ablationDelta）：同一配卡、同一目标与指标下"
+                    "移除此词条后的变化；重优化口径（reoptimizedDelta）：移除词条"
+                    "并允许重选普通 MOD 后的变化。负值代表该词条拖低目标指标"
+                ),
+            }
+        )
+
+    evaluation_target, context_hash = _context_identity()
+    # ── F10（审计修复）：三轴状态合同统一 ──────────────────────────────
+    # targetCalibrated 只在真正完成压力校准时为 true——capped-saturated
+    # （到达等级上限仍饱和）与 post-search-saturated（赢家仍饱和）都不算
+    # 已校准；skipped-by-request 也不算。旧实现把 capped-saturated 也标
+    # true，且 targetStatus 把「跳过校准」也显示成 calibrated。
+    calibration_status = str(target_calibration.get("status") or "")
+    search_quality = {
+        "objectiveMetric": objective_metric,
+        "scoreMetric": score_metric,
+        "fallbackReason": (
+            "continuous-ranking-from-start" if score_metric != objective_metric else None
+        ),
+        "targetCalibrated": calibration_status == "calibrated",
+        "targetCalibrationStatus": calibration_status or None,
+        "qualityCalibrated": (
+            not bool(request.get("_bakeStaticsOnly"))
+            and score_metric != objective_metric
+        ),
+        "qualityCacheHit": quality_cache_hit,
+        "profile": profile_raw,
+        "bakeStaticsOnly": bool(request.get("_bakeStaticsOnly")),
+    }
+    optimality_status = {
+        "baseline": "heuristic",
+        "recommended": "heuristic",
+        "scope": "beam-and-hill-climb",
+    }
+    model_uncertainty_tokens = (
+        "radial-or-field",
+        "projectile-component",
+        "event-mechanic",
+        "runtime",
+        "conditional",
+        "not-applied",
+        "not-evaluated",
+        "unmodeled",
+        "unverified",
+        "unresolved",
+        "idealized",
+        "order-fixed",
+    )
+    model_uncertainty_reasons = sorted(
+        {
+            str(item)
+            for build in (baseline, actual)
+            for item in getattr(build.stats, "unsupported", ())
+            if any(token in str(item).casefold() for token in model_uncertainty_tokens)
+        }
+    )
+    if model_uncertainty_reasons:
+        unsupported.append("analysis-model-partial")
+    # targetStatus：区分 not-applicable（无靶）/ calibrated（压力验证通过）/
+    # saturated-unresolved（饱和未解）/ skipped（请求跳过校准）。
+    target_status = "not-applicable" if benchmark_context is None else (calibration_status or "fixed")
+    model_status = (
+        "partial"
+        if any(
+            token in str(item).casefold()
+            for item in unsupported
+            for token in (
+                "unmodeled",
+                "unavailable",
+                "unsupported",
+                "partial",
+                "not-applied",
+                "not-evaluated",
+                "unresolved",
+                "unverified",
+                "idealized",
+                "order-fixed",
+            )
+        )
+        else "modeled"
+    )
+    search_status = {
+        "profile": profile_raw,
+        "metric": ranking_metric,
+        "scope": optimality_status["scope"],
+        "status": "heuristic-best-found",
+    }
+    if cacheable and not ultra and statics is not None:
+        statics["contextHash"] = context_hash
+        statics["evaluationTarget"] = evaluation_target
+        statics["targetCalibration"] = target_calibration
+        statics["scoreMetric"] = score_metric
+        statics["qualityCalibrated"] = bool(search_quality["qualityCalibrated"])
+        statics_cache["__dirty__"] = True
+
+    skipped = [
+        # 评分靶自适应等中途模块的口径说明前置（skip 语义：非缺陷的口径注记）。
+        *skipped_early,
+        f"optimizer-assumption: 8 slots, {capacity_limit} capacity, Catalyst and matching Forma",
+        (
+            "optimizer-objective: expected heavy/throw damage; target resistances and status DOT excluded"
+            if throwable
+            else (
+                "optimizer-objective: 面板普通攻击 DPS；派系歧视与敌方抗性不参与"
+                if weapon_type == "melee"
+                else (
+                    f"靶子：Lv{evaluation_target.get('level') if evaluation_target else '?'} "
+                    f"{'钢铁之路' if evaluation_target and evaluation_target.get('steelPath') else ''}凶魂百夫长"
+                    "（去掉天生超宏，护甲 2700 参与）；"
+                    f"弱点命中 {float(benchmark_context.get('headshotChance') or 0.0) * 100:.0f}%，其余为身体命中；"
+                    "血量按本武器无紫卡基线的身体命中击杀时间取三个硬度节点"
+                    + (
+                        "（" + " / ".join(f"{node['ttkSeconds']:.1f}s" for node in target_calibration.get("hardnessNodes") or ()) + "）"
+                        if target_calibration.get("hardnessNodes")
+                        else f"（{HARDNESS_TTK_RANGE[0]:g}–{HARDNESS_TTK_RANGE[1]:g}s 区间）"
+                    )
+                    + f"，每个节点 {float(benchmark_context.get('windowSeconds') or 30.0):g}s 窗口回放，KPM 取加权几何平均并计入血量展布；"
+                    "异常从零层叠起；同一武器的所有紫卡共用这组靶，增益可直接比较"
+                    if benchmark_context is not None
+                    else "optimizer-objective: 面板口径 · 触发按期望堆叠计入持续 DPS；不挂固定目标，派系歧视与敌方抗性不参与"
+                )
+            )
+        ),
+        (
+            "灵化路线："
+            + (f"使用灵化形态（模式 {fire_mode + 1}）" if fire_mode != 0 else "使用本体形态（模式 1）")
+            + (
+                "；进化 " + " / ".join(value for _, value in sorted(resolved_choices.items()))
+                + ("（显式指定）" if request.get("incarnonChoices") else "（无紫卡基准按武器默认策略选取）")
+                if resolved_choices
+                else ""
+            )
+            + (
+                "；当前紫卡配装改用进化 " + " / ".join(value for _, value in sorted(actual_choices.items()))
+                + "（按这张紫卡逐阶筛选路线后胜出）"
+                + ("；新路线的无紫卡配装更强，基准与增益改按它计" if route_screen.get("baselineRaised") else "")
+                if route_screen and route_screen.get("adopted")
+                else ("；已按这张紫卡逐阶筛选路线，默认路线最优" if route_screen else "")
+            )
+            + "；灵化形态按常驻计算，“自身护盾 / 超宏击破”类进化效果按强制生效"
+            if resolved_choices or weapon.get("isIncarnonForm")
+            else (
+                f"开火模式：使用模式 {fire_mode + 1}，其余模式仅展示"
+            )
+        ),
+        *([route_note(melee_schedule, (stance_info or {}).get("nameZh") or (stance_info or {}).get("nameEn")
+                      if melee_schedule and stance_info and stance_info.get("path") == melee_schedule.get("stance") else None)]
+          if melee_context else []),
+        "mod-family exclusivity checked by exported nameTag and weapon compatibility tags; account-specific conflicts are not exported",
+        f"Riven template values recovered from frozen build {template_build}",
+        "recommended Riven stats use theoretical max-roll values from the active frozen build",
+        (
+            "optimizer-profile: 快速档（beam 12/32，无爬山；词条分层为粗排口径）"
+            if profile == "fast"
+            else (
+                "optimizer-profile: 标准档（beam 24/40，3 轮爬山）"
+                if profile == "standard"
+                else "optimizer-profile: 深度档（beam 24/56，12 轮全邻域爬山）"
+            )
+        ),
+        f"optimizer-search: profile {profile}, {len(mod_pool)} candidate mods, {rejected_mods} unsupported mods rejected",
+        *(
+            [
+                "optimizer-scope: 必选 "
+                f"{len(search_required_keys)} 张 · 禁选 {len(search_forbidden_keys)} 张"
+                + (
+                    f" · 数量范围 {search_min_fill if search_min_fill is not None else 0}"
+                    f"–{search_max_fill if search_max_fill is not None else 8}"
+                    if search_min_fill is not None or search_max_fill is not None
+                    else ""
+                )
+            ]
+            if has_search_constraints
+            else []
+        ),
+        *([skipped_hint] if skipped_hint else []),
+        (
+            f"target: {target_calibration.get('status')} · Lv{target_calibration.get('evaluationLevel')} · "
+            "ttk " + "/".join(f"{node['ttkSeconds']:g}s" for node in target_calibration.get("hardnessNodes") or ())
+            + " · health x" + "/".join(f"{node['healthScale']:.3g}" for node in target_calibration.get("hardnessNodes") or ())
+        ),
+    ]
+    if stance_info:
+        stance_name = (
+            str(stance_info.get("nameZh") or stance_info.get("nameEn") or "")
+            or _path_basename(str(stance_info.get("path") or ""))
+        )
+        skipped.append(
+            f"optimizer-stance: 近战分析默认使用普攻 DPS 倍率最高的架势 {stance_name}"
+            f"（×{stance_multiplier:.2f}，容量 +{stance_capacity}），其余架势不参与"
+        )
+    if heavy_default_state and not weapon.get("heavyAttack", {}).get("components"):
+        unsupported.append("heavy-attack-route-unavailable-using-fire-mode-fallback")
+        # Keep the historical diagnostic token for clients that surfaced it.
+        unsupported.append("heavy-attack-dps-uses-normal-fire-mode-timing-and-no-heavy-multiplier")
+    elif metric == "heavyAttackDps" and not heavy_default_state:
+        unsupported.append("heavy-attack-dps-uses-normal-fire-mode-timing-and-no-heavy-multiplier")
+    for build in (baseline, actual):
+        unsupported.extend(build.stats.unsupported)
+        skipped.extend(build.stats.skipped)
+    timeline = None
+    if timeline_seconds is not None:
+        timeline = _arcane_timeline(
+            exports.get("arcanes") or (),
+            request.get("arcanes"),
+            weapon,
+            incarnon_card,
+            baseline,
+            actual,
+            actual,
+            actual_card,
+            actual_card,
+            scenario=scenario,
+            metric=objective_metric,
+            seconds=timeline_seconds,
+        )
+        skipped.append(
+            "arcane timeline is an expected DPS envelope, not an enemy hit/status event replay"
+        )
+    _progress("payload")
+    baseline_payload = _build_payload(weapon, baseline, None, baseline_passives)
+    actual_payload = _build_payload(weapon, actual, actual_card, actual_passives)
+    if physical_card is not None:
+        actual_payload["riven"].update(rank=actual_card.rank, drain=actual_card.drain)
+    # 无限极化口径的极化次数（只展示结果，不可调节）；近战带架势时按架势
+    # 倍率放大普通攻击展示数值（与配装页 HUD 口径一致，重击不受架势影响）。
+    for payload, evaluation, riven_card in (
+        (baseline_payload, baseline, None),
+        (actual_payload, actual, actual_card),
+    ):
+        payload["forma"] = _forma_summary(
+            weapon, evaluation.cards, riven_card, stance_info,
+            riven_index=evaluation.riven_index,
+            include_placement=physical_card is not None and riven_card is not None,
+        )
+        # 解算目标的原始分数（KPM 口径下即标准靶每分钟击杀数）：前端头条
+        # 直接读取，不再从提升百分比反推。
+        payload["objectiveScore"] = _score(evaluation.stats, objective_metric,
+                                            target_context=benchmark_context)
+        payload['objectiveMetric'] = objective_metric
+        payload['optimizationMetric'] = ranking_metric
+        payload['scoringMetric'] = score_metric
+        payload['scoringScore'] = quality_scores['baseline' if evaluation is baseline else 'actual']
+        if resolved_choices:
+            payload['incarnonChoices'] = dict(baseline_choices if evaluation is baseline else actual_choices)
+        if stance_multiplier != 1.0:
+            for key in ("attackDps", "burstDps", "sustainedDps"):
+                value = payload.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    payload[key] = value * stance_multiplier
+    alternate_modes = _alternate_mode_payloads(
+        weapon_record, actual, actual_card, actual_passives, selected_fire_mode=fire_mode
+    )
+    if alternate_modes:
+        actual_payload["alternateModes"] = alternate_modes
+    if actual_payload.get("damageBasis") == "projectileEvents.minimum":
+        unsupported = [
+            item
+            for item in unsupported
+            if item != "projectile-component-damage-unapplied"
+        ]
+        skipped = [
+            item
+            for item in skipped
+            if "unsupported[projectile-component-damage-unapplied]" not in item
+        ]
+    unsupported.extend(actual_payload.get("unsupported") or ())
+    # Build-level diagnostics (including known radial/field and projectile
+    # omissions) are appended only after payload construction, so finalize the
+    # model status here instead of allowing a partial weapon to look modeled.
+    model_status = (
+        "partial"
+        if any(
+            token in str(item).casefold()
+            for item in unsupported
+            for token in (
+                "unmodeled",
+                "unavailable",
+                "unsupported",
+                "partial",
+                "not-applied",
+                "not-evaluated",
+                "unresolved",
+                "unverified",
+                "idealized",
+                "order-fixed",
+            )
+        )
+        else "modeled"
+    )
+    result = {
+        "buildLabel": exports["buildLabel"],
+        "schemaVersion": exports["schemaVersion"],
+        "weapon": record_identity(weapon),
+        "fireMode": fire_mode,
+        "metric": metric,
+        "scoreMetric": score_metric,
+        "contextHash": context_hash,
+        "evaluationScenario": _scenario_context(scenario),
+        "requestedTarget": requested_target_payload,
+        "evaluationTarget": evaluation_target,
+        "targetCalibration": target_calibration,
+        "searchQuality": search_quality,
+        "modelStatus": model_status,
+        "targetStatus": target_status,
+        "searchStatus": search_status,
+        "optimalityStatus": optimality_status,
+        "scoringValues": {
+            "baseline": quality_scores["baseline"],
+            "actual": quality_scores["actual"],
+        },
+        "actualGain": actual_gain,
+        "details": details,
+        "recommendedPositive": [line.label for line in recommended],
+        "recommendedPositiveTiers": recommended_tiers,
+        "recommendedRoutes": None,
+        "recommendedNegative": [line.label for line in recommended_negative],
+        # 武器级致命负面（不随提交的紫卡变化）；提交紫卡的负面若在其中，另见 submittedFatalNegative。
+        "fatalNegative": [negative_map[code].label for code in fatal_codes if code in negative_map],
+        # 随数值变化的致命负：负值（百分点）不超过该值时不致命，超过即致命。
+        "fatalNegativeAbove": {negative_map[code].label: value for code, value in fatal_above.items()
+                               if code in negative_map},
+        "submittedFatalNegative": fatal_negative,
+        "negativeAssessment": negative_assessment,
+        "baseline": baseline_payload,
+        "actual": actual_payload,
+        # The actual build's route and the displayed baseline's (the default
+        # route unless the chosen route's no-Riven build is stronger).
+        # Recommendations and fatal negatives always use the default route.
+        "incarnonChoices": actual_choices,
+        "baselineIncarnonChoices": baseline_choices,
+        "incarnonRouteScreen": route_screen,
+        "incarnonPolicy": incarnon_policy,
+        "arcaneStates": arcane_states,
+        "stance": (
+            {
+                "path": stance_info.get("path"),
+                "nameZh": stance_info.get("nameZh") or stance_info.get("nameEn"),
+                "dpsMultiplier": stance_multiplier,
+                "capacityGain": stance_capacity,
+                "builtIn": bool(stance_info.get("builtIn")),
+            }
+            if stance_info
+            else None
+        ),
+        "unsupported": sorted(set(unsupported)),
+        "skipped": list(dict.fromkeys(skipped)),
+        "profile": profile_raw,
+    }
+    if timeline is not None:
+        result["timeline"] = timeline
+    if source_disposition is not None:
+        result["projection"] = {
+            "sourceDisposition": source_disposition,
+            "targetDisposition": disposition,
+            "scale": disposition_scale,
+        }
+    return result

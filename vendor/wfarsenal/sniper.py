@@ -1,0 +1,115 @@
+"""Sniper Shot Combo counter and zoom buffs.
+
+Data: data/mechanics/sniper-mechanics.json (tools/import_sniper_mechanics.py),
+read from the game packages' SniperImpactBehavior and ZoomLevels and
+cross-checked against WFSim's weapon YAML. Semantics follow WFSim
+engine/src/model/weapon.rs SniperCombo, fight/run.rs combo_at and
+fight/pellet.rs: every landing direct pellet counts once and the count drops
+by one per decay period without a landing hit. A hit is counted before it is
+paid (WFSim M118, 2026-10-22: a Rubico Prime's first scoped hit from an empty
+counter reaches Minimum Combo 1 and pays x1.5), so the hit that reaches a
+tier already takes it.
+"""
+from __future__ import annotations
+
+import json
+import math
+import sys
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+
+ZOOM_SOURCE = 'zoom:'
+
+
+@lru_cache(maxsize=1)
+def reference():
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+    try:
+        return json.loads((root / "data/mechanics/sniper-mechanics.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"weapons": {}}
+
+
+def entry(weapon):
+    return (reference().get("weapons") or {}).get(str(weapon.get("path") or ""))
+
+
+def _incarnon(weapon, fire_mode):
+    modes = weapon.get("fireModes") or ()
+    mode = modes[fire_mode] if 0 <= fire_mode < len(modes) else {}
+    return bool(weapon.get("isIncarnonForm") or mode.get("isIncarnonForm"))
+
+
+def zoom_effects(weapon, fire_mode, scenario):
+    """The top zoom level's buffs as engine effects, or () when not scoped.
+
+    Scope buffs require aiming. An Incarnon form retains the scope only when
+    its native attack still declares SniperImpactBehavior (Vectis / Prime).
+    """
+    from .damage import ModEffect
+    row = entry(weapon)
+    zoom = (row or {}).get("zoom") or {}
+    if not zoom.get("effects"):
+        return ()
+    if _incarnon(weapon, fire_mode) and not (row.get('combo') or {}).get('incarnonModes'):
+        return ()
+    if (row.get('sniper') or zoom.get("aimGated")) and not getattr(scenario, "aiming", False):
+        return ()
+    source = ZOOM_SOURCE + str(weapon.get("path"))
+    return tuple(ModEffect(e["upgradeType"], e["operation"], float(e["value"]),
+                           damage_type=e.get("damageType"), source_path=source)
+                 for e in zoom["effects"])
+
+
+def combo_spec(weapon):
+    combo = (entry(weapon) or {}).get("combo")
+    if not combo:
+        return None
+    return dict(min=int(combo["min"]), tierBonus=float(combo["tierBonus"]),
+                tierFactor=float(combo["tierFactor"]), seconds=float(combo["seconds"]),
+                incarnon=bool(combo.get('incarnonModes')))
+
+
+def multiplier(spec, hits):
+    """1 below the minimum, then +tierBonus per tier (min, min*3, min*9, ...)."""
+    hits = math.floor(hits + 1e-9)
+    if spec["min"] <= 0 or hits < spec["min"]:
+        return 1.0
+    threshold, value = spec["min"], 1.0 + spec["tierBonus"]
+    while hits >= threshold * spec["tierFactor"]:
+        threshold *= spec["tierFactor"]
+        value += spec["tierBonus"]
+    return value
+
+
+@dataclass
+class ShotCombo:
+    spec: dict
+    count: float = 0.
+    last_hit: float = 0.
+
+    def at(self, t):
+        seconds = self.spec["seconds"]
+        if seconds <= 0:
+            return self.count
+        lost = math.floor((t - self.last_hit) / seconds + 1e-9)
+        return max(0., self.count - lost) if lost > 0 else self.count
+
+    def shot(self, t, pellets):
+        """Mean multiplier over this shot's landing pellets, then count them.
+
+        Pellet i of the shot reads the count with itself and the i pellets
+        before it counted; a fractional pellet count is the expected mix of
+        floor/ceil pellets.
+        """
+        now = self.at(t)
+        pellets = max(float(pellets), 0.)
+        whole = math.floor(pellets)
+        part = pellets - whole
+        total = sum(multiplier(self.spec, now + i + 1) for i in range(whole))
+        total += part * multiplier(self.spec, now + whole + 1)
+        factor = total / pellets if pellets > 0 else multiplier(self.spec, now)
+        if pellets > 0:
+            self.count, self.last_hit = now + pellets, t
+        return factor
