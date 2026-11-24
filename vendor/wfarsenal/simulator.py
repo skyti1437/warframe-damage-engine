@@ -1163,6 +1163,7 @@ def simulate(
             "fireRate": stats.fire_rate,
             "reloadTime": stats.reload_time,
             "falloffMultiplier": stats.falloff_multiplier,
+            "hitProbability": stats.hit_probability,
             "noncritDamageMultiplier": stats.noncrit_damage_multiplier,
             "doubleCritChance": stats.double_crit_chance,
             # 膛室家族首发加成（最终伤害乘区，弹匣第一发）。
@@ -1203,6 +1204,7 @@ def simulate(
                 "victimStatusCount": scenario.victim_status_count,
                 "conditionalStacks": dict(scenario.conditional_stacks),
                 "distance": scenario.distance,
+                **({"modelSpread": True} if scenario.model_spread else {}),
                 "cloaked": scenario.cloaked,
                 "nearestEnemyDistance": scenario.nearest_enemy_distance,
                 "headshot": normalized_hit_location == "head",

@@ -19,7 +19,13 @@ TARGET = ROOT / "vendor" / "wfarsenal" / ("wfcore.pyd" if os.name == "nt" else "
 def main() -> int:
     profile = "debug" if "--debug" in sys.argv else "release"
     cargo = shutil.which("cargo") or str(Path.home() / ".cargo" / "bin" / "cargo")
-    command = [cargo, "build"] + ([] if profile == "debug" else ["--release"])
+    macos = sys.platform == "darwin"
+    command = [cargo, "rustc", "--lib"] if macos else [cargo, "build"]
+    if profile == "release":
+        command.append("--release")
+    if macos:
+        # PyO3's extension resolves Python symbols from the loading process.
+        command.extend(["--", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"])
     # Cargo reports progress on stderr; pass it on as stdout so a caller that
     # treats native stderr as an error (build-portable.ps1 under
     # $ErrorActionPreference = "Stop" with redirected output) does not abort.
@@ -29,7 +35,8 @@ def main() -> int:
     print(build.stdout, end="")
     if build.returncode:
         return build.returncode
-    built = CRATE / "target" / profile / ("wfcore.dll" if os.name == "nt" else "libwfcore.so")
+    library = {"win32": "wfcore.dll", "darwin": "libwfcore.dylib"}.get(sys.platform, "libwfcore.so")
+    built = CRATE / "target" / profile / library
     try:
         shutil.copyfile(built, TARGET)
     except PermissionError:

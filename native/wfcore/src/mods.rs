@@ -79,8 +79,8 @@ fn pysum(values: impl IntoIterator<Item = f64>) -> Num {
 
 /// `quantize_base_crit_damage`
 fn quantize(cd: f64) -> f64 {
-    let step = 32.0 / 4095.0;
-    (cd / step + 0.5).floor() * step
+    let scaled = (cd as f32).clamp(0.0, 32.0) * 127.96875;
+    ((scaled + 0.5).trunc() * (32.0_f32 / 4095.0_f32)) as f64
 }
 
 /// `damage._combine` over (op, value) parts.
@@ -342,6 +342,7 @@ pub struct ModsPrep {
     orb_stacks: i64,
     orb_special: bool,
     radial_only: bool,
+    ignore_headshot_bonus: Option<bool>,
     forced: Vec<(String, f64)>,
     ammo_cost: f64,
     cache: Mutex<FxHashMap<usize, Arc<Entry>>>,
@@ -457,6 +458,7 @@ impl ModsPrep {
             orb_stacks: get(config, "orbStacks")?.extract()?,
             orb_special: get(config, "orbSpecial")?.extract()?,
             radial_only: get(config, "radialOnly")?.extract()?,
+            ignore_headshot_bonus: config.get_item("ignoreHeadshotBonus")?.map(|v| v.extract()).transpose()?,
             forced: get(config, "forced")?.extract()?,
             ammo_cost: get(config, "ammoCost")?.extract()?,
             cache: Mutex::new(FxHashMap::default()),
@@ -899,10 +901,10 @@ pub fn apply_mods<'py>(
         }
     }
     // A melee weapon's damage mods are part of the status payload's base.
-    let mut dot_scale = combine(1.0, &[&scale_ops]);
+    let mut dot_scale = pmax(0.0, combine(1.0, &[&scale_ops]));
     if prep.melee {
         let melee_ops: Vec<(u8, f64)> = melee_idx.iter().map(|&i| (rows[i].op, rows[i].value)).collect();
-        dot_scale = co::combine(dot_scale, &[&melee_ops], Some(dot_scale));
+        dot_scale = pmax(0.0, co::combine(dot_scale, &[&melee_ops], Some(dot_scale)));
     }
     let mut dot_basis = elemental_base_total * dot_scale * compression_mult;
     // _dot_elemental_multipliers
@@ -1113,7 +1115,7 @@ pub fn apply_mods<'py>(
     out.set_item("area_direct", false)?;
     out.set_item("stack_native_fraction", 1.0)?;
     out.set_item("stackable_hit_event", false)?;
-    out.set_item("dot_base_damage", dot_basis)?;
+    out.set_item("dot_base_damage", pmax(0.0, dot_basis))?;
     let dots = PyDict::new(py);
     for (k, v) in dot_elements.iter() {
         dots.set_item(*k, *v)?;
@@ -1171,6 +1173,11 @@ pub fn apply_mods<'py>(
     out.set_item("co_assumed_count", vsc)?;
     out.set_item("continuous", continuous)?;
     out.set_item("radial_only", prep.radial_only)?;
+    // Older adapters insert these two fields themselves when the key is absent.
+    if let Some(ignored) = prep.ignore_headshot_bonus {
+        out.set_item("radial_victim_crit", false)?;
+        out.set_item("ignore_headshot_bonus", ignored)?;
+    }
     out.set_item("explosion_radius_multiplier", combine(1.0, &[&ap.ops(b!("WEAPON_EXPLOSION_RADIUS"))]))?;
     let forced_py = PyDict::new(py);
     for (k, v) in forced.iter() {
@@ -1196,6 +1203,7 @@ pub fn apply_mods<'py>(
     out.set_item("bow_draw_seconds", bow_draw)?;
     out.set_item("spread_min_deg", py.None())?;
     out.set_item("spread_max_deg", py.None())?;
+    out.set_item("hit_probability", 1.0)?;
     let crit_procs = PyDict::new(py);
     if !ap.empty(b!("WEAPON_SLASH_PROC_ON_CRIT_CHANCE")) {
         crit_procs.set_item("DT_SLASH", pysum(ap.values(b!("WEAPON_SLASH_PROC_ON_CRIT_CHANCE"))).to_py(py))?;

@@ -136,7 +136,7 @@ impl Types {
         for name in [
             "DT_FIRE", "DT_FREEZE", "DT_GAS", "DT_EXPLOSION", "DT_VIRAL", "DT_CORROSIVE", "DT_MAGNETIC",
             "DT_PUNCTURE", "DT_ELECTRICITY", "DT_SLASH", "DT_CINEMATIC", "DT_VOID", "DT_RADIANT",
-            "DT_IMPACT", "DT_POISON",
+            "DT_IMPACT", "DT_POISON", "DT_SENTIENT", "DT_RADIATION",
         ] {
             t.id(name);
         }
@@ -168,6 +168,8 @@ const SLASH: D = 9;
 const CINEMATIC: D = 10;
 const VOID: D = 11;
 const RADIANT: D = 12;
+const TAU: D = 15;
+const RADIATION: D = 16;
 
 fn duration_of(d: D) -> Option<f64> {
     match d {
@@ -176,6 +178,8 @@ fn duration_of(d: D) -> Option<f64> {
         MAGNETIC => Some(6.0),
         FREEZE => Some(6.0),
         PUNCTURE => Some(10.0),
+        TAU => Some(8.0),
+        RADIATION => Some(12.0),
         _ => None,
     }
 }
@@ -674,7 +678,7 @@ pub struct Replay<'py> {
     tables: TargetTables,
     battery: Option<(f64, f64, f64)>,
     spool: Option<SpoolSpec>,
-    rate_spool: Option<(f64, f64, f64)>,
+    rate_spool: Option<RateSpoolSpec>,
     shell: Option<(f64, f64, f64)>,
     shot_combo: Option<ShotCombo>,
     reload_after_every_shot: bool,
@@ -723,6 +727,7 @@ pub struct Replay<'py> {
     pools: [f64; 3],
     states: FxIndexMap<D, VecDeque<(f64, f64)>>,
     pooled: [CappedPool; 4],
+    tau: Option<CappedPool>,
     presence: FxIndexMap<D, StatusPresence>,
     proc_piles: FxIndexMap<D, ProcPile>,
     dots: Vec<DotInstance>,
@@ -740,6 +745,7 @@ pub struct Replay<'py> {
     heat_sources: [HeatChains; 2],
     heat_source_acc: [f64; 2],
     attribution: KillAttribution,
+    track_weak_kills: bool,
     puncture_strip: f64,
     frozen_until: f64,
     frozen_scale: f64,
@@ -832,6 +838,10 @@ pub struct Replay<'py> {
     proc_counts: FxIndexMap<D, f64>,
     dot_by_type: FxIndexMap<D, f64>,
     magnetic_breaks: Vec<(f64, usize, f64, f64, i64)>,
+    magnetic_proxy: Option<(f32, f32)>,
+    magnetic_weakness: Option<f32>,
+    magnetic_electric_immune: bool,
+    blocks_radiation: bool,
     sources: Vec<Source>,
     ammo: f64,
     shot_in_progress: bool,
@@ -915,8 +925,8 @@ impl<'py> Replay<'py> {
             delayed_attacks, reload_shell_events, derived, selected_incarnon, projectile_sequence_length, projectile_sequence_index, source_field_token, source_field_packets, source_field_activations, finite_field_packets, finite_field_activations, physical_lane_length, physical_lane_phase, physical_lane_selected, lane_stratum, volley_rounds, volley_shot_resume, melee_count, melee_heavy_multiplier,
             melee_last_hit, melee_combo_at, melee_recovery_token, melee_recovery_initial, melee_buff_boundary, melee_pending, melee_index, heavy_flag, no_co_flag, melee_heavy_now,
             affinity_per_kill, affinity, syndicate_ready, syndicate_events, pools, states,
-            pooled, presence, proc_piles, dots, dot_modes, dot_sources, proc_source, heat_proc_source, heat_mode_sources, damage_origin, blasts, blast_procs,
-            heat_acc, heat_token, heat_chains, heat_sources, heat_source_acc, attribution, puncture_strip, frozen_until,
+            pooled, tau, presence, proc_piles, dots, dot_modes, dot_sources, proc_source, heat_proc_source, heat_mode_sources, damage_origin, blasts, blast_procs,
+            heat_acc, heat_token, heat_chains, heat_sources, heat_source_acc, attribution, track_weak_kills, puncture_strip, frozen_until,
             frozen_scale, heap, seq, gen, kills, weak_kill_events,
             weak_draw, weak_index, weak_uncertainty, attacks, stale, first_kill,
             last_kill, min_interval, totals, fortifier, fortifier_damage, fortifier_stolen,
@@ -929,6 +939,7 @@ impl<'py> Replay<'py> {
             burst_base, burst_rate_base, burst_incarnon, burst_rate_incarnon, beam_floor_base, last_burst,
             tap_other, tap, tap_hits, tap_expires, field_duration, field_duration_ready,
             field_duration_used, enervate_views, enervate_weights, proc_counts, dot_by_type, magnetic_breaks,
+            magnetic_proxy, magnetic_weakness, magnetic_electric_immune, blocks_radiation,
             ammo, shot_in_progress, reloads, last_round, current_time, beam_progress,
             beam_last, actor_signal, actor_signal_used, armour_view, stats_by_ptr, model_cache,
             model_key, tick_chains, co_specs, varied, elements, hit_specs,
@@ -1469,6 +1480,7 @@ impl<'py> Replay<'py> {
                 pool.expire(t);
             }
         }
+        if let Some(pool) = &mut self.tau { pool.expire(t); }
         if self.heat_chains.active() {
             self.heat_chains.expire(t);
             if !self.heat_chains.active() {
@@ -1514,7 +1526,7 @@ impl<'py> Replay<'py> {
                 return value;
             }
         }
-        let dist = self.pooled[1].distribution().clone();
+        let dist = self.pooled[1].distribution();
         let mut s = PySum::new();
         for (k, w) in dist.iter().enumerate() {
             if *w > 0.0 {
@@ -1690,15 +1702,19 @@ impl<'py> Replay<'py> {
 
     // ── model / packets ─────────────────────────────────────────────────
 
+    fn live_proc_types(&mut self, t: f64) -> f64 {
+        psum(self.presence.values_mut().map(|presence| presence.probability(t)))
+    }
+
+    fn snapshot_victim_procs(&mut self, t: f64) {
+        self.victim_before.clear();
+        self.victim_before.extend(self.presence.iter_mut().map(|(&d, presence)| (d, presence.probability(t))));
+    }
+
     fn model(&mut self, t: f64) -> PyResult<(usize, Option<usize>)> {
         let _timer = crate::counters::Timer::start(crate::counters::MODEL);
         let live_types = if self.live_types_enabled {
-            let keys: Vec<D> = self.presence.keys().copied().collect();
-            let mut s = PySum::new();
-            for d in keys {
-                s.add(self.presence.get_mut(&d).unwrap().probability(t));
-            }
-            s.value()
+            self.live_proc_types(t)
         } else {
             0.0
         };
@@ -1817,7 +1833,7 @@ impl<'py> Replay<'py> {
         if self.stats[st].fixed_radial {
             return Ok(self.raw_packet(st, 0.0));
         }
-        let mut st = st;
+        let mut st = self.tau_view(st);
         let undamaged = (self.pools[1] - self.full[1]).abs() < 1e-7 && (self.pools[2] - self.full[2]).abs() < 1e-7;
         let (vfcc, vfcd) = (self.stats[st].victim_full_crit_chance, self.stats[st].victim_full_crit_damage);
         if undamaged && (vfcc != 0.0 || vfcd != 0.0) {
@@ -1996,6 +2012,7 @@ impl<'py> Replay<'py> {
 
     /// attack_data(st, aim) with no crit view (lingering ticks, fixed radials).
     fn raw_packet(&mut self, st: usize, aim: f64) -> PacketKey {
+        let st = self.tau_view(st);
         let key = (st, aim.to_bits(), 0, 0, 0, 1, 0);
         if !self.packets.contains_key(&key) {
             let (vector, procs, rows, non) = tables::attack_data(&self.stats[st].core, aim, &self.tables);
@@ -2289,7 +2306,6 @@ impl<'py> Replay<'py> {
             return v;
         }
         let s = &self.stats[st];
-        let cm = pmax(s.crit_multiplier, 1.0) - 1.0;
         let weak = s.weakpoint_crit_chance_bonus + s.base_crit_chance * s.weakpoint_crit_chance_relative;
         let mut mean = 0.0;
         let mut square = 0.0;
@@ -2299,9 +2315,12 @@ impl<'py> Replay<'py> {
             }
             let chance = pmax(0.0, chance);
             let fr = chance - chance.floor();
-            let m = 1.0 + chance * cm;
+            let tier = floor_i(chance);
+            let low = tables::tier_factor(tier, s.crit_multiplier);
+            let high = if fr > 0.0 { tables::tier_factor(tier + 1, s.crit_multiplier) } else { low };
+            let m = (1.0-fr)*low + fr*high;
             mean += weight * m;
-            square += weight * (m * m + fr * (1.0 - fr) * cm * cm);
+            square += weight * (m * m + fr * (1.0 - fr) * (high-low).powi(2));
         }
         let value = if mean <= 0.0 {
             0.0
@@ -2345,6 +2364,15 @@ impl<'py> Replay<'py> {
         tables::no_status_probability(&self.stats[st].core, d, aim, multishot, extra)
     }
 
+    fn tau_view(&mut self, st: usize) -> usize {
+        let count = self.tau.as_mut().map_or(0.0, |pool| pool.stats().1);
+        if count <= 0.0 || self.stats[st].status_chance <= 0.0 { return st; }
+        self.derive(st, 42, count, |v| {
+            v.status_chance *= 1.0 + 0.1 * count;
+            v.core.status_chance = v.status_chance;
+        })
+    }
+
     // ── damage ──────────────────────────────────────────────────────────
 
     fn faction_delta(&self, d: D) -> f64 {
@@ -2378,30 +2406,49 @@ impl<'py> Replay<'py> {
         Ok(best)
     }
 
-    fn magnetic_break(&mut self, t: f64, pool_index: usize) -> PyResult<()> {
-        let stacks = pmin(self.count(MAGNETIC), 10.0);
-        if stacks <= 0.0 { return Ok(()); }
+    fn magnetic_break(&mut self, t: f64, pool_index: usize, weapon_source: bool) -> PyResult<bool> {
+        let dist = self.pooled[pooled_index(MAGNETIC).unwrap()].distribution();
+        let probability = psum(dist.iter().skip(1).copied());
+        if probability <= 0.0 { return Ok(false); }
+        let stacks = psum(dist.iter().enumerate().map(|(n, p)| n as f64 * p));
+        let dist = dist.clone();
         let active = match self.proc_source { Some(st)=>st, None=>self.model(t)?.0 };
         let core=&self.stats[active].core;
         let scale=core.duration_scale(ELECTRICITY);
-        if scale<=0.0 {return Ok(());}
         let faction=core.faction_all*core.faction_target*core.faction_bracket;
-        let bracket=pmax(core.dot_elemental_multipliers.iter().find(|e|e.0==ELECTRICITY).map(|e|e.1).unwrap_or(1.0),0.0)*pmax(core.proc_damage_multiplier,0.0);
-        let per_tick=self.full[pool_index]*0.03*stacks/6.0*pow(faction,2.0)*bracket;
-        let accumulator=0.5*faction*bracket;
+        let electric=pmax(core.dot_elemental_multipliers.iter().find(|e|e.0==ELECTRICITY).map(|e|e.1).unwrap_or(1.0),0.0);
+        let status=pmax(core.proc_damage_multiplier,0.0) as f32;
+        let landing=faction*electric;
+        let mut direct = 0.0;
+        let mut child = 0.0;
+        let mut outcomes = vec![PileOutcome {probability:dist[0],count:0,seed:0.0,accumulator:0.0,landing:1.0,weak:false}];
+        for (n, weight) in dist.into_iter().enumerate().skip(1).filter(|(_, weight)| *weight != 0.0) {
+            let mut retained = (((self.full[pool_index] as f32) * 0.005_f32) * n as f32).trunc();
+            if let (Some(weapon), Some((weakness, attenuation))) = (self.magnetic_weakness, self.magnetic_proxy) {
+                let divisor = 1.0_f32 + weapon.max(0.0) * weakness;
+                retained = (((retained / divisor + 0.5_f32).floor()) * status) * attenuation;
+            } else {
+                retained *= status;
+            }
+            direct += retained as f64 * weight;
+            let seed = 0.5 * (((retained * status) as f64 * faction) as f32) as f64;
+            child += seed * weight;
+            outcomes.push(PileOutcome {probability:weight,count:1,seed,accumulator:0.5,landing,weak:false});
+        }
+        let per_tick=child/probability*landing;
         self.magnetic_breaks.push((t,pool_index,stacks,per_tick,self.gen));
+        if direct > 0.0 && self.settle_damage(&vec![(ELECTRICITY,direct*faction)],t,DIRECT,WeakKill::Flag(false),0.0,true,None,weapon_source,true)? {
+            return Ok(true);
+        }
+        if scale <= 0.0 || self.magnetic_electric_immune { return Ok(false); }
         let duration=6.0*scale;
-        let probability=self.presence.get_mut(&MAGNETIC).map(|p|p.probability(t)).unwrap_or(1.0);
         self.presence.entry(ELECTRICITY).or_default().add(t+duration,1.0-probability);
         *self.proc_counts.entry(ELECTRICITY).or_insert(0.0)+=probability;
-        self.add_pile(ELECTRICITY,t,duration,&[Rc::new(PileKernel::new(&[
-            PileOutcome {probability:1.0-probability,count:0,seed:0.0,accumulator:0.0,landing:1.0,weak:false},
-            PileOutcome {probability,count:1,seed:per_tick,accumulator,landing:1.0,weak:false},
-        ]))],active);
+        self.add_pile(ELECTRICITY,t,duration,&[Rc::new(PileKernel::new(&outcomes))],active);
         let signal=self.proc_signal(ELECTRICITY);
         self.signal(&signal,t,probability);
         self.signal("on-proc",t,probability);
-        Ok(())
+        Ok(false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2414,7 +2461,18 @@ impl<'py> Replay<'py> {
     }
 
     fn take_with_source_credit(&mut self, vector: &Vector, t: f64, source: usize, weak_kill: WeakKill, cv2: f64, extra: bool, damage_event: Option<(f64,f64)>, weapon_source: bool) -> PyResult<bool> {
+        self.settle_damage(vector,t,source,weak_kill,cv2,extra,damage_event,weapon_source,false)
+    }
+
+    fn settle_damage(&mut self, vector: &Vector, t: f64, source: usize, weak_kill: WeakKill, cv2: f64, extra: bool, damage_event: Option<(f64,f64)>, weapon_source: bool, magnetic_packet: bool) -> PyResult<bool> {
         let _timer = crate::counters::Timer::start(crate::counters::TAKE);
+        let clamped;
+        let vector = if vector.iter().any(|entry| entry.1 < 0.0) {
+            clamped = vector.iter().map(|&(dtype, raw)| (dtype, pmax(0.0, raw))).collect::<Vector>();
+            &clamped
+        } else {
+            vector
+        };
         if let Some((alignment, _, _)) = self.onos {
             if self.onos_crits && self.form != BASE && (self.onos_ticks as f64) < alignment
                 && (source == DOT || source == NONDOT) && vector.iter().any(|e| e.1 > 0.0)
@@ -2427,6 +2485,7 @@ impl<'py> Replay<'py> {
         let mut earlier_hit = 0.0;
         let mut health_hit = 0.0;
         let mut remaining = 0.0;
+        let mut overguard_broke = false;
         let mut shield_broke = false;
         if self.pools[0] > 0.0 {
             let mut value = psum(vector.iter().map(|(k, raw)| raw * if *k == VOID || *k == RADIANT { 1.5 } else { 1.0 }))
@@ -2452,8 +2511,7 @@ impl<'py> Replay<'py> {
             left -= fraction;
             if self.pools[0] <= 1e-9 {
                 self.pools[0] = 0.0;
-                self.magnetic_break(t, 0)?;
-                self.signal("on-overguard-broken", t, 1.0);
+                overguard_broke = true;
             }
         }
         if left > 0.0 && self.pools[1] > 0.0 {
@@ -2486,8 +2544,6 @@ impl<'py> Replay<'py> {
             if self.pools[1] <= 1e-9 {
                 self.pools[1] = 0.0;
                 shield_broke = true;
-                self.magnetic_break(t, 1)?;
-                self.signal("on-shield-broken", t, 1.0);
             }
         }
         if left > 0.0 && self.pools[1] <= 1e-9 && self.pools[2] > 0.0 {
@@ -2524,7 +2580,9 @@ impl<'py> Replay<'py> {
             WeakKill::Flag(false) => 0.0,
             WeakKill::Value(v) => v,
         };
-        self.attribution.add(t, earlier_hit, health_hit, cv2, weak, source == DIRECT);
+        if self.track_weak_kills {
+            self.attribution.add(t, earlier_hit, health_hit, cv2, weak, source == DIRECT && !magnetic_packet);
+        }
         if let (Some(curve), 0) = (self.life_curve.as_mut(), self.gen) {
             // One target life: (time, health damage, its variance, source).
             let hit = health_hit + earlier_hit;
@@ -2538,13 +2596,25 @@ impl<'py> Replay<'py> {
             }
         }
         if self.ehp > 0.0 && self.pools[0] <= 1e-7 && self.pools[2] <= 1e-7 {
+            if overguard_broke { self.signal("on-overguard-broken", t, 1.0); }
+            if shield_broke { self.signal("on-shield-broken", t, 1.0); }
             let resume = self.resume_time(t)?;
-            let crossing = self
-                .attribution
-                .crossing(t, remaining, resume)
-                .map_err(|_| PyIndexError::new_err("list index out of range"))?;
-            self.die(t, crossing.0, weapon_source && source != SYNDICATE, weapon_source)?;
+            let weak = if self.track_weak_kills && !magnetic_packet {
+                self.attribution.crossing(t, remaining, resume)
+                    .map_err(|_| PyIndexError::new_err("list index out of range"))?.0
+            } else { 0.0 };
+            self.die(t, weak, weapon_source && source != SYNDICATE, weapon_source)?;
             return Ok(true);
+        }
+        if overguard_broke {
+            let killed = self.magnetic_break(t, 0, weapon_source && source != SYNDICATE)?;
+            self.signal("on-overguard-broken", t, 1.0);
+            if killed { return Ok(true); }
+        }
+        if shield_broke {
+            let killed = self.magnetic_break(t, 1, weapon_source && source != SYNDICATE)?;
+            self.signal("on-shield-broken", t, 1.0);
+            if killed { return Ok(true); }
         }
         if weapon_source && !self.extra_hits.is_empty() && source == DIRECT && !extra {
             let trigger = psum(vector.iter().map(|x| x.1));
@@ -2595,6 +2665,7 @@ impl<'py> Replay<'py> {
         for pool in self.pooled.iter_mut() {
             pool.reset();
         }
+        self.tau = None;
         self.presence.clear();
         self.attribution.reset();
         self.frozen_until = -1.0;
@@ -2674,11 +2745,11 @@ impl<'py> Replay<'py> {
         let mut scaled = Packet { vector: Vec::new(), procs: data.procs.clone(),
                                   rows: data.rows.clone(), non: data.non.clone() };
         for row in scaled.rows.values_mut() {
-            row.seed *= scale;
-            row.accumulator *= scale;
-            for branch in &mut row.branches {
-                branch.seed *= scale;
-                branch.accumulator *= scale;
+            if row.branches.is_empty() {
+                row.seed *= scale;
+                row.accumulator *= scale;
+            } else {
+                for branch in &mut row.branches { branch.landing *= scale; }
             }
         }
         for value in scaled.non.values_mut() { *value *= scale; }
@@ -3026,6 +3097,7 @@ impl<'py> Replay<'py> {
         if self.gen != generation {
             return Ok(()); // a derived status killed the original target
         }
+        let status_view = self.tau_view(st);
         let sorted;
         let procs: &Vector = if self.empowered.is_some() {
             // The reference sorts by type name for a stable grouped order.
@@ -3040,7 +3112,7 @@ impl<'py> Replay<'py> {
         for &(d, n0) in procs.iter() {
             let scale = self.stats[st].core.duration_scale(d);
             let n = n0 * pmax(self.status_rate_multiplier, 0.0);
-            if n <= 0.0 || (d == FREEZE && self.frozen_until > t) {
+            if n <= 0.0 || (d == FREEZE && self.frozen_until > t) || (self.blocks_radiation && d == RADIATION) {
                 continue;
             }
             let prev = *self.proc_counts.get(&d).unwrap_or(&0.0);
@@ -3066,7 +3138,7 @@ impl<'py> Replay<'py> {
                 continue;
             }
             let _ns = crate::counters::Timer::start(crate::counters::NOSTATUS);
-            let mut absence = pow(self.no_status_probability(st, d, aim)?, pmax(self.status_rate_multiplier, 0.0));
+            let mut absence = pow(self.no_status_probability(status_view, d, aim)?, pmax(self.status_rate_multiplier, 0.0));
             drop(_ns);
             if absence >= 1.0 && n > 0.0 {
                 absence = 1.0 - pmin(n, 1.0);
@@ -3103,6 +3175,8 @@ impl<'py> Replay<'py> {
                 }
             } else if (d == GAS || d == ELECTRICITY) && row.is_some() {
                 self.add_pile(d,t,duration,&pile_events.unwrap(),st);
+            } else if d == TAU {
+                self.tau.get_or_insert_with(|| CappedPool::new(10.0)).add(t + duration, absence, n);
             } else if let Some(p) = pooled_index(d) {
                 { let _t = crate::counters::Timer::start(crate::counters::POOLED); self.pooled[p].add(t + duration, absence, n); }
             } else {
@@ -3207,23 +3281,18 @@ impl<'py> Replay<'py> {
         let part = if let Some(refresh)=refresh {
             let stacks=PyDict::new(self.py);
             for q in &self.sources {stacks.set_item(q.id.bind(self.py),q.stacks)?;}
-            let keys:Vec<D>=self.presence.keys().copied().collect();
-            let mut live=PySum::new();
-            for d in keys {live.add(self.presence.get_mut(&d).unwrap().probability(t));}
-            let out=refresh.call1((stacks,live.value()))?;
+            let live = self.live_proc_types(t);
+            let out=refresh.call1((stacks,live))?;
             self.view(&out)?
         } else if let Some(unit) = self.stats[part].live_co_unit {
-            let keys: Vec<D> = self.presence.keys().copied().collect();
-            let mut live = PySum::new();
-            for d in keys { live.add(self.presence.get_mut(&d).unwrap().probability(t)); }
-            self.vary(unit, live.value(), 1.0)
+            let live = self.live_proc_types(t);
+            self.vary(unit, live, 1.0)
                 .ok_or_else(|| PyValueError::new_err("live radial CO template missing"))?
         } else { part };
         let part=if let Some(ms)=weight {self.derive(part,34,ms,|v| {v.multishot=ms;v.core.multishot=ms;})}else{part};
         let admitted=self.stats[part].delayed_radial_hit_event || (weight.is_some() && !self.stats[part].radial_only);
         if notify && admitted {
-            let keys: Vec<D> = self.presence.keys().copied().collect();
-            self.victim_before = keys.into_iter().map(|d| (d, self.presence.get_mut(&d).unwrap().probability(t))).collect();
+            self.snapshot_victim_procs(t);
         }
         let rkey = self.packet(part, aim)?;
         let rvector: Vector = if sniper_factor == 1.0 {
@@ -3304,6 +3373,28 @@ struct SpoolSpec {
     rate_shots: f64,
     ammo_divisor: f64,
     spindown: f64,
+}
+
+#[derive(Clone, Copy)]
+enum RateSpoolSpec {
+    Reference { start: f64, end: f64, over: f64 },
+    Native { start: f32, end: f32, maximum: u32, source_rpm: f64, source_rate: f64 },
+}
+
+impl RateSpoolSpec {
+    fn refire(self, rate: f64, cycles: i64) -> (f64, Option<f64>) {
+        match self {
+            Self::Reference { start, end, over } => (rate * (start + (end - start) * pmin(cycles as f64 / over, 1.0)), None),
+            Self::Native { start, end, maximum, source_rpm, source_rate } => {
+                // Each automatic FIRE cycle advances the counter twice before REFIRE_WAIT.
+                let count = ((cycles + 1) * 2).min(i64::from(maximum));
+                let rps = (rate * source_rpm / source_rate) as f32 * (1.0_f32 / 60.0_f32);
+                let progress = count as f32 / maximum as f32;
+                let refire = rps * (start + (end - start) * progress);
+                (f64::from(refire), Some(f64::from(1.0_f32 / refire)))
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -3754,7 +3845,7 @@ impl<'py> Replay<'py> {
                     let before = self.totals[SYNDICATE];
                     let died = self.take(&vec![(d, 1000.0)], t, SYNDICATE, WeakKill::Flag(false), 0.0, false)?;
                     self.syndicate_events.push((t, self.totals[SYNDICATE] - before));
-                    if !died && id != "justice" {
+                    if !died && id != "justice" && !(self.blocks_radiation && d == RADIATION) {
                         let name = self.types.name(d).to_string();
                         let duration = if name == "DT_CORROSIVE" { 8.0 } else if name == "DT_RADIATION" { 12.0 } else { 6.0 };
                         if let Some(p) = pooled_index(d) {
@@ -3863,8 +3954,7 @@ impl<'py> Replay<'py> {
                 }
                 Kind::FiniteField(slot,part)=> {
                     self.finite_field_packets[slot]+=1;
-                    let keys:Vec<D>=self.presence.keys().copied().collect();
-                    self.victim_before=keys.into_iter().map(|d|(d,self.presence.get_mut(&d).unwrap().probability(t))).collect();
+                    self.snapshot_victim_procs(t);
                     let raw=self.raw_packet(part,0.0);
                     let vector:Vector=self.packets[&raw].vector.iter().map(|(d,v)|(*d,v*self.damage_rate_multiplier)).collect();
                     let cv2=self.spread(part,0.0);
@@ -3877,8 +3967,7 @@ impl<'py> Replay<'py> {
                 Kind::SourceField(token,slot,part,initial)=> {
                     if token!=self.source_field_token {self.stale+=1;continue;}
                     self.source_field_packets[slot]+=1;
-                    let keys:Vec<D>=self.presence.keys().copied().collect();
-                    self.victim_before=keys.into_iter().map(|d|(d,self.presence.get_mut(&d).unwrap().probability(t))).collect();
+                    self.snapshot_victim_procs(t);
                     let stored=self.stats[part].obj.clone_ref(self.py);
                     let stacks=PyDict::new(self.py);
                     for q in &self.sources {stacks.set_item(q.id.bind(self.py),q.stacks)?;}
@@ -3902,18 +3991,14 @@ impl<'py> Replay<'py> {
                     let stored = self.stats[part].obj.clone_ref(py);
                     let refresh = opt_attr(stored.bind(py), "_live_hit_refresh")?;
                     let part = if let Some(refresh) = refresh {
-                        let keys: Vec<D> = self.presence.keys().copied().collect();
-                        let mut live = PySum::new();
-                        for d in keys { live.add(self.presence.get_mut(&d).unwrap().probability(t)); }
+                        let live = self.live_proc_types(t);
                         let stacks = PyDict::new(py);
                         for q in &self.sources { stacks.set_item(q.id.bind(py), q.stacks)?; }
-                        let resolved = refresh.call1((stacks, live.value()))?;
+                        let resolved = refresh.call1((stacks, live))?;
                         self.view(&resolved)?
                     } else if let Some(unit)=self.stats[part].live_co_unit {
-                        let keys:Vec<D>=self.presence.keys().copied().collect();
-                        let mut live=PySum::new();
-                        for d in keys {live.add(self.presence.get_mut(&d).unwrap().probability(t));}
-                        self.vary(unit,live.value(),1.).ok_or_else(|| PyValueError::new_err("live field CO template missing"))?
+                        let live = self.live_proc_types(t);
+                        self.vary(unit,live,1.).ok_or_else(|| PyValueError::new_err("live field CO template missing"))?
                     } else {part};
                     if self.stats[part].delayed_radial_hit_event {
                         self.radial_hit(part,1.,t,true)?;
@@ -4341,11 +4426,12 @@ impl<'py> Replay<'py> {
                         });
                         spool_shots += 1;
                     }
-                    if let (Some((start, end, over)), true) = (self.rate_spool, self.form != INCARNON) {
+                    let mut native_refire_delay = None;
+                    if let (Some(spool), true) = (self.rate_spool, self.form != INCARNON) {
                         if t > rate_spool_due + 1e-9 {
                             rate_spool_shots = 0;
                         }
-                        speed *= start + (end - start) * pmin(rate_spool_shots as f64 / over, 1.0);
+                        (speed, native_refire_delay) = spool.refire(speed, rate_spool_shots);
                         rate_spool_shots += 1;
                     }
                     self.attacks += 1;
@@ -4466,11 +4552,7 @@ impl<'py> Replay<'py> {
                             sniper_factor = combo.shot(t, hit_count);
                         }
                     }
-                    let victim: Vec<(D, f64)> = {
-                        let keys: Vec<D> = self.presence.keys().copied().collect();
-                        keys.into_iter().map(|d| (d, self.presence.get_mut(&d).unwrap().probability(t))).collect()
-                    };
-                    self.victim_before = victim;
+                    self.snapshot_victim_procs(t);
                     let shot_puncture = if radial_only { 0.0 } else { self.live_crit().0 };
                     let aim = if radial_only || no_contact { 0.0 } else { self.head };
                     let primary_delay = self.stats[active].primary_delay;
@@ -4486,8 +4568,7 @@ impl<'py> Replay<'py> {
                         self.physical_lane_phase=(phase+number)%self.physical_lane_length;
                         for n in 0..number {
                             if self.gen!=generation {self.stale+=1;continue;}
-                            let keys:Vec<D>=self.presence.keys().copied().collect();
-                            self.victim_before=keys.into_iter().map(|d|(d,self.presence.get_mut(&d).unwrap().probability(t))).collect();
+                            self.snapshot_victim_procs(t);
                             self.physical_lane_selected=Some((phase+n)%self.physical_lane_length);
                             let (mut part,blast)=self.model(t)?;
                             if physical_first_round && self.stats[part].first_shot_damage_bonus != 0.0 {
@@ -4515,8 +4596,7 @@ impl<'py> Replay<'py> {
                             self.enervate_hit(part,t,shot_puncture,0.0);
                             self.signal("on-body-hit",t,1.0);
                             if self.gen==generation {if let Some(blast)=blast {
-                                let keys:Vec<D>=self.presence.keys().copied().collect();
-                                self.victim_before=keys.into_iter().map(|d|(d,self.presence.get_mut(&d).unwrap().probability(t))).collect();
+                                self.snapshot_victim_procs(t);
                                 let notify=self.stats[blast].delayed_radial_hit_event;
                                 self.radial_hit(blast,self.damage_rate_multiplier,t,notify)?;
                             }}
@@ -4815,7 +4895,7 @@ impl<'py> Replay<'py> {
                     let s = &self.stats[active];
                     let mut delay = match s.bow_draw {
                         Some(v) => v,
-                        None => 1.0 / speed + if s.charge_before_fire || (self.form == INCARNON
+                        None => native_refire_delay.unwrap_or_else(|| 1.0 / speed) + if s.charge_before_fire || (self.form == INCARNON
                             && self.cycle.map(|c| c.charge_before_fire).unwrap_or(false)) {
                                 0.0
                             } else { s.charge_time },
@@ -4973,6 +5053,9 @@ fn health_batch_inner<'py>(
         replay.pools = full;
         replay.ehp = ehp;
         replay.run()?;
+        if replay.proc_piles.values().any(|p| p.radial_floor_limited) {
+            return Err(NativeUnsupported::new_err("electric-gas-radial-floor-state-limit"));
+        }
         let score = replay.kills as f64 + if ehp != 0.0 { 1.0 - psum(replay.pools) / ehp } else { 0.0 };
         let damage = psum(replay.totals);
         let kpm = if replay.window != 0.0 { score * 60.0 / replay.window } else { 0.0 };
@@ -5072,7 +5155,17 @@ fn prepare_replay<'py>(py: Python<'py>, config: &Bound<'py, PyDict>, helper: &Bo
         None => None,
     };
     let rate_spool = match opt_dict("fireRateSpool")? {
-        Some(d) => Some((get_f(&d, "start", 1.0)?, get_f(&d, "end", 1.0)?, get_f(&d, "overShots", 1.0)?)),
+        Some(d) => {
+            let start = get_f(&d, "start", 1.0)?;
+            let end = get_f(&d, "end", 1.0)?;
+            let maximum = get_f(&d, "nativeMaxShots", 0.0)? as u32;
+            Some(if maximum > 0 {
+                RateSpoolSpec::Native { start: start as f32, end: end as f32, maximum,
+                    source_rpm: get_f(&d, "sourceRpm", 0.0)?, source_rate: get_f(&d, "sourceRate", 1.0)? }
+            } else {
+                RateSpoolSpec::Reference { start, end, over: get_f(&d, "overShots", 1.0)? }
+            })
+        }
         None => None,
     };
     let shell = match opt_dict("shellReload")? {
@@ -5458,6 +5551,7 @@ fn prepare_replay<'py>(py: Python<'py>, config: &Bound<'py, PyDict>, helper: &Bo
         // combat_replay: a weapon's extra Puncture stacks (Evensong) raise the cap.
         pooled: [CappedPool::new(10.0), CappedPool::new(10.0), CappedPool::new(10.0),
                  CappedPool::new(item("punctureCap")?.extract()?)],
+        tau: None,
         presence: FxIndexMap::default(),
         proc_piles: FxIndexMap::default(),
         dots: Vec::new(),
@@ -5478,6 +5572,7 @@ fn prepare_replay<'py>(py: Python<'py>, config: &Bound<'py, PyDict>, helper: &Bo
             pmax(1.0, if rate > 0.0 { 1.0 / rate } else { 0.0 }),
             if rate > 0.0 { Some(1.0 / rate) } else { None },
         ),
+        track_weak_kills: true,
         puncture_strip: 0.0,
         frozen_until: -1.0,
         heap: BinaryHeap::new(),
@@ -5570,6 +5665,16 @@ fn prepare_replay<'py>(py: Python<'py>, config: &Bound<'py, PyDict>, helper: &Bo
         proc_counts: FxIndexMap::default(),
         dot_by_type: FxIndexMap::default(),
         magnetic_breaks: Vec::new(),
+        magnetic_proxy: match config.get_item("magneticProxy")? {
+            Some(v) if !v.is_none() => Some(v.extract()?),
+            _ => None,
+        },
+        magnetic_weakness: match config.get_item("magneticWeaknessBonus")? {
+            Some(v) if !v.is_none() => Some(v.extract()?),
+            _ => None,
+        },
+        magnetic_electric_immune: truthy(config, "magneticElectricImmune")?,
+        blocks_radiation: truthy(config, "blocksRadiation")?,
         sources,
         ammo: 0.0,
         shot_in_progress: false,
@@ -5599,6 +5704,16 @@ fn prepare_replay<'py>(py: Python<'py>, config: &Bound<'py, PyDict>, helper: &Bo
         types,
         frozen_scale: 1.0,
     };
+    if truthy(config, "scoreOnly")? {
+        // A score has no weak-kill statistic. Keep attribution when it can feed
+        // a branch, restored ammo, or any lifecycle hook of a trigger source.
+        let signal = "on-headshot-kill";
+        replay.track_weak_kills = replay.weak_draw.is_some()
+            || replay.restore.as_ref().is_some_and(|r| r.kind == signal)
+            || replay.sources.iter().any(|s| s.kind.as_deref() == Some(signal)
+                || s.consume_on.as_deref() == Some(signal) || s.lock_on.as_deref() == Some(signal)
+                || s.toggle_on.as_deref() == Some(signal) || s.reset_on.iter().any(|r| r == signal));
+    }
     // Initial stats and ammo, then the reference's pushes in order.
     let initial = item("stats")?;
     replay.view(&initial)?;
@@ -5633,9 +5748,23 @@ fn prepare_replay<'py>(py: Python<'py>, config: &Bound<'py, PyDict>, helper: &Bo
 fn trajectory_inner<'py>(py: Python<'py>, config: &Bound<'py, PyDict>, helper: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyDict>> {
     let mut replay = prepare_replay(py, config, helper)?;
     replay.run()?;
+    if replay.proc_piles.values().any(|p| p.radial_floor_limited) {
+        return Err(NativeUnsupported::new_err("electric-gas-radial-floor-state-limit"));
+    }
     let _result_timer = crate::counters::Timer::start(crate::counters::RESULT);
     // Core results; the Python wrapper assembles the reference's result dict.
     let out = PyDict::new(py);
+    if truthy(config, "scoreOnly")? {
+        out.set_item("kills", replay.kills)?;
+        out.set_item("attacks", replay.attacks)?;
+        out.set_item("pools", replay.pools.to_vec())?;
+        out.set_item("totals", replay.totals.to_vec())?;
+        out.set_item("weakUncertainty", replay.weak_uncertainty)?;
+        out.set_item("weakIndex", replay.weak_index)?;
+        out.set_item("mineOverflows", replay.mine_overflows)?;
+        write_combat_state(&replay, &out)?;
+        return Ok(out);
+    }
     let opt = |v: Option<f64>| -> PyObject {
         match v {
             Some(x) => x.into_pyobject(py).unwrap().into_any().unbind(),
@@ -5718,8 +5847,13 @@ fn trajectory_inner<'py>(py: Python<'py>, config: &Bound<'py, PyDict>, helper: &
         syndicate_events.append(d)?;
     }
     out.set_item("syndicateEvents", syndicate_events)?;
+    write_combat_state(&replay, &out)?;
+    Ok(out)
+}
+
+fn write_combat_state<'py>(replay: &Replay<'py>, out: &Bound<'py, PyDict>) -> PyResult<()> {
     out.set_item("lastRound", replay.last_round)?;
-    let victim = PyDict::new(py);
+    let victim = PyDict::new(replay.py);
     for (k, v) in &replay.victim_before {
         victim.set_item(replay.types.name(*k), *v)?;
     }
@@ -5727,9 +5861,54 @@ fn trajectory_inner<'py>(py: Python<'py>, config: &Bound<'py, PyDict>, helper: &
     out.set_item("actorSignalUsed", replay.actor_signal_used)?;
     let stacks: Vec<f64> = replay.sources.iter().map(|q| q.stacks).collect();
     out.set_item("sourceStacks", stacks)?;
-    let _ = &replay.first_shot;
-    for q in &replay.sources {
-        let _ = q.obj.bind(py);
+    Ok(())
+}
+
+
+/// Exact immutable damage stream for the first GPU-admitted domain.
+/// Health-only, body hits, no status/kill feedback or persistent projectiles.
+/// Unknown mechanics fail closed; normal CPU health_batch remains authoritative.
+#[pyfunction]
+pub fn direct_bake_stream<'py>(py: Python<'py>, config: &Bound<'py, PyDict>, helper: &Bound<'py, PyAny>)
+    -> PyResult<(Vec<f64>, f64, f64)> {
+    let mut replay = prepare_replay(py, config, helper)?;
+    if replay.head != 0.0 || replay.full[0] != 0.0 || replay.full[1] != 0.0
+        || !replay.sources.is_empty() || replay.melee.is_some() || replay.cycle.is_some()
+        || replay.shot_combo.is_some() || replay.restore.is_some() || replay.syndicate.is_some()
+        || replay.empowered.is_some() || replay.cryogenic.is_some() || replay.encumber.is_some()
+        || replay.enervate.is_some() || replay.onos.is_some() || replay.mines.is_some()
+        || replay.projectiles.is_some() || replay.fortifier.is_some() || replay.weak_draw.is_some()
+        || replay.live_types_enabled || !replay.extra_hits.is_empty() || !replay.forced_procs.is_empty()
+        || replay.life_curve.is_some() || replay.puncture_armor_strip != 0.0
+        || !replay.victim_before.is_empty() || replay.field_duration.is_some() {
+        return Err(NativeUnsupported::new_err("GPU stream requires independent fixed-state direct hits"));
     }
-    Ok(out)
+    let (active, radial) = replay.model(0.0)?;
+    let st = &replay.stats[active];
+    if radial.is_some() || st.status_chance > 0.0 || !st.native_forced_procs.is_empty()
+        || !st.independent_proc_chances.is_empty() || st.has_crit_procs
+        || !st.core.impact_proc_conversions.is_empty() || !st.core.extra_hits.is_empty()
+        || st.impact_delay != 0.0 || st.primary_delay != 0.0 || st.lingering.is_some()
+        || !st.additional.is_empty() || st.persist_after_kill || st.stackable.is_some()
+        || !st.reload_empty.is_empty() || !st.reload_partial.is_empty()
+        || st.victim_full_crit_chance != 0.0 || st.victim_full_crit_damage != 0.0
+        || st.victim_low_health_multiplier != 1.0 || st.continuous
+        || st.head_only || st.body_only || st.radial_only || !st.co_bucket.is_empty() {
+        return Err(NativeUnsupported::new_err("GPU stream cannot discard statuses or target-dependent parts"));
+    }
+    let health = replay.full[2];
+    replay.full = [0.0, 0.0, 1e250];
+    replay.pools = replay.full;
+    replay.ehp = 1e250;
+    replay.life_curve = Some(Vec::new());
+    replay.run()?;
+    if replay.kills != 0 || replay.proc_counts.values().any(|v| *v != 0.0)
+        || replay.totals[1..].iter().any(|v| *v != 0.0) {
+        return Err(NativeUnsupported::new_err("GPU stream observed non-direct damage"));
+    }
+    let rows = replay.life_curve.as_ref().unwrap();
+    if rows.len() > 100000 || rows.iter().any(|r| r.3 != DIRECT || !r.1.is_finite() || r.1 < 0.0) {
+        return Err(NativeUnsupported::new_err("GPU stream event bounds exceeded"));
+    }
+    Ok((rows.iter().map(|r| r.1).collect(), health, replay.window))
 }

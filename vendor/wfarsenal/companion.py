@@ -76,6 +76,8 @@ def companion_payload(payload: Mapping[str, Any], weapon: Mapping[str, Any]) -> 
     state.update(companion=True, companionPlayerStacks=player)
     if isinstance(nested, Mapping):
         out["scenario"] = {**nested, "aiming": False, "combatState": state}
+        if "headshotChance" in nested:
+            out["scenario"]["headshotChance"] = 0.0
     else:
         out["combatState"] = state
     # Riven callers can supply their own target. It must not bypass the same

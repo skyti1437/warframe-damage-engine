@@ -290,6 +290,7 @@ pub fn co_damage(spec: &CoSpec, co: &[(u8, f64)], el: &Elements) -> CoDamage {
         };
     }
     damage_scale += spec.ordinary_scale * (spec.compression_mult - 1.0);
+    damage_scale = pmax(0.0, damage_scale);
     let base_bracket = damage_scale;
     let mut victim_low = 1.0;
     let (victim_damage, co_fraction) = (spec.victim_damage, spec.co_fraction);
@@ -304,10 +305,10 @@ pub fn co_damage(spec: &CoSpec, co: &[(u8, f64)], el: &Elements) -> CoDamage {
     let mut slam_damage_ratio = 1.0;
     if spec.melee {
         let pre_melee = damage_scale;
-        damage_scale = combine(damage_scale, &[&spec.melee_damage_effects], Some(damage_scale));
+        damage_scale = pmax(0.0, combine(damage_scale, &[&spec.melee_damage_effects], Some(damage_scale)));
         if !spec.slam_effects.is_empty() && damage_scale != 0.0 {
             slam_damage_ratio =
-                combine(pre_melee, &[&spec.melee_damage_effects, &spec.slam_effects], Some(pre_melee)) / damage_scale;
+                pmax(0.0, combine(pre_melee, &[&spec.melee_damage_effects, &spec.slam_effects], Some(pre_melee))) / damage_scale;
         }
     }
     let mut scaled = spec.base.clone();
@@ -341,6 +342,9 @@ pub fn co_damage(spec: &CoSpec, co: &[(u8, f64)], el: &Elements) -> CoDamage {
     }
     if let Some(f) = spec.frozen_factor {
         damage.scale(f);
+    }
+    for entry in &mut damage.0 {
+        entry.1 = pmax(0.0, entry.1);
     }
     CoDamage { damage_types: damage, scale: damage_scale, base_bracket, victim_low_health_multiplier: victim_low, slam_damage_ratio }
 }

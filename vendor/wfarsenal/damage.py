@@ -209,6 +209,34 @@ def _float32(value: float) -> float:
     return struct.unpack("<f", struct.pack("<f", float(value)))[0]
 
 
+def _shield_override_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    message = "enemy_enhancements.shieldOverride must be a finite nonnegative number or None"
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(message)
+    try:
+        value = float(value)
+    except OverflowError as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(value):
+        raise ValueError(message)
+    return value
+
+
+def _enemy_enhancement_cache_key(options: Mapping[str, Any] | None) -> tuple[tuple[str, Any], ...] | None:
+    if options is None:
+        return None
+    items = options.items()
+    if "shieldOverride" in options:
+        normalized = dict(items)
+        shield_override = _shield_override_value(normalized.pop("shieldOverride"))
+        if shield_override is not None:
+            normalized["shieldOverride"] = shield_override
+        items = normalized.items()
+    return tuple(sorted(items))
+
+
 def _enemy_enhancement_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
     if options is None:
         return {
@@ -243,6 +271,9 @@ def _enemy_enhancement_options(options: Mapping[str, Any] | None) -> dict[str, A
         "auraArmourReduction": options.get("auraArmourReduction", 0.0),
         "auraShieldReduction": options.get("auraShieldReduction", 0.0),
     }
+    shield_override = _shield_override_value(options.get("shieldOverride"))
+    if shield_override is not None:
+        result["shieldOverride"] = shield_override
     for key in ("auraArmourReduction", "auraShieldReduction"):
         share = result[key]
         if isinstance(share, bool) or not isinstance(share, (int, float)) or not math.isfinite(share) or not 0.0 <= share <= 1.0:
@@ -444,6 +475,7 @@ def _rebuild_scenario(
     detonation_delay_seconds: float = 0.0,
     detonation_batch_size: int = 1,
     combat_state: Mapping[str, Any] | None = None,
+    model_spread: bool = False,
 ) -> "Scenario":
     """Scenario.__reduce__ 的重建入口（pickle 反序列化路径）。"""
     return Scenario(
@@ -460,6 +492,7 @@ def _rebuild_scenario(
         detonation_delay_seconds=detonation_delay_seconds,
         detonation_batch_size=detonation_batch_size,
         combat_state=combat_state or {},
+        model_spread=model_spread,
     )
 
 
@@ -499,6 +532,7 @@ class Scenario:
     detonation_delay_seconds: float = 0.0
     detonation_batch_size: int = 1
     combat_state: Mapping[str, Any] = field(default_factory=dict)
+    model_spread: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -509,6 +543,8 @@ class Scenario:
             raise TypeError("aiming, heavy_attack and cloaked must be booleans")
         if not isinstance(self.incarnon_cycle, bool):
             raise TypeError("incarnon_cycle must be a boolean")
+        if not isinstance(self.model_spread, bool):
+            raise TypeError("model_spread must be a boolean")
         _require_int("combo_tier", self.combo_tier, maximum=11)
         _require_int("victim_status_count", self.victim_status_count)
         object.__setattr__(self, 'detonation_delay_seconds',
@@ -540,7 +576,7 @@ class Scenario:
                    'selfShieldBreakAt','selfShieldBreakInterval','selfOverguardBreakAt','selfOverguardBreakInterval','selfShieldHitAt','selfShieldHitInterval'}
         numeric |= {'grimoireCoverageSeconds','grimoireExpiryDistance','equipFromPrimaryAt','equipFromPrimaryInterval','abilityUseAt','abilityUseInterval','meleeTargetDistance','phantasmaChildArrivalSeconds','zymosChildArrivalSeconds','zymosChildFrameSeconds'}
         binary = {'overshields','channeling','aimGliding','sliding','incarnonMeleeActive','orbSpecialShield','onosRadialHit','selfShieldBreakForced','perfectCharge','infiniteAmmo',
-                  'companion','companionPlayerStacks'}
+                  'companion','companionPlayerStacks','gaugeChargingHeadshots'}
         integers = {'zymosChildContacts':5,'battacorCharges':3,'nearbyEnemies':1000,'stugBounceHits':2,'stugChildHits':5,'detonateAfterShots':20,'orbPasses':3,'orbStacks':3,'orbRank':6,'punchthroughTargets':100,'abilityUses':100000}
         melee_text = {'meleeRoute','meleeStance','meleeCombo'}
         allowed = numeric | binary | set(integers) | melee_text | {'projectileMode','equippedWeapons','emptySlots','orbAbsorbedDamageType','orbAbsorbedDamageTypes','quantaStrategy','grimoireStrategy','phantasmaChildOverlap','zymosChildOverlap'}
@@ -637,6 +673,7 @@ class Scenario:
                 self.detonation_delay_seconds,
                 self.detonation_batch_size,
                 dict(self.combat_state),
+                self.model_spread,
             ),
         )
 
@@ -1231,10 +1268,9 @@ class ModdedStats:
     charge_rate_multiplier: float = 1.0
     charge_seconds: float = 0.0
     bow_draw_seconds: float | None = None
-    # Inactive compatibility fields for deferred_spread research. Production
-    # apply_mods leaves these unset; replay/scoring never consumes them.
     spread_min_deg: float | None = None
     spread_max_deg: float | None = None
+    hit_probability: float = 1.0
     # Per-pellet chance of an extra status of the keyed type, rolled only on a
     # critical hit (crit tier >= 1). Hunter Munitions is the DT_SLASH entry.
     crit_proc_chances: dict[str, float] = field(default_factory=dict)
@@ -1348,19 +1384,27 @@ class ModdedStats:
         )
 
 
+def _tier_factor(tier: int, multiplier: float) -> float:
+    if not tier:
+        return 1.0
+    step = _float32(_float32(multiplier) - 1.0)
+    return max(0.0, _float32(1.0 + _float32(tier * step)))
+
+
 def effective_crit_multiplier(chance: float, multiplier: float) -> float:
     """Return the average damage multiplier from critical hits.
 
     Each whole 100% of crit chance guarantees one more crit tier. Tier *n* multiplies
     by ``1 + n * (multiplier - 1)``.
     """
-    if multiplier <= 1.0 or chance <= 0.0:
+    if chance <= 0.0:
         return 1.0
     guaranteed = int(chance)
     remainder = chance - guaranteed
-    low = 1.0 + guaranteed * (multiplier - 1.0)
-    high = 1.0 + (guaranteed + 1) * (multiplier - 1.0)
-    return low * (1.0 - remainder) + high * remainder
+    low = _tier_factor(guaranteed, multiplier)
+    if not remainder:
+        return low
+    return low * (1.0 - remainder) + _tier_factor(guaranteed + 1, multiplier) * remainder
 
 
 def crit_tier_seed_distribution(
@@ -1400,12 +1444,12 @@ def crit_tier_seed_distribution(
         rate=promotion if tier>0 else 0.0
         promoted[tier]=promoted.get(tier,0.0)+weight*(1-rate)
         if rate:promoted[tier+1]=promoted.get(tier+1,0.0)+weight*rate
-    cd=max(1.0,crit_multiplier*float(critical_multiplier_factor))
+    cd=crit_multiplier*float(critical_multiplier_factor)
     if critical_only:
         promoted={tier:weight for tier,weight in promoted.items() if tier>0}
         total=sum(promoted.values())
         promoted={tier:weight/total for tier,weight in promoted.items()} if total>0 else {}
-    return [(weight, max(1.0,noncrit_damage_multiplier) if tier==0 else 1+tier*(cd-1))
+    return [(weight, max(1.0,noncrit_damage_multiplier) if tier==0 else _tier_factor(tier,cd))
             for tier,weight in sorted(promoted.items()) if weight>0]
 
 
@@ -1437,20 +1481,15 @@ def effective_hit_multiplier(
         or double_crit_chance < 0.0
     ):
         raise ValueError("double_crit_chance must be a finite non-negative number")
-    crit = effective_crit_multiplier(
-        crit_chance, crit_multiplier * float(critical_multiplier_factor)
-    )
-    # A Vigilante promotion is only rolled for hits that already crit.  For a
-    # fractional crit chance that is ``crit_chance`` of hits; at 100%+ every hit
-    # is critical.  One extra tier contributes (critMultiplier - 1) on average.
-    promotion = (
-        min(max(float(crit_chance), 0.0), 1.0)
-        * min(float(double_crit_chance), 1.0)
-        * max(crit_multiplier * float(critical_multiplier_factor) - 1.0, 0.0)
-    )
+    if double_crit_chance and crit_chance > 0.0:
+        # A tier promotion can reduce damage to zero; clamp before averaging.
+        return sum(p * factor for p, factor in crit_tier_seed_distribution(
+            crit_chance, crit_multiplier, noncrit_damage_multiplier, critical_multiplier_factor,
+            double_crit_chance=double_crit_chance))
+    crit = effective_crit_multiplier(crit_chance, crit_multiplier * float(critical_multiplier_factor))
     noncrit_chance = min(1.0, max(1.0 - crit_chance, 0.0))
     noncrit_bonus = max(noncrit_damage_multiplier - 1.0, 0.0)
-    return crit + promotion + noncrit_chance * noncrit_bonus
+    return crit + noncrit_chance * noncrit_bonus
 
 
 # -- mod application ------------------------------------------------------------------
@@ -1497,6 +1536,46 @@ def with_innate(weapon: Mapping[str, Any], effects: ModEffectList, fire_mode: in
     if not terms or any(e.source_path == terms[0].source_path for e in effects):
         return effects
     return ModEffectList([*effects, *terms], skipped=effects.skipped)
+
+
+_MOTOVORE_PATH = '/Lotus/Weapons/Infested/InfestedLich/Melee/InfestedHammer/InfLichHammerWeapon'
+_MOTOVORE_SLASH_WHEEL = ModEffect('WEAPON_PROC_CHANCE', 'STACKING_MULTIPLY', 1.0,
+                                  source_path='innate:coda-motovore-slash-wheel')
+
+
+def motovore_wheel_effects(weapon, effects, fire_mode, scenario):
+    """M131: the ordinary Slash wheel joins the additive status bracket."""
+    if (weapon.get('path') != _MOTOVORE_PATH or scenario.heavy_attack or fire_mode != 0
+            or weapon.get('__selectedFireMode__', 0) != 0 or weapon.get('__innateResolved__')
+            or scenario.combat_state.get('meleeRoute', 'combo') != 'combo'):
+        return effects
+    mode = (weapon.get('fireModes') or [{}])[0]
+    types = (mode.get('damage') or {}).get('types') or {}
+    if not all(types.get(dtype, 0.0) > 0.0 for dtype in PHYSICAL_TYPES):
+        return effects
+    if any(dtype == 'DT_IMPACT' and value for dtype, value in _read_innate_elements(weapon)[0]):
+        return effects  # Impact progenitor's wheel selection is unmeasured.
+    effects = ModEffectList(effects, skipped=getattr(effects, 'skipped', ()))
+    totals = {dtype: types[dtype] for dtype in PHYSICAL_TYPES}
+    for effect in effects:
+        if (not effect.supported or effect.damage_type not in totals
+                or effect.upgrade_type not in ('WEAPON_PERCENT_BASE_DAMAGE_ADDED',
+                                               'WEAPON_PERCENT_BASE_DAMAGE_ADDED_POST_COALESCE')):
+            continue
+        if effect.valid_type and effect.valid_type.rstrip('/') not in (*weapon.get('ancestry', ()), _MOTOVORE_PATH):
+            continue
+        if _qualifier_rejection(effect, weapon, scenario):
+            continue
+        # The exported ordinary card already supplies its Motovore-specific
+        # potency. Do not extrapolate ranks, negative Rivens or other phases.
+        if (effect.value < 0.0 or effect.operation != 'STACKING_MULTIPLY'
+                or effect.upgrade_type != 'WEAPON_PERCENT_BASE_DAMAGE_ADDED'
+                or (effect.source_path or '').startswith('riven:')):
+            return effects
+        totals[effect.damage_type] += types[effect.damage_type] * effect.value
+    if all(totals['DT_SLASH'] > totals[dtype] for dtype in ('DT_IMPACT', 'DT_PUNCTURE')):
+        effects.append(_MOTOVORE_SLASH_WHEEL)
+    return effects
 
 
 def apply_mods(
@@ -1566,6 +1645,7 @@ def _co_damage(spec: CoSpec, co_effects: list[ModEffect]) -> _CoDamage:
         damage_scale = ordinary_scale*(1.+raw_co*fraction) if spec.gunco_independent else ordinary_scale+raw_co*fraction
     # Multiplying Compression amplifies the ordinary bucket, not adding GunCO.
     damage_scale += spec.ordinary_scale * (spec.compression_mult - 1.0)
+    damage_scale = max(0.0, damage_scale)
     out = _CoDamage()
     # The replay adds live Cold stacks to this bracket (hit damage scales with it).
     out.base_bracket = damage_scale
@@ -1581,17 +1661,17 @@ def _co_damage(spec: CoSpec, co_effects: list[ModEffect]) -> _CoDamage:
     slam_damage_ratio = 1.0
     if spec.melee:
         pre_melee = damage_scale
-        damage_scale = _combine(
+        damage_scale = max(0.0, _combine(
             damage_scale,
             spec.melee_damage_effects,
             base_value=damage_scale,
-        )
+        ))
         if spec.slam_effects and damage_scale:
-            slam_damage_ratio = _combine(
+            slam_damage_ratio = max(0.0, _combine(
                 pre_melee,
                 [*spec.melee_damage_effects, *spec.slam_effects],
                 base_value=pre_melee,
-            ) / damage_scale
+            )) / damage_scale
     out.slam_damage_ratio = slam_damage_ratio
     scaled_base = {dtype: amount * damage_scale for dtype, amount in spec.base.items()}
     damage_types = _apply_elements(
@@ -1625,7 +1705,7 @@ def _co_damage(spec: CoSpec, co_effects: list[ModEffect]) -> _CoDamage:
     if spec.frozen_factor is not None:
         frozen = spec.frozen_factor
         damage_types = {k: v * frozen for k, v in damage_types.items()}
-    out.damage_types = damage_types
+    out.damage_types = {dtype: max(0.0, amount) for dtype, amount in damage_types.items()}
     out.status_multiplier = _combine(1.0, status_damage_effects)
     out.innate_damage_types = {
         dtype: base_total * damage_scale * value
@@ -1689,6 +1769,7 @@ def _apply_mods_spec_py(
     effect_list = with_innate(weapon, ModEffectList(
         list(effects), skipped=getattr(effects, "skipped", ())
     ), fire_mode)
+    effect_list = motovore_wheel_effects(weapon, effect_list, fire_mode, scenario)
     heavy = weapon.get("heavyAttack")
     if scenario.heavy_attack and isinstance(heavy, Mapping):
         components = heavy.get("components")
@@ -2091,9 +2172,9 @@ def _apply_mods_spec_py(
     # (Pressure Point, a melee Riven's damage) are part of it as they are of
     # the hit (WFSim ModifiedBase: Primed Pressure Point x2.65 on a bleed).
     # Condition Overload and GunCO stay out.
-    dot_scale = _combine(1.0, damage_scale_effects)
+    dot_scale = max(0.0, _combine(1.0, damage_scale_effects))
     if weapon.get("slot") in MELEE_SLOTS:
-        dot_scale = _combine(dot_scale, melee_damage_effects, base_value=dot_scale)
+        dot_scale = max(0.0, _combine(dot_scale, melee_damage_effects, base_value=dot_scale))
     dot_basis = elemental_base_total * dot_scale * compression_mult
     dot_elements = _dot_elemental_multipliers(buckets['WEAPON_PERCENT_BASE_DAMAGE_ADDED'],
                                             buckets['WEAPON_PERCENT_BASE_DAMAGE_ADDED_POST_COALESCE'])
@@ -2168,7 +2249,7 @@ def _apply_mods_spec_py(
             forced_statuses[effect.damage_type] = forced_statuses.get(effect.damage_type, 0.0) + float(effect.runtime_chance)
     co = _co_damage(spec, co_effects)
     from .event_profiles import ignores_headshot_bonus
-    return ModdedStats(
+    stats = ModdedStats(
         damage_types=co.damage_types,
         crit_chance=crit_chance,
         # 基础暴伤量化（wfsim §5）：flat CD 先加进基础值 → 量化到 32/4095
@@ -2277,7 +2358,7 @@ def _apply_mods_spec_py(
         bodyshot_crit_multiplier=_combine(1.,[e for e in buckets['WEAPON_CRIT_CHANCE_BODY_PART'] if e.symbol_filter=='TORSO']),
         base_crit_chance=_combine(damage.get('critChance', 0.0), [e for e in buckets['WEAPON_CRIT_CHANCE'] if e.operation in ('ADD_BASE', 'SET_BASE')]),
         falloff_multiplier=falloff_multiplier,
-        dot_base_damage=dot_basis,
+        dot_base_damage=max(0.0, dot_basis),
         dot_elemental_multipliers=dot_elements,
         impact_proc_conversions=impact_proc_conversions,
         independent_proc_chances=independent_proc_chances,
@@ -2288,7 +2369,11 @@ def _apply_mods_spec_py(
         innate_element_candidates=tuple(innate_candidates),
         unsupported=sorted(unsupported),
         skipped=list(dict.fromkeys(skipped)),
-    ), spec
+    )
+    if scenario.model_spread:
+        from .deferred_spread import apply_spread
+        apply_spread(stats, weapon, fire_mode, applicable, scenario)
+    return stats, spec
 
 
 def _apply_heavy_components(
@@ -3002,6 +3087,26 @@ def _eximus_shield_base(base: float, level: float) -> float:
     return base * scale
 
 
+_STEEL_PATH_SHIELD_AURA = _float32(1.58114)
+_CORRUPTED_CREWMAN_CONTROLLER = '/Lotus/Types/Enemies/Corpus/Spaceman/AIWeek/RifleSpacemanDamageController'
+
+
+def _native_shield_maximum(base, delta, curve, steel_path, aura_reduction):
+    f32 = _float32
+    low_scale, low_exponent, high_scale, high_exponent = map(f32, curve)
+    delta = f32(max(0., delta))
+    low = f32(1. + f32(low_scale * f32(delta ** low_exponent)))
+    high = f32(1. + f32(high_scale * f32(delta ** high_exponent)))
+    t = min(1., max(0., f32(f32(delta - 70.) / 10.)))
+    blend = f32(f32(t * t) * f32(3. - f32(2. * t)))
+    curve_value = f32(low + f32(f32(high - low) * blend))
+    sp = _STEEL_PATH_SHIELD_AURA if steel_path else 1.
+    initial = math.floor(f32(f32(f32(base) * sp) + .5))
+    stored = math.floor(f32(f32(initial * curve_value) + .5))
+    maximum = f32(f32(stored * sp) * f32(1. - f32(aura_reduction)))
+    return float(math.floor(f32(maximum + .5)))
+
+
 def _overguard_level_multiplier(level: float) -> float:
     """Evaluate the Eximus/Overguard absolute-level f32 smoothstep curve."""
     level = max(float(level), 1.0)
@@ -3056,7 +3161,7 @@ def enemy_defenses(
 ) -> dict[str, Any]:
     """:func:`_enemy_defenses`, memoised; every call gets its own copy."""
     try:
-        options = None if enemy_enhancements is None else tuple(sorted(enemy_enhancements.items()))
+        options = _enemy_enhancement_cache_key(enemy_enhancements)
         from .record_keys import record_key
         key = (record_key(target), level, steel_path, armour_strip, elemental_armour_strip, options)
         hash(key)
@@ -3116,6 +3221,11 @@ def _enemy_defenses(
     unsupported: set[str] = set()
     health = _enemy_pool(target, "health", required=True, unsupported=unsupported)
     shield = _enemy_pool(target, "shield", required=False, unsupported=unsupported)
+    shield_override = enhancements.get("shieldOverride")
+    shield_type = None
+    if shield_override is not None and shield_override > 0.0:
+        innately_shielded_type = target.get("shieldType") if shield > 0.0 else None
+        shield_type = innately_shielded_type or "RK_SHIELD"
     base_level = _enemy_base_level(target, level, unsupported)
     faction = str(target.get("factionResistance") or "")
 
@@ -3124,30 +3234,48 @@ def _enemy_defenses(
     if enhancements["eximus"] and not standard_eximus:
         unsupported.add("eximus-special-variant")
     if standard_eximus:
+        # Eximus health uses the enemy's innate defenses.
         has_shield_or_armour = shield > 0.0 or bool(target.get("armour"))
         health = _eximus_pool_base(
             health,
             enhancement_level,
             has_shield_or_armour=has_shield_or_armour,
         )
-        if shield > 0.0:
-            shield = _eximus_shield_base(shield, enhancement_level)
+    if shield_override is not None:
+        shield = shield_override
+    if standard_eximus and shield > 0.0:
+        shield = _eximus_shield_base(shield, enhancement_level)
 
+    shield_curve = FACTION_SHIELD_SCALING.get(faction, DEFAULT_SHIELD_SCALING)
+    shield_base_level = base_level
+    if (shield_base_level is None and target.get('path') == '/Lotus/Types/Enemies/Orokin/RifleSpacemanAvatar'
+            and target.get('damageController') == _CORRUPTED_CREWMAN_CONTROLLER):
+        shield_base_level = 1.
+    native_shield = (shield > 0. and level is not None and shield_base_level is not None
+                     and not enhancements['eximus'] and not enhancements['empowered'])
+    if native_shield:
+        try:
+            shield = _native_shield_maximum(shield, level - shield_base_level, shield_curve,
+                                            steel_path, enhancements['auraShieldReduction'])
+        except OverflowError:
+            if shield_override is None:
+                raise
+            # A finite synthetic base can exceed the game's f32 range.
+            native_shield = False
     if level is not None and base_level is not None:
         health *= _level_curve_multiplier(
             max(level - base_level, 0.0),
             FACTION_HEALTH_SCALING.get(faction, DEFAULT_HEALTH_SCALING),
         )
-        shield *= _level_curve_multiplier(
-            max(level - base_level, 0.0),
-            FACTION_SHIELD_SCALING.get(faction, DEFAULT_SHIELD_SCALING),
-        )
+        if not native_shield:
+            shield *= _level_curve_multiplier(max(level - base_level, 0.0), shield_curve)
 
     path_multiplier = STEEL_PATH_DEFENSE_MULTIPLIER if steel_path else 1.0
     shield_multiplier = path_multiplier
     armour_multiplier = 1.0
     health *= path_multiplier
-    shield *= shield_multiplier
+    if not native_shield:
+        shield *= shield_multiplier
     # Current Wiki data separates Steel Path health/shield bonuses from armor;
     # applying 2.5x to armor overstates mitigation and makes faction comparisons
     # wrong.  Keep the explicit multiplier here for future sourced variants.
@@ -3183,7 +3311,8 @@ def _enemy_defenses(
     if enhancements["noOverguard"]:
         overguard = 0.0
     armour *= 1.0 - enhancements["auraArmourReduction"]
-    shield *= 1.0 - enhancements["auraShieldReduction"]
+    if not native_shield:
+        shield *= 1.0 - enhancements["auraShieldReduction"]
     if any(
         target.get(key)
         for key in (
@@ -3206,6 +3335,7 @@ def _enemy_defenses(
         "steelPathArmorMultiplier": armour_multiplier,
         "health": health,
         "shield": shield,
+        **({"shieldType": shield_type} if shield_type is not None else {}),
         "armour": armour,
         "armourReduction": _armour_reduction(armour) if armour else 0.0,
         "elementalArmourStrip": elemental_armour_strip,
@@ -3257,8 +3387,8 @@ def quantize_base_crit_damage(cd: float) -> float:
     CD bonuses (Incarnon "Critical Parallel" +0.4) must add into the base
     BEFORE quantization; RELATIVE (%) mods (Vital Sense) multiply AFTER.
     """
-    step = 32.0 / 4095.0
-    return math.floor(float(cd) / step + .5) * step
+    scaled = _float32(min(32.0, max(0.0, _float32(cd))) * 127.96875)
+    return _float32(int(_float32(scaled + .5)) * _float32(32.0 / 4095.0))
 
 
 # 临界：flat CD（ADD/ADD_BASE 操作）与相对 CD（STACKING_MULTIPLY/MULTIPLY）
@@ -3342,13 +3472,14 @@ def damage_against_cached_armour(
 
     per_type: dict[str, float] = {}
     shield_value = float(defenses_snapshot.get("shield") or 0.0)
+    shielded = _target_is_shielded(target, defenses_snapshot)
     for dtype, amount in quantized_types.items():
         if overguard > 0.0:
             value = _overguard_damage_multiplier(dtype, magnetic_stacks)
         else:
             value = _target_damage_multiplier(
                 dtype,
-                target,
+                shielded=shielded,
                 armour=live_armour,
                 faction_deltas=faction_deltas,
                 armour_bypass=armour_bypass,
@@ -3373,15 +3504,8 @@ def damage_against_cached_armour(
             damage_type: amount * _weapon_hit_damage_multiplier(stats, hit_multiplier)
             for damage_type, amount in per_type.items()
         }
-    raw = sum(per_type.values()) * effective_hit_multiplier(
-        max(stats.crit_chance + crit_chance_add, 0.0) if crit_chance_add else stats.crit_chance,
-        max(stats.crit_multiplier + crit_multiplier_add, 1.0) if crit_multiplier_add else stats.crit_multiplier,
-        stats.noncrit_damage_multiplier,
-        hit_critical_multiplier,
-        double_crit_chance=stats.double_crit_chance,
-    )
-    raw = _apply_weakpoint_folding(
-        raw, stats, hit_multiplier, hit_critical_multiplier,
+    raw = sum(per_type.values()) * _location_hit_factor(
+        stats, hit_multiplier, hit_critical_multiplier,
         crit_chance_add=crit_chance_add, crit_multiplier_add=crit_multiplier_add,
     )
     return {
@@ -3407,8 +3531,7 @@ def _weakpoint_noncrit_scale(stats: "ModdedStats", hit_multiplier: float) -> flo
     return scale
 
 
-def _apply_weakpoint_folding(
-    raw: float,
+def _location_hit_factor(
     stats: "ModdedStats",
     hit_multiplier: float,
     hit_critical_multiplier: float,
@@ -3416,46 +3539,12 @@ def _apply_weakpoint_folding(
     crit_chance_add: float = 0.0,
     crit_multiplier_add: float = 0.0,
 ) -> float:
-    # WFSim 69e6a139 MECHANICS weak-point bracket. Prior disassembly only
-    # established the gate, not the arithmetic (its openQuestions say so).
-    if stats.radial_only:
-        return raw
-    weakpoint_share = 1.0 if hit_multiplier > 1.0 + 1e-9 else 0.0
-    if weakpoint_share <= 0.0:
-        if stats.bodyshot_crit_multiplier!=1.:
-            cc=max(stats.crit_chance+crit_chance_add,0.)
-            cd=max(stats.crit_multiplier+crit_multiplier_add,1.)
-            original=effective_hit_multiplier(cc,cd,stats.noncrit_damage_multiplier,
-                hit_critical_multiplier,double_crit_chance=stats.double_crit_chance)
-            modified=effective_hit_multiplier(cc*stats.bodyshot_crit_multiplier,cd,stats.noncrit_damage_multiplier,
-                hit_critical_multiplier,double_crit_chance=stats.double_crit_chance)
-            raw*=modified/original if original else 1.
-        return raw
-    raw *= _weakpoint_noncrit_scale(stats, hit_multiplier)
-    weak_crit = stats.weakpoint_crit_chance_bonus + stats.base_crit_chance * stats.weakpoint_crit_chance_relative
-    if weak_crit != 0.0:
-        base_cc = (
-            max(stats.crit_chance + crit_chance_add, 0.0)
-            if crit_chance_add
-            else stats.crit_chance
-        )
-        base_cd = (
-            max(stats.crit_multiplier + crit_multiplier_add, 1.0)
-            if crit_multiplier_add
-            else stats.crit_multiplier
-        )
-        base_crit = effective_hit_multiplier(
-            base_cc, base_cd, stats.noncrit_damage_multiplier,
-            hit_critical_multiplier, double_crit_chance=stats.double_crit_chance,
-        )
-        boosted_crit = effective_hit_multiplier(
-            max(base_cc + weak_crit, 0.0),
-            base_cd, stats.noncrit_damage_multiplier,
-            hit_critical_multiplier, double_crit_chance=stats.double_crit_chance,
-        )
-        if base_crit > 0.0:
-            raw *= 1.0 + (boosted_crit / base_crit - 1.0)
-    return raw
+    # Apply the location to the chance before computing damage. A zero factor
+    # at the unmodified chance cannot be divided out to recover the raw shot.
+    cc = _part_crit_chance(stats, hit_multiplier > 1.0 + 1e-9, crit_chance_add)
+    return effective_hit_multiplier(cc, stats.crit_multiplier + crit_multiplier_add,
+        stats.noncrit_damage_multiplier, hit_critical_multiplier,
+        double_crit_chance=stats.double_crit_chance) * _weakpoint_noncrit_scale(stats, hit_multiplier)
 
 
 def _weapon_hit_damage_multiplier(stats: "ModdedStats", multiplier: float) -> float:
@@ -3529,13 +3618,14 @@ def damage_against(
     )
 
     per_type: dict[str, float] = {}
+    shielded = _target_is_shielded(target, defenses)
     for dtype, amount in quantized_types.items():
         if overguard > 0.0:
             value = _overguard_damage_multiplier(dtype, magnetic_stacks)
         else:
             value = _target_damage_multiplier(
                 dtype,
-                target,
+                shielded=shielded,
                 armour=armour,
                 faction_deltas=faction_deltas,
                 armour_bypass=armour_bypass,
@@ -3564,16 +3654,7 @@ def damage_against(
             damage_type: amount * _weapon_hit_damage_multiplier(stats, hit_multiplier)
             for damage_type, amount in per_type.items()
         }
-    raw = sum(per_type.values()) * effective_hit_multiplier(
-        stats.crit_chance,
-        stats.crit_multiplier,
-        stats.noncrit_damage_multiplier,
-        hit_critical_multiplier,
-        double_crit_chance=stats.double_crit_chance,
-    )
-    raw = _apply_weakpoint_folding(
-        raw, stats, hit_multiplier, hit_critical_multiplier
-    )
+    raw = sum(per_type.values()) * _location_hit_factor(stats, hit_multiplier, hit_critical_multiplier)
     return {
         "perType": per_type,
         "perHit": raw,
@@ -3657,7 +3738,9 @@ def enemy_kill_metrics(
     burst_ttk: float | None = None
     sustained_ttk: float | None = None
     effective_health: float | None = None
-    if trigger_equivalents is not None and math.isfinite(trigger_equivalents):
+    if trigger_equivalents is not None and not math.isfinite(trigger_equivalents):
+        trigger_equivalents = None
+    if trigger_equivalents is not None:
         # 首发加成：第一发多造成 bonus × 单发期望，等效少打 bonus 发；
         # 首发超杀时下限 1 发（目标存活就必须至少开一枪）。
         effective_triggers = trigger_equivalents
@@ -3701,9 +3784,7 @@ def enemy_kill_metrics(
         "ammoRequired": ammo_required,
         "burstTtkSeconds": burst_ttk,
         "sustainedTtkSeconds": sustained_ttk,
-        "killableByDirectHits": (
-            trigger_equivalents is not None and math.isfinite(trigger_equivalents)
-        ),
+        "killableByDirectHits": trigger_equivalents is not None,
         "hitLocation": location,
         "hitMultiplier": hit_multiplier,
         **hit_metadata,
@@ -3725,10 +3806,14 @@ def location_crit_chance(stats: ModdedStats, hit_location: str | None = None) ->
     the weak-point bonuses, matching ``combat_replay.enervate_hit``. A radial
     part strikes no body part.
     """
-    chance = max(float(stats.crit_chance), 0.0)
+    return _part_crit_chance(stats, _normalise_hit_location(hit_location) == 'head')
+
+
+def _part_crit_chance(stats: ModdedStats, head: bool, extra: float = 0.0) -> float:
+    chance = float(stats.crit_chance) + extra
     if stats.radial_only:
-        return chance
-    if _normalise_hit_location(hit_location) == "head":
+        return max(chance, 0.0)
+    if head:
         weak = (stats.weakpoint_crit_chance_bonus
                 + stats.base_crit_chance * stats.weakpoint_crit_chance_relative)
         return max(chance + weak, 0.0)
@@ -3752,6 +3837,19 @@ def crit_proc_probability(
     return min(chance, 1.0) * crit * (1.0 - forced)
 
 
+def _status_weights(stats: ModdedStats) -> dict[str, float]:
+    # M130: ordinary rolls read the packet's quantized composition. Weapon- or
+    # script-forced counters are submitted separately, even with no drawn weight.
+    base = stats.dot_base_damage if stats.dot_base_damage is not None else stats.total_damage
+    return quantize_damage_vector(stats.damage_types, base)
+
+
+def devourer_blocks_radiation(target) -> bool:
+    # M87 observes rejected Radiation status on this exact variant; the
+    # damage component and its contribution to the roll are still present.
+    return target.get('path') == '/Lotus/Types/Enemies/Grineer/Disruption/Avatars/DemoDevourerAvatar'
+
+
 def expected_status_procs(
     stats: ModdedStats,
     *,
@@ -3772,21 +3870,13 @@ def expected_status_procs(
     random_total = chance * shots
     if stats.continuous:
         shots = 1.0 if shots > 0 else 0.0
-    weights = {
-        dtype: max(float(amount), 0.0)
-        for dtype, amount in stats.damage_types.items()
-        if isinstance(dtype, str) and isinstance(amount, (int, float))
-    }
-    total_weight = sum(weights.values())
     result: dict[str, float] = {}
-    if random_total and total_weight:
-        result.update(
-            {
-                dtype: random_total * amount / total_weight
-                for dtype, amount in weights.items()
-                if amount
-            }
-        )
+    if random_total:
+        weights = _status_weights(stats)
+        total_weight = sum(amount for amount in weights.values() if amount > 0.)
+        if total_weight:
+            result = {dtype: random_total * amount / total_weight
+                      for dtype, amount in weights.items() if amount > 0.}
 
     # PT_ELECTROCUTION is verified by the native electric-proc adapter and raw
     # attack ForcedProcs. A zero status chance does not suppress this event.
@@ -3919,6 +4009,8 @@ def expected_dot_damage(
         target.get("shieldBypassDamageTypes"), DEFAULT_SHIELD_BYPASS_DAMAGE_TYPES
     )
     procs = expected_status_procs(stats, forced_procs=forced_procs, hit_location=location)
+    if devourer_blocks_radiation(target):
+        procs.pop('DT_RADIATION', None)
     dot_base = (
         stats.dot_base_damage
         if stats.dot_base_damage is not None
@@ -3936,14 +4028,14 @@ def expected_dot_damage(
     # average.  In the linear closed-form path the two agree exactly; the
     # split matters for the stepped windowed model and future per-tick reads.
     seed_tiers = crit_tier_seed_distribution(
-        stats.crit_chance,
+        _part_crit_chance(stats, hit_multiplier > 1.0 + 1e-9),
         stats.crit_multiplier,
         stats.noncrit_damage_multiplier,
         hit_critical_multiplier,
         double_crit_chance=stats.double_crit_chance,
     )
     crit = sum(weight * factor for weight, factor in seed_tiers)
-    weak_seed_scale = _apply_weakpoint_folding(1.0, stats, hit_multiplier, hit_critical_multiplier)
+    weak_seed_scale = _weakpoint_noncrit_scale(stats, hit_multiplier)
     # A crit-conditioned proc (Hunter Munitions) is seeded only by critical
     # hits, so its seed is E[crit multiplier | crit] at this location's crit
     # chance, not the all-hit average. The location's crit-chance bonuses are
@@ -3970,6 +4062,7 @@ def expected_dot_damage(
 
     breakdown: dict[str, dict[str, float]] = {}
     total = 0.0
+    shielded = _target_is_shielded(target, defenses)
     for dtype, coefficient in DOT_DAMAGE_COEFFICIENTS.items():
         count = procs.get(dtype, 0.0)
         if not count:
@@ -3983,7 +4076,7 @@ def expected_dot_damage(
         else:
             target_multiplier = _target_damage_multiplier(
                 interaction_type,
-                target,
+                shielded=shielded,
                 armour=armour,
                 faction_deltas=faction_deltas,
                 armour_bypass=armour_bypass,
@@ -4009,8 +4102,8 @@ def expected_dot_damage(
         # +1 accumulator per tick group (wfsim MEASUREMENTS M58, AGPL-3.0):
         # Heat/Electricity/Gas consolidate into ONE tick group sharing a single
         # +1; Slash and Toxin tick independently so every live stack carries
-        # its own.  The +1 scales with the elemental/proc-damage multipliers
-        # (it rides the M bracket of the tick formula) but not with crit/base.
+        # its own. Electric/Gas apply the own-element and target bracket
+        # after the radial minimum; their initial 1 is not status damage.
         shared_group = dtype in {"DT_FIRE", "DT_ELECTRICITY", "DT_GAS"}
         accumulator = 1.0 if shared_group else min(count, 10.0)
         accumulator_multiplier = max(float(elemental), 0.0) * proc_damage
@@ -4023,27 +4116,21 @@ def expected_dot_damage(
         landing_weak = landing_head
         landing_multiplier = (float(stats.headshot_bonus_multiplier)
                               if landing_weak else 1.0)
+        radial_scale = elemental_factor * max(float(faction_mod), 0.0) * target_multiplier
         if part_landing:
-            # M58/M100: the accumulator gets C and one faction layer; the
-            # applying hit's seed already carries the other faction layer.
-            accumulator_multiplier *= coefficient * max(float(faction_mod), 0.0) * target_multiplier
-        # Per-tier seed: each tier's procs tick at their own seed factor.
-        # The M58 +1 accumulator rides M (elemental/proc-damage), not the
-        # seed, so it is added once per tick group at the averaged tier only
-        # in the closed-form path (the stepped model re-derives it per step).
+            accumulator_multiplier = coefficient * radial_scale
+        # A radial seed is already scaled by the coefficient, but excludes
+        # the group's downstream bracket from the latest successful record.
         # Crit-conditioned procs join as their own tier group, weighted by
         # their share of this type's expected procs.
-        unit = (
-            coefficient
-            * seed_basis
-            * _proc_seed_merge_multiplier(stats, dtype, forced_procs)
-            * elemental_factor
-            * proc_damage
-            * stats.falloff_multiplier
-            * _weapon_hit_damage_multiplier(stats, hit_multiplier)
-            * target_multiplier
-            * max(float(faction_mod), 0.0) ** 2
-        )
+        unit = coefficient * seed_basis * _proc_seed_merge_multiplier(stats, dtype, forced_procs)
+        if part_landing:
+            unit = (unit * proc_damage * stats.falloff_multiplier
+                    * _weapon_hit_damage_multiplier(stats, hit_multiplier) * max(float(faction_mod), 0.0))
+        else:
+            unit = (unit * elemental_factor * proc_damage * stats.falloff_multiplier
+                    * _weapon_hit_damage_multiplier(stats, hit_multiplier) * target_multiplier
+                    * max(float(faction_mod), 0.0) ** 2)
         crit_share = 0.0
         if dtype in stats.crit_proc_chances and crit_seed_tiers:
             shots = 1.0 if stats.continuous else max(float(stats.multishot), 0.0)
@@ -4058,16 +4145,26 @@ def expected_dot_damage(
             for weight, factor in crit_seed_tiers
         ]
         per_second_by_tier = [(w, ps) for w, ps in per_second_by_tier if w > 0.0]
-        seed_per_second_no_acc = sum(weight * ps for weight, ps in per_second_by_tier)
-        per_second = (seed_per_second_no_acc + accumulator * accumulator_multiplier) * landing_multiplier
+        radial_seed = sum(weight * ps for weight, ps in per_second_by_tier)
+        seed_per_second_no_acc = radial_seed * radial_scale if part_landing else radial_seed
+        if part_landing:
+            per_second = sum(weight * max(coefficient + ps, 1.0) for weight, ps in per_second_by_tier)
+            per_second *= radial_scale * landing_multiplier
+        else:
+            per_second = (seed_per_second_no_acc + accumulator * accumulator_multiplier) * landing_multiplier
         type_duration = DOT_BASE_DURATION_SECONDS * proc_duration_scale(stats, dtype)
         damage = per_second * type_duration
         if part_landing:
             from .proc_probability import no_status_probability
             presence = 1.0 - no_status_probability(
                 stats, dtype, forced_procs, aim=1.0 if location == "head" else 0.0)
-            expected = ((seed_per_second_no_acc * count + accumulator_multiplier * presence)
-                        * landing_multiplier * type_duration)
+            # The closed form knows a single-stack group when count equals
+            # presence. Multi-stack floor expectations belong to event replay.
+            if count == presence:
+                expected = per_second * presence * type_duration
+            else:
+                expected = ((seed_per_second_no_acc * count + accumulator_multiplier * presence)
+                            * landing_multiplier * type_duration)
         else:
             expected = damage * count
         breakdown[dtype] = {
@@ -4082,7 +4179,8 @@ def expected_dot_damage(
             # 种子分层明细（供步进模型按 tier 重算 per-tick 放大器）：
             # [(weight, per_second_excl_accumulator)] per crit tier。
             "seedTiers": [
-                {"weight": weight, "perSecond": ps} for weight, ps in per_second_by_tier
+                {"weight": weight, "perSecond": ps * radial_scale if part_landing else ps}
+                for weight, ps in per_second_by_tier
             ],
             "targetMultiplier": target_multiplier,
             "perSecond": per_second,
@@ -4101,6 +4199,8 @@ def expected_dot_damage(
             # Stored seeds exclude the second landing bracket. Consumers must
             # apply the latest successful proc's landing to the entire group.
             "landingMultiplier": landing_multiplier,
+            **({"radialSeed": radial_seed, "radialLanding": radial_scale * landing_multiplier}
+               if part_landing else {}),
             "landingHead": landing_head,
             "landingWeakEligible": landing_weak,
             "seedPerSecondPerProc": seed_per_second_no_acc,
@@ -4145,8 +4245,8 @@ def expected_status_damage(
 
     The existing five DoTs remain authoritative through :func:`expected_dot_damage`.
     Blast is a delayed non-DoT hit per proc: 30% of modded base damage, unaffected
-    by elemental bonuses. Its 3x area component is exposed only as ``aoePotential``
-    and is deliberately excluded from the single-target total.
+    by elemental bonuses. Its early detonation deals 3x the original seed to
+    neighbours, exposed separately as ``aoePotential`` from the host damage.
     """
     target = target or {}
     dot = expected_dot_damage(
@@ -4201,7 +4301,7 @@ def expected_status_damage(
         else:
             target_multiplier = _target_damage_multiplier(
                 "DT_EXPLOSION",
-                target,
+                shielded=_target_is_shielded(target, defenses),
                 armour=armour,
                 faction_deltas=faction_deltas,
                 armour_bypass=armour_bypass,
@@ -4241,7 +4341,7 @@ def expected_status_damage(
             * max(float(faction_mod), 0.0) ** 2
         )
         expected = per_proc * blast_count
-        aoe_potential = expected * BLAST_AOE_MULTIPLIER
+        aoe_potential = expected * (BLAST_AOE_MULTIPLIER / BLAST_DAMAGE_COEFFICIENT)
         breakdown["DT_EXPLOSION"] = {
             "expectedProcs": blast_count,
             "coefficient": BLAST_DAMAGE_COEFFICIENT,
@@ -4386,7 +4486,7 @@ def sustained_status_damage(
     adjusted_stats = replace(
         stats,
         crit_chance=max(float(stats.crit_chance) + puncture_crit, 0.0),
-        crit_multiplier=max(float(stats.crit_multiplier) + cold_crit, 1.0),
+        crit_multiplier=float(stats.crit_multiplier) + cold_crit,
     )
     kwargs = {
         "level": level,
@@ -4462,9 +4562,9 @@ def sustained_status_damage(
             # Preserve the steady model's average-live-stack approximation:
             # a positive mean count represents a present group. The windowed
             # event kernel resolves occupancy and latest-landing correlation.
-            value = ((float(row["seedPerSecondPerProc"]) * active_procs
-                      + (float(row["accumulatorPerSecondPerAttack"]) if active_procs > 0.0 else 0.0))
-                     * float(row["landingMultiplier"]) * average_hit_multiplier)
+            value = ((float(row["radialSeed"]) * active_procs
+                      + (float(row["coefficient"]) if active_procs > 0.0 else 0.0))
+                     * float(row["radialLanding"]) * average_hit_multiplier)
         else:
             value = float(row.get("expectedDamage") or 0.0) * damage_rate
         dot_by_type[dtype] = value * damage_multiplier
@@ -4632,9 +4732,10 @@ def windowed_status_damage(
     # Refreshable Heat and part-landing Electricity/Gas share the event kernel
     # with manual replay. This preserves E[seed * latest landing], including
     # forced/independent proc sources, instead of multiplying two averages.
-    event_dots = {"DT_FIRE", "DT_ELECTRICITY", "DT_GAS"}
+    event_dots = {"DT_FIRE", "DT_ELECTRICITY", "DT_GAS", "DT_SENTIENT"}
     event_procs = expected_status_procs(stats, forced_procs=forced_procs)
-    if any(event_procs.get(d, 0.0) > 0.0 for d in event_dots) and isinstance(target, Mapping) and target.get('health'):
+    if (isinstance(target, Mapping) and target.get('health')
+            and (devourer_blocks_radiation(target) or any(event_procs.get(d, 0.0) > 0.0 for d in event_dots))):
         from .combat_replay import replay
         return replay(
             stats, target, attacks_per_second=attacks_per_second, window_seconds=window_seconds,
@@ -5669,10 +5770,19 @@ def _trigger_equivalents_to_kill(
     return pulls + to_break_shield + remaining_health / health_after_shield_damage
 
 
+def _target_is_shielded(
+    target: Mapping[str, Any],
+    defenses: Mapping[str, Any],
+) -> bool:
+    if (defenses.get("enhancements") or {}).get("shieldOverride") is not None:
+        return defenses["shield"] > 0.0
+    return bool(target.get("shield"))
+
+
 def _target_damage_multiplier(
     dtype: str,
-    target: Mapping[str, Any],
     *,
+    shielded: bool,
     armour: float,
     faction_deltas: Mapping[str, float],
     armour_bypass: frozenset[str] | set[str],
@@ -5680,7 +5790,6 @@ def _target_damage_multiplier(
 ) -> float:
     """Return target resistance/defense multiplier for one damage type."""
     value = max(0.0, 1.0 + faction_deltas.get(dtype, 0.0))
-    shielded = bool(target.get("shield"))
     hits_health = not shielded or dtype in shield_bypass
     if hits_health and armour and dtype not in armour_bypass:
         value *= 1.0 - _armour_reduction(armour)

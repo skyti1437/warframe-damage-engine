@@ -25,6 +25,7 @@ from .search_session import SESSION, session_request, memoized_search, heartbeat
 # Scored no-Riven baselines per exact inputs (see analyze_riven_request._reconstruct).
 _BASELINE_EVALUATIONS: OrderedDict = OrderedDict()
 
+from .companion import is_companion
 from .damage import (
     BASE_ELEMENTS,
     MELEE_SLOTS,
@@ -380,6 +381,7 @@ class _Card:
     trigger_specs: tuple[Mapping[str, Any], ...] = ()
     event_arcanes: tuple[tuple[Mapping[str, Any], int, Mapping[str, Any]], ...] = ()
     incarnon_choices: tuple[tuple[str, str], ...] = ()
+    special_cards: tuple[_Card, ...] = ()
 
 
 @dataclass
@@ -600,7 +602,20 @@ def _wire_lines(stats: Any, scale: float = 1.0) -> tuple[list[_RivenLine], list[
     return lines, unsupported
 
 
-def _card_from_lines(lines: Sequence[_RivenLine], *, polarity: str = "AP_ATTACK") -> _Card:
+def _physical_riven(request: Mapping[str, Any]) -> tuple[int, str]:
+    if "rivenCard" not in request:
+        return 8, "AP_ATTACK"
+    card = request["rivenCard"]
+    if not isinstance(card, Mapping) or type(card.get("rank")) is not int or not 0 <= card["rank"] <= 8:
+        raise SimulationError("rivenCard.rank must be an integer between 0 and 8")
+    if card.get("polarity") not in ("AP_ATTACK", "AP_DEFENSE", "AP_TACTIC"):
+        raise SimulationError("rivenCard requires a valid fixed polarity")
+    return card["rank"], card["polarity"]
+
+
+def _card_from_lines(
+    lines: Sequence[_RivenLine], *, polarity: str = "AP_ATTACK", rank: int = 8
+) -> _Card:
     effects = tuple(line.effect for line in lines if line.effect is not None)
     skipped = tuple(
         f"riven:{line.code}: unsupported[no-handler]"
@@ -610,10 +625,10 @@ def _card_from_lines(lines: Sequence[_RivenLine], *, polarity: str = "AP_ATTACK"
     return _Card(
         key="__riven__",
         record=None,
-        rank=8,
+        rank=rank,
         effects=effects,
         skipped=skipped,
-        drain=18,
+        drain=10 + rank,
         polarity=polarity,
         riven_lines=tuple(lines),
     )
@@ -665,11 +680,14 @@ def _mod_card(
 
 
 def _candidate_mods(
-    exports: Mapping[str, Any], weapon: Mapping[str, Any], scenario: Scenario
+    exports: Mapping[str, Any], weapon: Mapping[str, Any], scenario: Scenario, *,
+    availability_only: bool = False,
 ) -> tuple[list[_Card], int]:
     cards: list[_Card] = []
     rejected = 0
-    shells = _set_shells(exports["mods"])
+    # A set shell contributes when evaluating a build. It never affects
+    # whether _mod_card admits the member into the catalog.
+    shells = {} if availability_only else _set_shells(exports["mods"])
     reach: Mapping[str, Any] | None = None
     from .runtime_adapters import double_tap_configuration
     for mod in exports["mods"]:
@@ -700,6 +718,8 @@ def _candidate_mods(
         )
         if card is None:
             rejected += 1
+        elif availability_only:
+            return [card], rejected
         else:
             cards.append(card)
     # Reach is a comfort reservation for ordinary melee builds. Hammers
@@ -1647,6 +1667,7 @@ def _merge_passives(*cards: _Card | None) -> _Card | None:
         trigger_specs=tuple(t for c in active for t in c.trigger_specs),
         event_arcanes=tuple(r for c in active for r in c.event_arcanes),
         incarnon_choices=tuple(x for c in active for x in c.incarnon_choices),
+        special_cards=tuple(special for c in active for special in c.special_cards),
         record=None,
         rank=0,
         effects=tuple(effect for card in active for effect in card.effects),
@@ -1658,6 +1679,8 @@ def _merge_passives(*cards: _Card | None) -> _Card | None:
 
 def _effects(cards: Sequence[_Card], scenario: Scenario) -> ModEffectList:
     result = ModEffectList()
+    if cards and cards[-1].special_cards:
+        cards = [*cards[:-1], *cards[-1].special_cards, cards[-1]]
     set_counts: dict[str, int] = {}
     set_shells: dict[str, Mapping[str, Any]] = {}
     for card in cards:
@@ -1669,19 +1692,16 @@ def _effects(cards: Sequence[_Card], scenario: Scenario) -> ModEffectList:
             if card.set_shell is not None:
                 set_shells[set_id] = card.set_shell
     for card in cards:
-        current = ModEffectList(card.effects, skipped=card.skipped)
+        current = card.effects
         if card.record is not None:
             set_id = _set_key(card.record.get("modSet"))
             pieces = set_counts.get(set_id, 0)
             if pieces and card.record.get("modSetValues"):
                 multiplier = _buff_set_multiplier(card.record, pieces)
                 if multiplier != 1.0:
-                    current = ModEffectList(
-                        (with_value(effect, effect.value * multiplier) for effect in current),
-                        skipped=current.skipped,
-                    )
+                    current = (with_value(effect, effect.value * multiplier) for effect in current)
         result.extend(current)
-        result.skipped.extend(current.skipped)
+        result.skipped.extend(card.skipped)
     for set_id, pieces in set_counts.items():
         shell = set_shells.get(set_id)
         if shell is not None:
@@ -1846,6 +1866,7 @@ def _forma_summary(
     riven_index: int | None = None,
     exilus: Mapping[str, Any] | None = None,
     include_placement: bool = False,
+    fixed_exilus: bool = False,
 ) -> dict[str, Any]:
     """该配装放进容量所需的最少极化次数（不是逐张都极化）。
 
@@ -1866,18 +1887,19 @@ def _forma_summary(
     extras: list[list[tuple[int, int, int]]] = []
     kinds: list[str] = []
     gain = 0
+    matched_stance_gain = 0
     if stance and stance.get("path") and not stance.get("builtIn"):
         gain = int(stance.get("nativeCapacityGain", stance.get("capacityGain")) or 0)
-        matched = int(stance.get("matchedCapacityGain", stance.get("capacityGain")) or 0)
-        if stance.get("polarityRelation") != "matched" and matched > gain:
-            extras.append([(0, 0, 0), (1, 0, gain - matched)])
+        matched_stance_gain = int(stance.get("matchedCapacityGain", stance.get("capacityGain")) or 0)
+        if stance.get("polarityRelation") != "matched" and matched_stance_gain > gain:
+            extras.append([(0, 0, 0), (1, 0, gain - matched_stance_gain)])
             kinds.append("stance")
-    if exilus and exilus.get("polarity") and isinstance(exilus.get("rawDrain"), int):
+    if exilus and isinstance(exilus.get("rawDrain"), int):
         raw = int(exilus["rawDrain"])
         polarity = _slot_polarity(exilus.get("polarity"))
         current = _slot_drain(raw, polarity, _slot_polarity(exilus.get("slotPolarity")))
         matched = _slot_drain(raw, polarity, polarity)
-        if matched < current:
+        if not fixed_exilus and matched < current:
             extras.append([(0, 0, current), (1, 1 if polarity in _UMBRA_POLARITIES else 0, matched)])
             kinds.append("exilus")
         else:
@@ -1910,7 +1932,8 @@ def _forma_summary(
                 {"origin": item.origin, "polarity": slot,
                  "drain": _slot_drain(item.drain, item.polarity, slot)}
             )
-        summary.update(placement=placement, drain=plan["drain"], limit=60 + gain)
+        stance_delta = matched_stance_gain - gain if stance_count else 0
+        summary.update(placement=placement, drain=plan["drain"] + stance_delta, limit=60 + gain + stance_delta)
     return summary
 
 
@@ -1979,6 +2002,8 @@ def _bind_combat_inputs(stats, weapon, cards, effects, scenario, passives=None):
     built only inside the event evaluation; public stat serialization is unchanged.
     """
     from .search_combat import bind
+    if passives is not None and passives.special_cards:
+        cards = (*cards, *passives.special_cards)
     bind(stats, weapon, cards, effects, scenario, passives)
     return stats
 
@@ -2095,25 +2120,26 @@ def _score(
             # which turns shots-to-kill steps into a monotone ramp.
             single = {key: value for key, value in context.items() if key != "hardnessNodes"}
             from .search_combat import windows
-            contexts = []
+            contexts, groups = [], []
             for node in nodes:
                 scale, spread = float(node["healthScale"]), float(node.get("healthSpread") or 0.0)
                 points = (scale * (1.0 - spread), scale * (1.0 + spread)) if spread > 0 else (scale,)
                 contexts.extend(_with_health_scale(single, point) for point in points)
+                groups.append((float(node['weight']), len(points)))
             batched = windows(stats, contexts)
             values = iter(batched) if batched is not None else None
             field = {"killsPerMinute": "killsPerMinute", "windowedDps": "windowDps",
                      "windowedTotalDamage": "totalWindowDamage"}[metric]
             total = weights = 0.0
-            for node in nodes:
-                scale, spread = float(node["healthScale"]), float(node.get("healthSpread") or 0.0)
-                points = (scale * (1.0 - spread), scale * (1.0 + spread)) if spread > 0 else (scale,)
-                value = (sum(float(next(values)[field]) for _ in points) if values is not None else
-                         sum(_score(stats, metric, projectile_events, _with_health_scale(single, point))
-                             for point in points)) / len(points)
-                total += float(node["weight"]) * math.log(max(value, 1e-12))
-                weights += float(node["weight"])
-            return math.exp(total / weights)
+            any_damage = False
+            scores = ((float(row[field]) for row in values) if values is not None else
+                      (_score(stats, metric, projectile_events, ctx) for ctx in contexts))
+            for weight, count in groups:
+                value = sum(next(scores) for _ in range(count)) / count
+                any_damage |= value > 0.0
+                total += weight * math.log(max(value, 1e-12))
+                weights += weight
+            return math.exp(total / weights) if any_damage else 0.0
         target = context.get("target")
         target = target if isinstance(target, Mapping) else None
         windowed = _event_window(stats, context, score_only=True) if hasattr(stats, "_combat_inputs") else windowed_status_damage(
@@ -3772,11 +3798,23 @@ def theoretical_structure_scale(
 
 
 def riven_stat_window(
-    base: float, disposition: float, positive_count: int, negative_count: int, *, negative: bool = False
+    base: float, disposition: float, positive_count: int, negative_count: int, *,
+    negative: bool = False, rank: int = 8,
 ) -> tuple[float, float, float]:
     """(nominal, lowest roll, highest roll) of one Riven stat on this card shape."""
     nominal = abs(base * disposition * theoretical_structure_scale(positive_count, bool(negative_count), negative=negative))
+    nominal *= (rank + 1) / 9
     return nominal, nominal * RIVEN_ROLL_LOW, nominal * RIVEN_ROLL_HIGH
+
+
+def _checked_riven_window(base, disposition, positives, negatives, *, rank, code, value, negative):
+    _, low, high = riven_stat_window(
+        base, disposition, positives, negatives, negative=negative, rank=rank
+    )
+    # Preserve the tolerance for values read from the card's decimal display.
+    if value < low - 0.11 or value > high + 0.11 or (value == 0.0 and (rank == 8 or low > 0.05)):
+        raise SimulationError(f"Riven stat {code} value {value:g} is outside {low:.1f}-{high:.1f}")
+    return low, high
 
 
 def _structure_full_roll_factor() -> float:
@@ -4423,8 +4461,7 @@ def _scenario(metric: str, *, incarnon_cycle: bool = False, aiming: bool = False
 def _requested_scenario(request: Mapping[str, Any], metric: str) -> Scenario:
     """Shared public request parser for builds, manual replay and Riven analysis.
 
-    Nested explicit values win, including false/0/null. Distance remains damage
-    falloff/arming input; deferred spread is never consulted here.
+    Nested explicit values win, including false/0/null.
     """
     nested = request.get('scenario')
     if nested is not None and not isinstance(nested, Mapping):
@@ -4432,6 +4469,17 @@ def _requested_scenario(request: Mapping[str, Any], metric: str) -> Scenario:
     nested = nested or {}
     if 'conditionalStacks' in request or 'conditionalStacks' in nested:
         raise SimulationError('conditionalStacks is derived from equipped MODs and cannot be overridden')
+    supported = {'aiming', 'incarnonCycle', 'heavyAttack', 'distance', 'nearestEnemyDistance',
+                 'cloaked', 'comboTier', 'triggerPolicy', 'detonationDelaySeconds',
+                 'detonationBatchSize', 'combatState', 'modelSpread', 'headshotChance',
+                 'companionPlayerStacks'}
+    unknown = set(nested) - supported
+    if unknown:
+        raise SimulationError('scenario has unsupported fields: ' + ', '.join(sorted(unknown)))
+    if 'headshotChance' in nested:
+        chance = nested['headshotChance']
+        if isinstance(chance, bool) or not isinstance(chance, (int, float)) or not 0 <= chance <= 1:
+            raise SimulationError('scenario.headshotChance must be a number between 0 and 1')
     def value(key, default=None):
         return nested.get(key, request.get(key, default))
     def boolean(key):
@@ -4443,14 +4491,17 @@ def _requested_scenario(request: Mapping[str, Any], metric: str) -> Scenario:
         raw = value(key)
         if raw is None:
             return None
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw) or raw < 0:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= raw < math.inf:
             raise SimulationError(f'{key} must be a finite non-negative number')
-        return float(raw)
+        try:
+            return float(raw)
+        except OverflowError as exc:
+            raise SimulationError(f'{key} must be a finite non-negative number') from exc
     combo = value('comboTier', 0)
     if isinstance(combo, bool) or not isinstance(combo, int) or not 0 <= combo <= 11:
         raise SimulationError('comboTier must be an integer between 0 and 11')
-    policy = str(value('triggerPolicy', 'emergent') or 'emergent')
-    if policy not in {'emergent', 'assumed_max'}:
+    policy = value('triggerPolicy', 'emergent')
+    if not isinstance(policy, str) or policy not in {'emergent', 'assumed_max'}:
         raise SimulationError('triggerPolicy must be emergent or assumed_max')
     delay = distance('detonationDelaySeconds')
     batch = value('detonationBatchSize', 1)
@@ -4460,6 +4511,7 @@ def _requested_scenario(request: Mapping[str, Any], metric: str) -> Scenario:
         return Scenario(aiming=boolean('aiming'), incarnon_cycle=boolean('incarnonCycle'),
             heavy_attack=boolean('heavyAttack') or _scenario(metric).heavy_attack,
             distance=distance('distance'), nearest_enemy_distance=distance('nearestEnemyDistance'),
+            model_spread=boolean('modelSpread'),
             cloaked=boolean('cloaked'), combo_tier=combo, trigger_policy=policy,
             detonation_delay_seconds=delay or 0., detonation_batch_size=batch,
             combat_state=value('combatState',{}))
@@ -4474,7 +4526,8 @@ def _scenario_context(scenario: Scenario) -> dict[str, Any]:
                 nearestEnemyDistance=scenario.nearest_enemy_distance, comboTier=scenario.combo_tier,
                 detonationDelaySeconds=scenario.detonation_delay_seconds,
                 detonationBatchSize=scenario.detonation_batch_size,
-                combatState=dict(scenario.combat_state))
+                combatState=dict(scenario.combat_state),
+                **({'modelSpread': True} if scenario.model_spread else {}))
 
 
 def _default_analysis_scenario(scenario: Scenario, metric: str) -> bool:
@@ -4840,6 +4893,8 @@ def _build_payload(
         "heavyAttackDps": heavy_metrics["heavyDamage"],
         "unsupported": unsupported,
     }
+    if evaluation.scenario.model_spread:
+        result["hitProbability"] = evaluation.stats.hit_probability
     if riven is not None:
         result['riven'] = {
             'slot':evaluation.riven_index,
@@ -4895,6 +4950,7 @@ def _arcane_timeline(
     scenario: Scenario,
     metric: str,
     seconds: float,
+    exilus_card: _Card | None = None,
 ) -> dict[str, Any]:
     point_count = 41
     step = seconds / (point_count - 1)
@@ -4907,6 +4963,9 @@ def _arcane_timeline(
             records, requested_arcanes, weapon, elapsed=elapsed
         )
         passives = _merge_passives(incarnon, arcane)
+        if exilus_card is not None:
+            holder = passives or _Card("__passives__", None, 0, (), (), 0, None)
+            passives = replace(holder, special_cards=(exilus_card,))
         values = []
         for evaluation, riven in (
             (baseline, None),
@@ -4965,6 +5024,11 @@ def analyze_riven_request(
     stance: Mapping[str, Any] | None = None,
     statics_cache: dict[str, Any] | None = None,
     progress_hook: Any = None,
+    *,
+    exilus: Mapping[str, Any] | None = None,
+    exilus_card: _Card | None = None,
+    exilus_selector: Any = None,
+    benchmark_defense: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Score one wire-format Riven and return baseline/actual/optimal builds.
 
@@ -4977,7 +5041,7 @@ def analyze_riven_request(
     stance 传入与配装页同口径的架势信息；statics_cache 为按武器缓存的静态
     解算结果（基准配装/双路推荐/理论上限），组合装配、显式灵化/赋能与时间线
     请求不读不写缓存。
-    实卡可随请求附 rivenCard（满级 rank=8 和它的固定 polarity）。
+    实卡可随请求附 rivenCard（rank 0–8 和固定 polarity）。
 
     progress_hook(stage: str)：阶段边界回调（"baseline" / "calibration" /
     "actual" / "recommendation" / "optimal" / "quality" / "payload"），
@@ -4995,16 +5059,8 @@ def analyze_riven_request(
 
     if not isinstance(request, Mapping):
         raise SimulationError("riven request must be a JSON object")
-    actual_polarity = "AP_ATTACK"
+    actual_rank, actual_polarity = _physical_riven(request)
     physical_card = request.get("rivenCard")
-    if "rivenCard" in request:
-        if not isinstance(physical_card, Mapping) or (
-            type(physical_card.get("rank")) is not int or physical_card["rank"] != 8
-        ):
-            raise SimulationError("rivenCard requires a max-rank Riven (rank 8)")
-        actual_polarity = physical_card.get("polarity")
-        if actual_polarity not in ("AP_ATTACK", "AP_DEFENSE", "AP_TACTIC"):
-            raise SimulationError("rivenCard requires a valid fixed polarity")
     record_overridden = weapon_record is not None
     exports = load_exports(export_dir)
     weapon_query = str(request.get("weapon") or "").strip()
@@ -5118,7 +5174,8 @@ def analyze_riven_request(
     stance_capacity = (
         max(0, int(stance_info.get("capacityGain") or 0)) if stance_info else 0
     )
-    capacity_limit = 60 + stance_capacity
+    exilus_drain = exilus["drain"] if exilus is not None else 0
+    capacity_limit = 60 + stance_capacity - exilus_drain
     stance_multiplier = (
         float(stance_info.get("dpsMultiplier") or 1.0)
         if stance_info and not throwable
@@ -5142,9 +5199,10 @@ def analyze_riven_request(
                 state[key] = str(request[key])
         scenario = replace(scenario, combat_state=state)
         melee_schedule = build_schedule(weapon, state.get("meleeRoute"), stance=state.get("meleeStance"),
-                                        combo=state.get("meleeCombo"), target_distance=state.get("meleeTargetDistance"))
+                                        combo=state.get("meleeCombo"), target_distance=state.get("meleeTargetDistance"),
+                                        heavy_attack=scenario.heavy_attack)
         if melee_schedule:
-            route_sensitive = melee_schedule["route"] != "combo"
+            route_sensitive = scenario.heavy_attack or melee_schedule["route"] != "combo"
             melee_context = {"route": melee_schedule["route"], "label": melee_schedule.get("label"),
                              "stance": melee_schedule.get("stance"), "combo": melee_schedule.get("combo")}
             stance_multiplier = status_rate_multiplier = 1.0
@@ -5154,14 +5212,11 @@ def analyze_riven_request(
     benchmark_context: dict[str, Any] | None = None
     if isinstance(benchmark, Mapping):
         benchmark_enemy = benchmark.get("enemy") or benchmark.get("path")
-        resolved_enemy = None
-        if isinstance(benchmark_enemy, str) and benchmark_enemy.strip():
-            try:
-                resolved_enemy = resolve_record(
-                    exports.get("enemies") or (), benchmark_enemy.strip(), kind="enemy"
-                )
-            except SimulationError:
-                resolved_enemy = None
+        resolved_enemy = benchmark_defense
+        if resolved_enemy is None and isinstance(benchmark_enemy, str) and benchmark_enemy.strip():
+            resolved_enemy = resolve_record(
+                exports.get("enemies") or (), benchmark_enemy.strip(), kind="enemy"
+            )
         if resolved_enemy is not None:
             benchmark_context = {
                 "target": resolved_enemy,
@@ -5326,6 +5381,24 @@ def analyze_riven_request(
     if metric_warning:
         unsupported.append(metric_warning)
     template_bases = _template_bases(exports.get("rivenTemplates") or {}, riven_type)
+    if physical_card is not None:
+        negatives = sum(line.negative for line in actual_lines)
+        positives = len(actual_lines) - negatives
+        if positives not in (2, 3):
+            raise SimulationError("physical Riven requires two or three positive stats")
+        bases = {**RIVEN_BASE_VALUES.get(riven_type, {}), **template_bases}
+        bounded_lines = []
+        for line in actual_lines:
+            base = bases.get(line.code)
+            if not base:
+                raise SimulationError(f"Riven stat {line.code} has no valid range")
+            low, high = _checked_riven_window(
+                base, source_disposition or disposition, positives, negatives,
+                rank=actual_rank, code=line.code,
+                value=line.value / disposition_scale, negative=line.negative,
+            )
+            bounded_lines.append(replace(line, low=low * disposition_scale, high=high * disposition_scale))
+        actual_lines = bounded_lines
     template_build = str((exports.get("rivenTemplates") or {}).get("buildLabel") or RIVEN_TEMPLATE_BUILD)
     if not template_bases and exports["buildLabel"] != RIVEN_TEMPLATE_BUILD:
         unsupported.append(
@@ -5357,9 +5430,19 @@ def analyze_riven_request(
         default_heavy_state=heavy_default_state,
     )
     unsupported.extend(arcane_unsupported)
-    passives = _merge_passives(incarnon_card, arcane_card)
+    def with_exilus(card: _Card | None) -> _Card | None:
+        combined = _merge_passives(card, arcane_card)
+        if exilus_card is not None:
+            holder = combined or _Card("__passives__", None, 0, (), (), 0, None)
+            combined = replace(holder, special_cards=(exilus_card,))
+        return combined
+
+    passives = with_exilus(incarnon_card)
 
     mod_pool, rejected_mods = _candidate_mods(exports, weapon, scenario)
+    if exilus_card is not None:
+        family = _mod_family(exilus_card)
+        mod_pool = [card for card in mod_pool if _mod_family(card) != family]
 
     # 流派钳制已移除（用户确认实战就是双修混搭，只是细节不同）：全量池
     # 单次求解，词条推荐与配装均为算法最优，不再区分触发/直伤流派。
@@ -5374,8 +5457,26 @@ def analyze_riven_request(
     ranking_metric = ('windowedDps' if objective_metric == 'killsPerMinute'
                       and benchmark_context is not None and profile != 'fast'
                       else objective_metric)
+    # An explicitly disabled gauge override uses the same baked statics as the default.
+    statics_scenario = scenario
+    state = scenario.combat_state
+    if state.get("gaugeChargingHeadshots") is False:
+        state = dict(state)
+        state.pop("gaugeChargingHeadshots")
+        statics_scenario = replace(scenario, combat_state=state)
+    default_scenario = _default_analysis_scenario(statics_scenario, metric)
+    # The application's companion policy adds actor state even to a default
+    # request. Admit just that preset, retaining its state in the cache key.
+    default_companion = (
+        is_companion(weapon) and len(state) == 2
+        and state.get('companion') is True and state.get('companionPlayerStacks') is False
+        and _default_analysis_scenario(replace(scenario, combat_state={}), metric)
+    )
     cacheable = (
         statics_cache is not None
+        and exilus is None
+        and exilus_selector is None
+        and benchmark_defense is None
         and (not record_overridden or bool(request.get("_cacheDefaultInnate"))
              # A default-element Kitgun / Zaw assembly caches under its parts.
              or (bool(request.get("_cacheAssembly")) and statics_weapon != weapon_record.get("path")))
@@ -5385,7 +5486,7 @@ def analyze_riven_request(
         and request.get("arcanes") is None
         # A fixed caller preset (the Bot) may cache its own scenario; the
         # scenario then joins the cache key below.
-        and (_default_analysis_scenario(scenario, metric) or bool(request.get("_cacheScenario")))
+        and (default_scenario or default_companion or bool(request.get("_cacheScenario")))
         and timeline_seconds is None
         and not has_search_constraints
     )
@@ -5398,8 +5499,8 @@ def analyze_riven_request(
             "heavyAttack": bool(scenario.heavy_attack),
         }
     )
-    if not _default_analysis_scenario(scenario, metric):
-        _bm["scenario"] = _scenario_context(scenario)
+    if not default_scenario:
+        _bm["scenario"] = _scenario_context(statics_scenario)
     if melee_context:
         _bm["melee"] = melee_context
     if request.get("incarnonChoices") is not None and request.get("_cacheIncarnon"):
@@ -5882,7 +5983,7 @@ def analyze_riven_request(
         return floor if floor is not None and floor.score > result.score else result
 
     _progress("actual")
-    actual_card = _card_from_lines(actual_lines, polarity=actual_polarity)
+    actual_card = _card_from_lines(actual_lines, polarity=actual_polarity, rank=actual_rank)
     # A statics bake keeps only what every card of the weapon shares; the
     # trigger card's own build, floor and contributions are not part of it
     # (nothing below writes them to the statics).
@@ -5935,7 +6036,7 @@ def analyze_riven_request(
                 raise SimulationError("a baked Incarnon baseline has invalid choices")
             build = _optimize_archetype(
                 weapon, None, scenario=scenario, metric=ranking_metric,
-                passives=_merge_passives(card, arcane_card), capacity_limit=capacity_limit)
+                passives=with_exilus(card), capacity_limit=capacity_limit)
             baked[_route_key(route)] = {"mods": [mod.key for mod in build.cards], "score": build.score}
         statics["incarnonBaselines"] = baked
         statics_cache["__dirty__"] = True
@@ -6070,7 +6171,7 @@ def analyze_riven_request(
             key = tuple(sorted(route.items()))
             if key not in route_cards:
                 card, _choices, card_unsupported, _policy = _route_incarnon_card(route)
-                route_cards[key] = (_merge_passives(card, arcane_card), card_unsupported)
+                route_cards[key] = (with_exilus(card), card_unsupported)
             return route_cards[key]
 
         reuse_route_witness = (
@@ -6213,6 +6314,20 @@ def analyze_riven_request(
         if prioritize_winner:
             route_screen["defaultVerified"] = default_verified
             route_screen["scoutFallback"] = scout_fallback
+
+    if exilus_selector is not None:
+        selected_exilus, selected_card = exilus_selector(
+            weapon, actual, scenario=scenario, metric=ranking_metric,
+            passives=actual_passives, target_context=search_context,
+            capacity_limit=capacity_limit,
+        )
+        if selected_exilus is not None:
+            return analyze_riven_request(
+                export_dir, request,
+                weapon_record=weapon_record if record_overridden else None,
+                stance=stance, statics_cache=statics_cache, progress_hook=progress_hook,
+                exilus=selected_exilus, exilus_card=selected_card, benchmark_defense=benchmark_defense,
+            )
 
     # Reverse floor (ultra without a cached baseline only): the actual build
     # without its Riven, the slot refilled, is a no-Riven build too; when it
@@ -6601,7 +6716,7 @@ def analyze_riven_request(
                     continue
                 _without = _card_from_lines(
                     [item for item in actual_lines if item.code != _line.code],
-                    polarity=actual_polarity,
+                    polarity=actual_polarity, rank=actual_rank,
                 )
                 _jobs[_line.code] = _pool.submit(_parallel._score_job, (actual.cards, _without, _ctx))
             for _code, _future in _jobs.items():
@@ -6614,7 +6729,7 @@ def analyze_riven_request(
         elif reoptimized_contributions:
             without = _card_from_lines(
                 [item for item in actual_lines if item.code != line.code],
-                polarity=actual_polarity,
+                polarity=actual_polarity, rank=actual_rank,
             )
             removed = _best_fixed(
                 weapon,
@@ -6654,7 +6769,7 @@ def analyze_riven_request(
         #   子集重优化删掉其他 MOD 而显示巨大「贡献」。
         without_line = _card_from_lines(
             [item for item in actual_lines if item.code != line.code],
-            polarity=actual_polarity,
+            polarity=actual_polarity, rank=actual_rank,
         )
         if line.code in ablation_scores:
             ablated_score = ablation_scores[line.code]
@@ -6933,6 +7048,7 @@ def analyze_riven_request(
             scenario=scenario,
             metric=objective_metric,
             seconds=timeline_seconds,
+            exilus_card=exilus_card,
         )
         skipped.append(
             "arcane timeline is an expected DPS envelope, not an enemy hit/status event replay"
@@ -6951,8 +7067,13 @@ def analyze_riven_request(
         payload["forma"] = _forma_summary(
             weapon, evaluation.cards, riven_card, stance_info,
             riven_index=evaluation.riven_index,
-            include_placement=physical_card is not None and riven_card is not None,
+            exilus=exilus,
+            include_placement=exilus is not None or (physical_card is not None and riven_card is not None),
+            fixed_exilus=True,
         )
+        if exilus is not None:
+            payload.update(exilus=dict(exilus), capacity=payload["forma"]["drain"],
+                           capacityLimit=payload["forma"]["limit"])
         # 解算目标的原始分数（KPM 口径下即标准靶每分钟击杀数）：前端头条
         # 直接读取，不再从提升百分比反推。
         payload["objectiveScore"] = _score(evaluation.stats, objective_metric,
@@ -7069,6 +7190,8 @@ def analyze_riven_request(
     }
     if timeline is not None:
         result["timeline"] = timeline
+    if exilus is not None:
+        result["exilus"] = dict(exilus)
     if source_disposition is not None:
         result["projection"] = {
             "sourceDisposition": source_disposition,

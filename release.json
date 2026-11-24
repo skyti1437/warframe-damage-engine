@@ -3,16 +3,17 @@
     "darwin-arm64": {
       "name": "portable-runtime-mac-arm64.zip",
       "python": "3.12",
-      "sha256": "740041313e02c6bb728c066c9a1a84a6c7d7697da766afab5f40adb783aa5e87",
-      "size": 1321736
+      "sha256": "c37bd92cd26dc54d4736c20e3439aee61540eb6105d2aa205512c0e9c6b8cc1f",
+      "size": 2369576
     },
     "linux-x86_64": {
       "name": "portable-runtime-linux-x86_64.zip",
       "python": "3.12",
-      "sha256": "1a527d2bddf6f854112e8af49dc6b100504a3cb57ff908e4fdbf375b781c2bf4",
-      "size": 1390705
+      "sha256": "daf8eed28cc8b3b6668222c9d9cce71b65f23d5e0f63841a589d46970a07d361",
+      "size": 2465818
     }
   },
-  "tag": "portable-85ec9cdb3461c01c",
-  "upstream": "44096ddfbc50470656f5b13b6a0b45e9c24d93c7"
+  "engineFingerprint": "535ed49f5a51149d",
+  "tag": "portable-535ed49f5a51149d",
+  "upstream": "d62e4ae56387e241d512dcf9176f3bfd3d426de7"
 }

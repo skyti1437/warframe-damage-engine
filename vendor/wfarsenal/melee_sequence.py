@@ -209,20 +209,22 @@ _SCHEDULES_MAX = 256
 
 
 def build_schedule(weapon: Mapping[str, Any], route: str | None = None, *, stance: str | None = None,
-                   combo: str | None = None, target_distance: float | None = None) -> dict[str, Any] | None:
+                   combo: str | None = None, target_distance: float | None = None,
+                   heavy_attack: bool = False) -> dict[str, Any] | None:
     """The hit loop of one melee route, or None when the weapon has no data."""
-    key = (record_key(weapon), route, stance, combo, repr(target_distance))
+    key = (record_key(weapon), route, stance, combo, repr(target_distance), heavy_attack)
     hit = _SCHEDULES.get(key)
     if hit is not None:
         return hit[1]
-    schedule = _build_schedule(weapon, route, stance=stance, combo=combo, target_distance=target_distance)
+    schedule = _build_schedule(weapon, route, stance=stance, combo=combo,
+                               target_distance=target_distance, heavy_attack=heavy_attack)
     if len(_SCHEDULES) >= _SCHEDULES_MAX:
         _SCHEDULES.clear()
     _SCHEDULES[key] = (pin(weapon), schedule)
     return schedule
 
 
-def _build_schedule(weapon, route, *, stance, combo, target_distance):
+def _build_schedule(weapon, route, *, stance, combo, target_distance, heavy_attack):
     ref = reference()
     row = weapon_row(weapon)
     if not row:
@@ -257,6 +259,30 @@ def _build_schedule(weapon, route, *, stance, combo, target_distance):
     common = dict(stance=tree_path, notes=notes, comboSpec=row.get("combo") or {},
                   meleeCrit=(melee_damage.get("crit"), melee_damage.get("critMultiplier")))
     if route == "combo":
+        if heavy_attack:
+            # Heavy strings come from the weapon's attack set. Each charged
+            # attack spends combo once, even when its animation lands multiple hits.
+            heavy_path = (weapon.get("heavyAttack") or {}).get("meleeTree") or row.get("tree")
+            heavy_tree = (ref.get("trees") or {}).get(heavy_path) or tree or {}
+            paths = (heavy_tree.get("contexts") or {}).get("CC_GROUND_HEAVY") or ()
+            charge, guessed = class_charge_time(ref, row)
+            segments = []
+            for path in paths:
+                if path not in attacks:
+                    continue
+                strike = _combo_segments([attacks[path]], slams)
+                hits = [part["hit"] for part in strike if part["hit"]]
+                for hit in hits:
+                    hit.update(heavy=True, comboMultiplier=True, comboHits=0.0)
+                hits[-1]["consumesCombo"] = True
+                segments.extend([dict(fixed=charge, anim=0.0, hit=None, chargeScaled=True), *strike])
+            if segments:
+                if guessed:
+                    notes.append("heavy-wind-up-from-class")
+                return dict(common, route=route, segments=segments, label="heavy-attack", combo="CC_GROUND_HEAVY")
+            # The reducer can still replay the exported heavy components on
+            # weapons that have no extracted heavy animation.
+            return None
         if tree is None:
             return None
         options = []
@@ -513,6 +539,9 @@ def route_note(schedule: Mapping[str, Any], stance_name: str | None = None) -> s
     route = schedule.get("route")
     hits = [s["hit"] for s in schedule.get("segments") or () if s.get("hit")]
     seconds = sum(s["fixed"] + s["anim"] for s in schedule.get("segments") or ())
+    if schedule.get("label") == "heavy-attack":
+        return (f"攻击路线：重击连段（{len(hits)} 击，1.0 攻速下 {seconds:.2f} 秒一轮），"
+                "逐次计算重击蓄力、连击倍率和消耗")
     if route == "combo":
         stance = stance_name or str(schedule.get("stance") or "").rsplit("/", 1)[-1] or "无架势"
         return (f"攻击路线：轻击连段（{stance} · {_COMBO_NAMES.get(schedule.get('combo'), schedule.get('combo'))}连段，"

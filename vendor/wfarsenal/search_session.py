@@ -35,6 +35,8 @@ def check_cancelled():
 # the engine between two evaluations: the HTTP layer sets the hook, which
 # hands the engine over and takes it back.
 YIELD = ContextVar('search_yield', default=None)
+# An offline worker can drain sampled native inputs at existing progress beats.
+BAKE_PROGRESS = ContextVar('bake_progress', default=None)
 
 
 def session_request(fn):
@@ -43,11 +45,13 @@ def session_request(fn):
         request = args[1] if len(args) > 1 else kwargs['request']
         if not isinstance(request, Mapping):
             return fn(*args, **kwargs)  # Preserve the engine's input error.
+        if SESSION.get() is not None:
+            return fn(*args, **kwargs)
         if request.get('_bakeStaticsOnly'):
             # A bake has no interactive budget (its statics must not depend on
             # the machine's load) but shares the request's search memo.
             token = SESSION.set(dict(start=time.monotonic(), deadline=float('inf'), phaseSeconds=float('inf'),
-                                     stage='baseline', hook=None, evaluations=0, memoHits=0, memo=OrderedDict(),
+                                     stage='baseline', hook=BAKE_PROGRESS.get(), evaluations=0, memoHits=0, memo=OrderedDict(),
                                      searches=OrderedDict(), limited=0, lastBeat=0.))
             try:
                 result = fn(*args, **kwargs)
@@ -59,13 +63,13 @@ def session_request(fn):
             finally:
                 SESSION.reset(token)
         profile = str(request.get('profile') or 'standard').strip().casefold()
-        budget = {'fast':45., 'standard':90., 'deep':240., 'ultra':35.}.get(profile,90.)
         remaining = request.get('_searchBudgetSeconds')
+        budget = float('inf')
         if remaining is not None:
             if (isinstance(remaining, bool) or not isinstance(remaining, (int, float))
                     or not math.isfinite(remaining) or remaining <= 0.):
                 raise ValueError('_searchBudgetSeconds must be a finite positive number')
-            budget = min(budget, remaining)
+            budget = min({'fast':45., 'standard':90., 'deep':240., 'ultra':35.}.get(profile,90.), remaining)
         start = time.monotonic()
         state = dict(start=start, deadline=start + budget,
                      phaseSeconds={'fast':8.,'standard':15.,'deep':45.,'ultra':5.}.get(profile,15.),
@@ -78,7 +82,7 @@ def session_request(fn):
             result['searchWork'] = {key: state[key] for key in ('evaluations','memoHits','limited')}
             result['searchWork']['negative'] = dict(state.get('negativeWork') or {})
             result['searchWork'].update(elapsedSeconds=time.monotonic()-state['start'],
-                budgetSeconds=state['deadline']-state['start'],
+                budgetSeconds=budget if math.isfinite(budget) else None,
                 status='heuristic-budget-limited' if state['limited'] else 'heuristic-best-found')
             result['searchStatus']['work'] = result['searchWork']
             if state['limited']:
@@ -150,7 +154,7 @@ def phase_deadline(phase_seconds=None):
     state = SESSION.get()
     if UNBOUNDED:
         return float('inf')
-    if state is None:
+    if state is None or not math.isfinite(state['deadline']):
         return float('inf')
     allowance = state['phaseSeconds'] if phase_seconds is None else phase_seconds
     return min(state['deadline'], time.monotonic() + allowance)

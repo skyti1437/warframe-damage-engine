@@ -676,6 +676,8 @@ def _stances_fingerprint() -> str:
 
 def _analysis_inputs_fingerprint() -> str:
     from wfarsenal.cache_identity import score_source_bytes
+    from wfarsenal import mods_native, native_replay, status_native
+    from wfarsenal.portable_score_identity import portable_score_fingerprint
 
     digest = hashlib.sha1()
     digest.update(
@@ -708,6 +710,7 @@ def _analysis_inputs_fingerprint() -> str:
         ROOT / "data" / "source-lock.json",
         ROOT / "data" / "wiki_weapon_overrides.json",
         ROOT / "data" / "mechanics" / "combat-reference.json",
+        ROOT / "data" / "mechanics" / "deferred-spread-profiles.json",
         ROOT / "data" / "mechanics" / "sniper-mechanics.json",
         ROOT / "data" / "mechanics" / "melee-mechanics.json",
         ROOT / "data" / "mechanics" / "riven-disposition.json",
@@ -731,8 +734,16 @@ def _analysis_inputs_fingerprint() -> str:
         # by the static optimizer candidate set yet, so changing its notes
         # must not invalidate an otherwise identical baked static cache.
         STANCE_DATA_PATH,
+        UTILITY_MOD_DATA_PATH,
+        EXALTED_WEAPON_DATA_PATH,
+        WARFRAME_DATA_PATH,
         Path(optimizer.__file__),
+        Path(optimizer.__file__).with_name('cache_identity.py'),
+        Path(optimizer.__file__).with_name('record_keys.py'),
+        Path(optimizer.__file__).with_name('incarnon_conditions.py'),
+        Path(optimizer.__file__).with_name('exalted.py'),
         Path(optimizer.__file__).with_name("damage.py"),
+        Path(optimizer.__file__).with_name("deferred_spread.py"),
         Path(optimizer.__file__).with_name("simulator.py"),
         Path(optimizer.__file__).with_name("catalog_releases.py"),
         Path(optimizer.__file__).with_name("projectile_events.py"),
@@ -744,6 +755,8 @@ def _analysis_inputs_fingerprint() -> str:
         Path(optimizer.__file__).with_name("mods_native.py"),
         Path(optimizer.__file__).with_name("status_native.py"),
         Path(optimizer.__file__).with_name("proc_probability.py"),
+        Path(optimizer.__file__).with_name("magnetic_break.py"),
+        Path(optimizer.__file__).with_name("magnetic_weapon_sources.py"),
         Path(optimizer.__file__).with_name("beam_ramp.py"),
         Path(optimizer.__file__).with_name("manual_combat.py"),
         Path(optimizer.__file__).with_name("delayed_radial_events.py"),
@@ -786,7 +799,27 @@ def _analysis_inputs_fingerprint() -> str:
             raise SimulationError(
                 f"analysis input dependency unreadable: {path}"
             ) from None
-    return digest.hexdigest()[:16]
+    # Use the loaded extension's source identity across platforms.
+    adapters = (native_replay, mods_native, status_native)
+    enabled = tuple(bool(adapter.ENABLED) for adapter in adapters)
+    digest.update(b'\0score-native-runtime\0' + bytes(enabled))
+    if enabled[0]:
+        digest.update(bytes((bool(native_replay.HEALTH_BATCH),)))
+    for adapter, active in zip(adapters, enabled):
+        if active:
+            source_sha = getattr(adapter.wfcore, "SOURCE_SHA256", None)
+            if isinstance(source_sha, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha):
+                digest.update(b"\0wfcore-source-sha256\0" + source_sha.encode("utf-8"))
+            elif source_sha is None:
+                path = Path(adapter.wfcore.__file__)
+                try:
+                    digest.update(hashlib.sha256(path.read_bytes()).digest())
+                except OSError:
+                    raise SimulationError(f"analysis native core unreadable: {path}") from None
+            else:
+                raise SimulationError("analysis native core SOURCE_SHA256 is invalid")
+            break  # All three adapters import the same wfarsenal.wfcore module.
+    return portable_score_fingerprint(digest.hexdigest())
 
 
 def _read_analysis_statics_cache(path: Path, inputs_fingerprint: str) -> dict[str, Any]:
@@ -806,11 +839,12 @@ def _read_analysis_statics_cache(path: Path, inputs_fingerprint: str) -> dict[st
     return dict(entries) if isinstance(entries, dict) else {}
 
 
-def _load_analysis_statics_cache() -> dict[str, Any]:
-    try:
-        inputs_fingerprint = _analysis_inputs_fingerprint()
-    except SimulationError:
-        return {}
+def _load_analysis_statics_cache(inputs_fingerprint: str | None = None) -> dict[str, Any]:
+    if inputs_fingerprint is None:
+        try:
+            inputs_fingerprint = _analysis_inputs_fingerprint()
+        except SimulationError:
+            return {}
     entries = (_read_analysis_statics_cache(BUNDLED_ANALYSIS_STATICS_CACHE_PATH, inputs_fingerprint)
                if getattr(sys, "frozen", False) else {})
     # A valid local update wins; an old or partial local cache cannot hide
@@ -823,7 +857,8 @@ try:
     ANALYSIS_STATICS_RUNTIME_INPUTS = _analysis_inputs_fingerprint()
 except SimulationError:
     ANALYSIS_STATICS_RUNTIME_INPUTS = None
-ANALYSIS_STATICS_CACHE: dict[str, Any] = _load_analysis_statics_cache()
+ENGINE_FINGERPRINT = ANALYSIS_STATICS_RUNTIME_INPUTS
+ANALYSIS_STATICS_CACHE: dict[str, Any] = _load_analysis_statics_cache(ANALYSIS_STATICS_RUNTIME_INPUTS) if ANALYSIS_STATICS_RUNTIME_INPUTS else {}
 try:
     ANALYSIS_STATICS_CACHE_MTIME_NS = ANALYSIS_STATICS_CACHE_PATH.stat().st_mtime_ns
 except OSError:
@@ -839,7 +874,12 @@ def _refresh_analysis_statics_cache_if_newer() -> None:
         return
     if mtime <= ANALYSIS_STATICS_CACHE_MTIME_NS:
         return
-    loaded = _load_analysis_statics_cache()
+    try:
+        if _analysis_inputs_fingerprint() != ANALYSIS_STATICS_RUNTIME_INPUTS:
+            return  # The loaded engine cannot use a new on-disk runtime's entries.
+    except SimulationError:
+        return
+    loaded = _load_analysis_statics_cache(ANALYSIS_STATICS_RUNTIME_INPUTS)
     ANALYSIS_STATICS_CACHE_MTIME_NS = mtime
     if loaded:
         ANALYSIS_STATICS_CACHE.clear()
@@ -872,7 +912,7 @@ def _persist_analysis_statics_cache() -> None:
         # A running preview may still hold code from before a workspace update.
         # It cannot label those in-memory results with the new on-disk engine.
         return
-    disk_entries = _load_analysis_statics_cache()
+    disk_entries = _load_analysis_statics_cache(inputs_fingerprint)
     disk_entries.update({key:value for key,value in ANALYSIS_STATICS_CACHE.items()
                          if isinstance(value,dict)})
     ANALYSIS_STATICS_CACHE.update(disk_entries)
@@ -1196,7 +1236,10 @@ def _finish_analysis_progress(token: str, error: str | None = None) -> None:
 def _finite_positive(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
     return number if math.isfinite(number) and number > 0 else None
 
 
@@ -1684,6 +1727,7 @@ def _weapon_build_issue(weapon: Mapping[str, Any], weapon_type: str) -> str | No
             optimizer._scenario(
                 "attackDps" if weapon_type in {"melee", "zaw"} else "sustainedDps"
             ),
+            availability_only=True,
         )
     except (SimulationError, TypeError, ValueError) as exc:
         return str(exc)
@@ -1902,14 +1946,14 @@ def _resolve_stance(
     }
 
 
-def _analysis_stance(weapon: Mapping[str, Any], weapon_type: str) -> dict[str, Any] | None:
+def _analysis_stance(weapon: Mapping[str, Any], weapon_type: str, requested_path=None) -> dict[str, Any] | None:
     """紫卡分析的近战架势：与配装页同口径，默认普攻 DPS 倍率最高的架势。
 
     分析按无限极化口径解算——架势槽视为已极化匹配（容量收益取匹配值），
     原生极性不匹配时由引擎的极化统计计入「极化 ×N」结果。显赫武器的内置
     架势容量收益恒为 0。
     """
-    stance = _resolve_stance(weapon, weapon_type)
+    stance = _resolve_stance(weapon, weapon_type, requested_path)
     if stance is None:
         return None
     if stance.get("builtIn"):
@@ -1978,6 +2022,24 @@ def _utility_model_gaps(row: Mapping[str, Any] | None) -> list[str]:
     return []
 
 
+def _exilus_at_rank(row, rank, slot_polarity):
+    max_rank = int(row.get("rank") if row.get("rank") is not None else row.get("maxRank") or 0)
+    rank = _manual_int(max_rank if rank is None else rank, "exilus.rank", high=max_rank)
+    raw_drain = int(row.get("drain") or 0) - max_rank + rank
+    drain, relation = _polarity_adjusted_drain(raw_drain, row.get("polarity"), slot_polarity)
+    return {**row, "rank": rank, "rawDrain": raw_drain, "drain": drain,
+            "slotPolarity": slot_polarity, "polarityRelation": relation}
+
+
+def _exilus_row(raw):
+    if not isinstance(raw, Mapping):
+        raise SimulationError("exilus must be an object when supplied")
+    path = raw.get("path") or raw.get("query")
+    if not isinstance(path, str) or path not in UTILITY_MODS_BY_PATH:
+        raise SimulationError("exilus must use a supported utility MOD path")
+    return UTILITY_MODS_BY_PATH[path]
+
+
 def _score_with_special_card(
     weapon: Mapping[str, Any],
     evaluation: optimizer._Evaluation,
@@ -2022,6 +2084,7 @@ def _auto_exilus(
     slot_polarity = _special_slot_polarities(
         weapon, catalog_weapon["weaponType"]
     )["exilus"]
+    equipped_families = {optimizer._mod_family(card) for card in evaluation.cards}
     choices = []
     for row in CATALOG_UTILITY_MODS:
         if not _utility_matches_weapon(row, weapon, catalog_weapon):
@@ -2033,6 +2096,8 @@ def _auto_exilus(
             if evaluation.capacity + drain > capacity_limit:
                 continue
             card = _utility_card_at_rank(row, scenario, rank)
+            if card is not None and optimizer._mod_family(card) in equipped_families:
+                continue
             score, stats, derived_scenario = _score_with_special_card(
                 weapon,
                 evaluation,
@@ -2063,13 +2128,7 @@ def _auto_exilus(
             capacity=evaluation.capacity + drain,
             scenario=derived_scenario,
         ),
-        {
-            **row,
-            "rank": rank,
-            "drain": drain,
-            "slotPolarity": slot_polarity,
-            "polarityRelation": relation,
-        },
+        _exilus_at_rank(row, rank, slot_polarity),
     )
 
 
@@ -2912,8 +2971,10 @@ _ARCANE_CONDITION_NOTES = {
     '/Lotus/Upgrades/CosmeticEnhancers/Offensive/HeavyAttackDamageAndShieldOnShieldBreak':
         '只作用于重击；护盾被击破跟随上方「自身护盾击破类效果强制生效」。',
 }
+_PRIMARY_DEBILITATE = '/Lotus/Upgrades/CosmeticEnhancers/Offensive/SplitStatusProcsOnStackedStatusHit'
 # Cards kept in the list whose effect cannot reach a single-target replay.
 _ARCANE_UNMODELLED_NOTES = {
+    _PRIMARY_DEBILITATE: '复合异常达到 10 层且本次命中包含该异常时才可拆分；同一子包内相同基础异常只施加一次，子包按身体命中处理。尚未确认每次攻击的实际回调次数与包内异常的联合分布，单目标不计入评分。',
     '/Lotus/Upgrades/CosmeticEnhancers/Offensive/RadialDamageOnMaxRadiationStackHit': '伤害只溅射给周围其他敌人，单目标解算中不计。',
     '/Lotus/Upgrades/CosmeticEnhancers/Offensive/HeavyCritOnRegularMelee': '普通攻击叠层、重击消耗；解算未建模这段叠层，暂不计算。',
     '/Lotus/Upgrades/CosmeticEnhancers/Offensive/PermaComboOnFinisher': '只在处决击杀时增加初始连击，解算中没有处决。',
@@ -2966,7 +3027,9 @@ def _manual_arcane_rows() -> list[dict[str, Any]]:
         support = arcane.get("support") if isinstance(arcane.get("support"), Mapping) else {}
         from wfarsenal.status_arcanes import configuration as status_configuration
         status_spec = status_configuration(arcane, int(arcane.get('maxRank') or 0))
-        if not arcane.get('path') or (not status_spec and (not support.get('manualState') or not int(support.get('weaponEffects') or 0))):
+        path = arcane.get('path')
+        score_excluded = path == _PRIMARY_DEBILITATE
+        if not path or (not score_excluded and not status_spec and (not support.get('manualState') or not int(support.get('weaponEffects') or 0))):
             continue
         trigger = arcane.get("trigger") if isinstance(arcane.get("trigger"), Mapping) else {}
         from wfarsenal.enervate import configuration
@@ -3029,6 +3092,7 @@ def _manual_arcane_rows() -> list[dict[str, Any]]:
             "iconAsset": f"/assets/arcanes/{Path(icon).name}" if icon else None,
             "compatibility": compatibility,
             "slotKind": slot_kind,
+            "scoreExcluded": score_excluded,
             "equipmentType": arcane.get("equipmentType"),
             "compatibilityTags": list(arcane.get("compatibilityTags") or ()),
             "incompatibilityTags": list(arcane.get("incompatibilityTags") or ()),
@@ -3298,6 +3362,8 @@ def analyze_payload(payload: Any) -> dict[str, Any]:
     weapon = CATALOG_WEAPONS_BY_PATH.get(weapon_path.strip())
     if weapon is None:
         raise SimulationError("weapon is not in the portable Riven catalog")
+    if is_companion(weapon):
+        optimizer._requested_scenario(request, "killsPerMinute")
     request = dict(companion_payload(request, weapon))
     selected_catalog_weapon, innate_selection = _innate_element_selection(request, weapon)
     # 组合枪/组合近战：带齐部件时按装配后的记录分析（与配装路由同口径），
@@ -3327,7 +3393,7 @@ def analyze_payload(payload: Any) -> dict[str, Any]:
                           if request.get("sourceDisposition") is not None else disposition)
     if source_disposition is None or source_disposition > 2:
         raise SimulationError("source disposition must be finite and between 0 and 2")
-    disposition_scale = disposition / source_disposition
+    actual_rank, _ = optimizer._physical_riven(request)
     raw_stats = request.get("stats")
     if not isinstance(raw_stats, list) or not 2 <= len(raw_stats) <= 4:
         raise SimulationError("portable Riven input requires 2 to 4 stat objects")
@@ -3378,24 +3444,17 @@ def analyze_payload(payload: Any) -> dict[str, Any]:
     for raw in raw_stats:
         code = str(raw.get("code") or "").strip().upper()
         base = _finite_positive(bases.get(code))
-        value = _finite_positive(raw.get("value"))
-        if base is None or value is None:
+        if base is None:
             raise SimulationError(f"Riven stat {code or '?'} has no valid portable range")
+        value = _manual_number(raw.get("value"), f"Riven stat {code} value", low=0.0)
         negative = raw.get("negative") is True
         if code not in allowed[negative]:
             raise SimulationError(f"Riven stat {code} is not allowed for this weapon")
-        _nominal, low, high = optimizer.riven_stat_window(
-            base, source_disposition, positive_count, negative_count, negative=negative
+        low, high = optimizer._checked_riven_window(
+            base, source_disposition, positive_count, negative_count,
+            rank=actual_rank, code=code, value=value, negative=negative,
         )
-        # The game shows one decimal: a displayed max roll may read 0.05 above.
-        if value < low - 0.11 or value > high + 0.11:
-            raise SimulationError(
-                f"Riven stat {code} value {value:g} is outside {low:.1f}-{high:.1f}"
-            )
-        stat = {**raw, "code": code, "low": low, "high": high}
-        if disposition_scale != 1.0:
-            stat.update(value=value * disposition_scale, low=low * disposition_scale, high=high * disposition_scale)
-        normalized_stats.append(stat)
+        normalized_stats.append({**raw, "code": code, "value": value, "low": low, "high": high})
     engine_request = {
         **request,
         "weapon": weapon["path"],
@@ -3427,23 +3486,11 @@ def analyze_payload(payload: Any) -> dict[str, Any]:
     ):
         engine_request["_cacheAssembly"] = True
     engine_request.pop("sourceWeapon", None)
-    engine_request.pop("sourceDisposition", None)
     engine_request.pop("kitgunParts", None)
     engine_request.pop("progressToken", None)  # HTTP 进度令牌不进引擎层
-    # 标准配装靶：见 _BENCHMARK_ENEMY_PATH 处说明（去超宏、按武器固定血量倍率）。
-    if not isinstance(engine_request.get("benchmarkTarget"), Mapping):
-        engine_request["benchmarkTarget"] = {
-            "enemy": _BENCHMARK_ENEMY_PATH,
-            "level": _BENCHMARK_LEVEL,
-            "steelPath": True,
-            "eximus": False,
-            "enemyEnhancements": dict(_BENCHMARK_ENHANCEMENTS),
-            "windowSeconds": 30.0,
-            "armourStrip": 0.0,
-            "headshotChance": _manual_number(
-                request.get("headshotChance", 0.0), "headshotChance", low=0.0, high=1.0
-            ),
-        }
+    if "scenario" in request:
+        engine_request["scenario"] = _loadout_target_fields(request)["scenario"]
+    engine_request["benchmarkTarget"], benchmark_defense = _analysis_benchmark(request)
     assembled_record = None
     analysis_record = None
     if assembly_ready:
@@ -3466,16 +3513,64 @@ def analyze_payload(payload: Any) -> dict[str, Any]:
     if assembled_record is not None and innate_selection is not None:
         assembled_record = {**assembled_record, "innateElements": [innate_selection]}
         analysis_record = assembled_record
+    special_override = request.get("specialSlotPolarities") is not None
+    if special_override:
+        analysis_record = _special_slot_override(request, analysis_record, weapon["weaponType"])
     # 近战/组合近战：架势参与解算（与配装页同口径，默认普攻 DPS 倍率最高的
     # 架势，容量收益计入）；枪械/组合枪无架势。
     analysis_stance = None
     if weapon["weaponType"] in {"melee", "zaw"}:
-        stance_record = assembled_record
+        stance_record = analysis_record if special_override else assembled_record
         if stance_record is None:
             stance_record = optimizer.resolve_record(
                 EXPORTS["weapons"], weapon["path"], kind="weapon"
             )
-        analysis_stance = _analysis_stance(stance_record, weapon["weaponType"])
+        analysis_stance = _analysis_stance(stance_record, weapon["weaponType"], request.get("stancePath"))
+    exilus_raw = request.get("exilus")
+    exilus = None
+    auto_exilus = False
+    if exilus_raw is not None:
+        if not isinstance(exilus_raw, Mapping):
+            raise SimulationError("exilus must be an object when supplied")
+        mode = exilus_raw.get("mode", "fixed")
+        if mode == "auto":
+            if set(exilus_raw) != {"mode"}:
+                raise SimulationError("auto exilus accepts only mode")
+            auto_exilus = True
+        elif mode == "fixed":
+            row = _exilus_row(exilus_raw)
+            if not _utility_matches_weapon(row, analysis_record, weapon):
+                raise SimulationError("exilus MOD is incompatible with this weapon")
+            slot = _special_slot_polarities(analysis_record, weapon["weaponType"])["exilus"]
+            exilus = _exilus_at_rank(row, exilus_raw.get("rank"), slot)
+        else:
+            raise SimulationError("exilus.mode must be fixed or auto")
+
+    def select_exilus(selected_weapon, evaluation, **options):
+        score, _, _ = _score_with_special_card(selected_weapon, evaluation, None, **{
+            key: options[key] for key in ("scenario", "metric", "passives", "target_context")
+        })
+        evaluation = replace(evaluation, score=score)
+        _, selected = _auto_exilus(selected_weapon, weapon, evaluation, **options)
+        if selected is None:
+            return None, None
+        return selected, _utility_card_at_rank(selected, options["scenario"], selected["rank"])
+
+    def solve_analysis(**options):
+        if benchmark_defense is not None:
+            options["benchmark_defense"] = benchmark_defense
+        if exilus is not None:
+            scenario = optimizer._requested_scenario(engine_request, "killsPerMinute")
+            options.update(exilus=exilus, exilus_card=_utility_card_at_rank(exilus, scenario, exilus["rank"]))
+        return optimizer.analyze_riven_request(
+            EXPORT_DIR,
+            engine_request,
+            weapon_record=analysis_record if innate_selection is not None or special_override else assembled_record,
+            stance=analysis_stance,
+            statics_cache=ANALYSIS_STATICS_CACHE,
+            progress_hook=_stage_hook,
+            **options,
+        )
     # 进度令牌：前端在 payload 里声明 progressToken 时注册进度心跳，
     # analyze_riven_request 的阶段边界回调更新注册表，前端轮询读取。
     progress_token = _progress_token_for(payload)
@@ -3499,14 +3594,9 @@ def analyze_payload(payload: Any) -> dict[str, Any]:
                 result = deepcopy(cached_result)
                 result['responseCache'] = 'exact-request-hit'
             else:
-                result = optimizer.analyze_riven_request(
-                    EXPORT_DIR,
-                    engine_request,
-                    weapon_record=analysis_record if innate_selection is not None else assembled_record,
-                    stance=analysis_stance,
-                    statics_cache=ANALYSIS_STATICS_CACHE,
-                    progress_hook=_stage_hook,
-                )
+                result = solve_analysis(**({"exilus_selector": select_exilus} if auto_exilus else {}))
+                if exilus_raw is not None:
+                    result.setdefault("exilus", None)
                 _persist_analysis_statics_cache()
                 if not request.get('_bakeStaticsOnly') and not (result.get('searchWork') or {}).get('limited'):
                     _ANALYSIS_RESULTS[result_key] = deepcopy(result)
@@ -3640,6 +3730,48 @@ def _scenario_input(payload: Mapping[str, Any], key: str, default=None):
     return nested.get(key, payload.get(key, default)) if isinstance(nested, Mapping) else payload.get(key, default)
 
 
+def _loadout_target_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Use the same public target fields for build, analysis and trait scoring."""
+    request = dict(payload)
+    target = request.pop("benchmarkTarget", None)
+    if target is not None and not isinstance(target, Mapping):
+        raise SimulationError("benchmarkTarget must be an object")
+    target = target or {}
+    if "path" in target and "enemy" not in target:
+        request["enemy"] = target["path"]
+    scenario = request.get("scenario")
+    scenario = dict(scenario) if isinstance(scenario, Mapping) else {}
+    for key in ("headshotChance", "eximus", "archimedea", "empowered",
+                "playerCount", "magneticStacks", "noOverguard", "shieldOverride"):
+        if key in scenario:
+            request[key] = scenario.pop(key)
+    strips = _armour_strips(request)
+    strips.update(_armour_strips(scenario))
+    strips.update(_armour_strips(target))
+    for key in ("armourStrip", "armorStrip", "elementalArmourStrip", "elementalArmorStrip"):
+        request.pop(key, None)
+        scenario.pop(key, None)
+    if isinstance(request.get("scenario"), Mapping):
+        request["scenario"] = scenario
+    for key in ("enemy", "level", "steelPath", "headshotChance", "windowSeconds", "hitLocation"):
+        if key in target:
+            request[key] = target[key]
+    enhancement_keys = ("eximus", "archimedea", "empowered", "playerCount",
+                        "magneticStacks", "noOverguard", "shieldOverride")
+    enhancements = {key: request.pop(key) for key in enhancement_keys if key in request}
+    for source in (request, target):
+        if source is target:
+            enhancements.update({key: target[key] for key in enhancement_keys if key in target})
+        raw = source.get("enemyEnhancements", source.get("enhancements"))
+        if raw is not None:
+            if not isinstance(raw, Mapping):
+                raise SimulationError("enemyEnhancements must be an object")
+            enhancements.update(raw)
+    if enhancements or "enemyEnhancements" in request or "enemyEnhancements" in target:
+        request["enemyEnhancements"] = enhancements
+    return {**request, **strips}
+
+
 # /api/build answers by request. The search is deterministic (exports are
 # frozen, the build page runs no time budget), so an identical request --
 # switching back to a config, undoing an edit, reloading the page -- gets the
@@ -3744,10 +3876,24 @@ def _auto_loadout(
     if auto_incarnon:
         evaluation = choose_route(evaluation, arcane_card, rescreen=False)
     if auto_arcane:
+        from wfarsenal import arcane_runtime
+
         no_arcane_score = evaluation.score
-        candidates = [row for row in MANUAL_ARCANES if str(row.get("slotKind") or "weapon") == "weapon"
-                      and optimizer._arcane_matches_weapon(
-                          optimizer.resolve_record(EXPORTS["arcanes"], row["path"], kind="arcane"), weapon)]
+        candidates = []
+        for row in MANUAL_ARCANES:
+            if str(row.get("slotKind") or "weapon") != "weapon" or row.get("scoreExcluded"):
+                continue
+            path = row["path"]
+            record = optimizer.resolve_record(EXPORTS["arcanes"], path, kind="arcane")
+            if not optimizer._arcane_matches_weapon(record, weapon):
+                continue
+            rank = int(row.get("maxRank") or 0)
+            candidate = dict(path=path, rank=rank)
+            if path == arcane_runtime.EXPOSURE:
+                spec = arcane_runtime.configuration(record, rank)
+                if spec is not None:
+                    candidate.update(stacks=spec["maxStacks"], uptime=1.0)
+            candidates.append(candidate)
         picked: list[dict[str, Any]] = []
         arcane_rows: list[dict[str, Any]] = []
         for _slot in range(weapon_arcane_limit):
@@ -3755,7 +3901,7 @@ def _auto_loadout(
             for row in candidates:
                 if any(item["path"] == row["path"] for item in picked):
                     continue
-                trial = [*frame_rows, *picked, {"path": row["path"], "rank": int(row.get("maxRank") or 0)}]
+                trial = [*frame_rows, *picked, row]
                 card, _unsupported = arcane_card_for(trial)
                 if card is False:
                     continue
@@ -3815,13 +3961,12 @@ def _auto_loadout(
                     else:
                         if any(item["path"] == row["path"] for i, item in enumerate(trial) if i != slot):
                             continue
-                        choice = dict(path=row["path"], rank=int(row.get("maxRank") or 0))
                         if slot < len(trial):
-                            if trial[slot] == choice:
+                            if trial[slot] == row:
                                 continue
-                            trial[slot] = choice
+                            trial[slot] = row
                         else:
-                            trial.append(choice)
+                            trial.append(row)
                     key = json.dumps(trial, sort_keys=True)
                     if key not in variants:
                         card, _ = arcane_card_for([*frame_rows, *trial])
@@ -3984,6 +4129,7 @@ def build_weapon_payload(
 ) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise SimulationError("request body must be a JSON object")
+    payload = _loadout_target_fields(payload)
     weapon_path = payload.get("weapon")
     if not isinstance(weapon_path, str) or weapon_path.strip():
         weapon_path = weapon_path.strip() if isinstance(weapon_path, str) else None
@@ -4024,7 +4170,7 @@ def build_weapon_payload(
             "metric must be one of " + ", ".join((*[row["id"] for row in metric_rows], "killsPerMinute"))
         )
     if internal_event_metric:
-        metric = "sustainedDps"
+        metric = metric_rows[0]["id"]
 
     element_key = payload.get("elementTarget", payload.get("element"))
     if element_key in (None, ""):
@@ -4113,6 +4259,24 @@ def build_weapon_payload(
     stance_multiplier = float((stance or {}).get("dpsMultiplier") or 1.0)
     status_rate_multiplier = float((stance or {}).get("statusRateMultiplier") or 1.0)
     capacity_limit = 60 + int((stance or {}).get("capacityGain") or 0)
+    exilus_raw = payload.get("exilus")
+    fixed_exilus = None
+    fixed_exilus_card = None
+    if exilus_raw is not None:
+        if not isinstance(exilus_raw, Mapping):
+            raise SimulationError("exilus must be an object when supplied")
+        mode = exilus_raw.get("mode", "fixed")
+        if mode == "fixed":
+            row = _exilus_row(exilus_raw)
+            if not _utility_matches_weapon(row, selected_weapon, catalog_weapon):
+                raise SimulationError("exilus MOD is incompatible with this weapon")
+            polarity = _special_slot_polarities(selected_weapon, catalog_weapon["weaponType"])["exilus"]
+            fixed_exilus = _exilus_at_rank(row, exilus_raw.get("rank"), polarity)
+            fixed_exilus_card = _utility_card_at_rank(row, scenario, fixed_exilus["rank"])
+        elif mode != "auto" or set(exilus_raw) != {"mode"}:
+            raise SimulationError("exilus must select a fixed MOD or specify only mode=auto")
+    auto_exilus = (exilus_raw == {"mode": "auto"} or payload.get("autoExilus", True) is True)
+    search_capacity = capacity_limit - (fixed_exilus["drain"] if fixed_exilus else 0)
     incarnon_card, incarnon_choices, incarnon_unsupported, incarnon_policy = optimizer._incarnon_card(
         selected_weapon,
         payload.get("incarnonChoices"),
@@ -4131,6 +4295,7 @@ def build_weapon_payload(
         or (
             str(card.record.get("path") or "") in MANUAL_MODS_BY_PATH
             and str(card.record.get("path") or "") not in UTILITY_MOD_PATHS
+            and (fixed_exilus_card is None or optimizer._mod_family(card) != optimizer._mod_family(fixed_exilus_card))
         )
     ]
     enemy_path = payload.get("enemy")
@@ -4287,7 +4452,7 @@ def build_weapon_payload(
             card, _states, unsupported_rows, _normalized = _prepare_manual_arcanes(
                 rows, selected_weapon, event_stats=None,
                 headshot_chance=float(payload.get("headshotChance") or 0.0),
-                combat_state=payload.get("combatState") if isinstance(payload.get("combatState"), Mapping) else {},
+                combat_state=scenario.combat_state,
             )
             return card, list(unsupported_rows)
         except (SimulationError, TypeError, ValueError):
@@ -4338,6 +4503,8 @@ def build_weapon_payload(
     benchmark_context["headshotChance"] = _manual_number(
         payload.get("headshotChance", 0.0), "headshotChance", low=0.0, high=1.0
     )
+    if payload.get("hitLocation") == "head" and "headshotChance" not in payload:
+        benchmark_context.update(headshotChance=1.0, hit_location="head")
     forced = payload.get('forcedProcs') or {}
     if not isinstance(forced, Mapping):
         raise SimulationError('forcedProcs must be an object')
@@ -4358,25 +4525,31 @@ def build_weapon_payload(
                 required=row['path'] in required_mod_paths,
                 rank=row['rank'],set_shell=shells.get(optimizer._set_key(record.get('modSet')))))
         violation = optimizer.validate_build(fixed_cards,None,slot_count=slot_count,
-            capacity_limit=capacity_limit,required_mod_keys=required_keys,forbidden_mod_keys=forbidden_keys)
+            capacity_limit=search_capacity,required_mod_keys=required_keys,forbidden_mod_keys=forbidden_keys)
         if violation:
             raise SimulationError('equipped build is invalid: '+violation)
     search_metric = "killsPerMinute" if dual_route else objective
     search_context = benchmark_context if dual_route else None
 
+    def with_exilus(passives: Any) -> Any:
+        if fixed_exilus_card is None:
+            return passives
+        holder = passives or optimizer._Card("__passives__", None, 0, (), (), 0, None)
+        return replace(holder, special_cards=(*holder.special_cards, fixed_exilus_card))
+
     def evaluate_fixed(passives: Any) -> Any:
         return optimizer._evaluate(selected_weapon, fixed_cards, None, scenario=scenario,
-                                   metric=search_metric, passives=passives,
-                                   slot_limit=slot_count, capacity_limit=capacity_limit,
+                                   metric=search_metric, passives=with_exilus(passives),
+                                   slot_limit=slot_count, capacity_limit=search_capacity,
                                    target_context=search_context)
 
     def search(passives: Any, seed: Any = None, search_profile: str | None = None, **options: Any) -> Any:
         common = dict(
             scenario=scenario,
             metric=search_metric,
-            passives=passives,
+            passives=with_exilus(passives),
             slot_count=slot_count,
-            capacity_limit=capacity_limit,
+            capacity_limit=search_capacity,
             required_damage_type=required_damage_type,
             target_context=search_context,
             profile=search_profile or profile,
@@ -4403,8 +4576,9 @@ def build_weapon_payload(
 
     def screen(cards: Any, passives_list: Any) -> list[float | None]:
         return loadout_search.screen_scores(
-            selected_weapon, cards, None if fixed_cards is not None else equipped_riven, passives_list,
-            scenario=scenario, metric=search_metric, capacity_limit=capacity_limit,
+            selected_weapon, cards, None if fixed_cards is not None else equipped_riven,
+            [with_exilus(passives) for passives in passives_list],
+            scenario=scenario, metric=search_metric, capacity_limit=search_capacity,
             slot_limit=slot_count, target_context=search_context)
 
     auto_report: dict[str, Any] = {}
@@ -4449,45 +4623,35 @@ def build_weapon_payload(
             raise SimulationError(
                 f"optimizer returned no usable MOD build for fire mode {selected_fire_mode} metric {metric}"
             )
-        if fixed_cards is not None:
-            selected_exilus = None
-            if payload.get('exilus'):
-                special = payload['exilus']
-                meta = UTILITY_MODS_BY_PATH.get(special.get('path'))
-                if not meta:
-                    raise SimulationError('exilus is not a supported utility MOD')
-                selected_exilus = {**meta,'rank':special.get('rank',meta.get('maxRank',0))}
-                card = _utility_card_at_rank(selected_exilus,scenario,selected_exilus['rank'])
-                evaluation = optimizer._evaluate(selected_weapon,fixed_cards,None,scenario=scenario,
-                    metric='killsPerMinute' if dual_route else objective,passives=arcane_passives,
-                    slot_limit=slot_count,capacity_limit=capacity_limit,
-                    special_cards=(card,) if card else (), special_capacity_cost=int(selected_exilus.get('drain') or 0),
-                    target_context=benchmark_context if dual_route else None)
-        else:
+        selected_exilus = fixed_exilus
+        if fixed_cards is None:
             evaluation = optimizer.refine_final_build(
                 selected_weapon, candidates, equipped_riven, evaluation,
-                scenario=scenario, metric=search_metric, passives=arcane_passives,
-                slot_count=slot_count, capacity_limit=capacity_limit,
+                scenario=scenario, metric=search_metric, passives=with_exilus(arcane_passives),
+                slot_count=slot_count, capacity_limit=search_capacity,
                 required_damage_type=required_damage_type, target_context=search_context,
                 profile=profile, required_mod_keys=required_keys, forbidden_mod_keys=forbidden_keys,
                 min_fill=min_fill, max_fill=max_fill,
             )
-            evaluation, selected_exilus = _auto_exilus(
-                selected_weapon,
-                catalog_weapon,
-                evaluation,
-                scenario=scenario,
-                metric="killsPerMinute" if dual_route else objective,
-                passives=arcane_passives,
-                target_context=benchmark_context if dual_route else None,
-                capacity_limit=capacity_limit,
-            )
+            if selected_exilus is None and auto_exilus:
+                evaluation, selected_exilus = _auto_exilus(
+                    selected_weapon,
+                    catalog_weapon,
+                    evaluation,
+                    scenario=scenario,
+                    metric=search_metric,
+                    passives=arcane_passives,
+                    target_context=search_context,
+                    capacity_limit=capacity_limit,
+                )
+        if fixed_exilus is not None:
+            evaluation = replace(evaluation, capacity=evaluation.capacity + fixed_exilus["drain"])
         build_archetype = "hybrid"
         if not evaluation.cards and (min_fill is None or min_fill > 0):
             raise SimulationError(
                 f"optimizer returned no usable MOD build for fire mode {selected_fire_mode} metric {metric}"
             )
-        build = optimizer._build_payload(selected_weapon, evaluation, equipped_riven, arcane_passives)
+        build = optimizer._build_payload(selected_weapon, evaluation, equipped_riven, with_exilus(arcane_passives))
         if equipped_riven is not None:
             build["riven"] = {**dict(payload["riven"]), "slot": evaluation.riven_index}
             for index, mod in enumerate(build["mods"]):
@@ -4634,9 +4798,119 @@ def build_weapon_payload(
             "weaponType": catalog_weapon["weaponType"],
             "stanceMultiplier": stance_multiplier,
             "candidates": candidates,
+            "slotCount": slot_count,
+            "exilusCard": (
+                _utility_card_at_rank(selected_exilus, scenario, selected_exilus["rank"])
+                if selected_exilus else None
+            ),
             "riven": equipped_riven,
         }
         return result, engine_context
+    return result
+
+
+_TRAIT_MATRIX_RESULTS: OrderedDict[str, str] = OrderedDict()
+_TRAIT_MATRIX_RESULTS_LOCK = threading.Lock()
+_TRAIT_MATRIX_RESULTS_MAX = 24
+
+
+def trait_matrix_payload(payload: Any) -> dict[str, Any]:
+    """Calculate all legal single-trait trials for the selected loadout context."""
+    from wfarsenal import trait_matrix
+
+    if not isinstance(payload, Mapping):
+        raise SimulationError("request body must be a JSON object")
+    roll = payload.get("roll", "both")
+    if roll not in ("3+1-", "2+1-", "both"):
+        raise SimulationError("roll must be 3+1-, 2+1- or both")
+    request = _loadout_target_fields(payload)
+    for key in (*_LIVE_FIELDS, "roll", "_searchBudgetSeconds", "riven"):
+        request.pop(key, None)
+    if isinstance(request.get("weapon"), str):
+        request["weapon"] = request["weapon"].strip()
+    scenario = optimizer._scenario_context(optimizer._requested_scenario(request, "killsPerMinute"))
+    for key in (*scenario, "modelSpread"):
+        request.pop(key, None)
+    request.pop("enhancements", None)
+    request.update(scenario=scenario, metric="killsPerMinute", damageModel="target")
+    request.setdefault("fireMode", 0)
+    request["profile"] = _solve_profile(request.get("profile"))
+    request.setdefault("autoArcane", "arcanes" not in request)
+    request.setdefault("autoExilus", "exilus" not in request or request.get("exilus") == {"mode": "auto"})
+    if request.get("exilus") == {"mode": "auto"}:
+        request.pop("exilus")
+        request["autoExilus"] = True
+    elif request.get("exilus") is None:
+        request.pop("exilus", None)
+    if "arcanes" in request and request["arcanes"] is None:
+        request["arcanes"] = []
+    request.setdefault("autoIncarnon", True)
+    request.setdefault("enemy", _BENCHMARK_ENEMY_PATH)
+    request.setdefault("level", _BENCHMARK_LEVEL)
+    request.setdefault("steelPath", True)
+    request.setdefault("windowSeconds", _BENCHMARK_WINDOW_SECONDS)
+    request.setdefault("headshotChance", 1.0 if request.get("hitLocation") == "head" else 0.0)
+    request.setdefault("armourStrip", 0.0)
+    request.setdefault("elementalArmourStrip", 0.0)
+    request.setdefault("enemyEnhancements", dict(_BENCHMARK_ENHANCEMENTS))
+    if "hitLocation" in request and request["hitLocation"] not in ("head", "body"):
+        raise SimulationError("hitLocation must be body or head")
+    request.pop("hitLocation", None)
+    request["enemyEnhancements"], _ = _manual_enemy_enhancements(
+        request, steel_path=request["steelPath"],
+    )
+    if not isinstance(request["enemy"], str) or request["enemy"] not in MANUAL_ENEMIES_BY_PATH:
+        raise SimulationError("enemy must be a portable enemy path")
+    request["steelPath"] = _manual_bool(request["steelPath"], "steelPath")
+    for field, low, high in (("headshotChance", 0.0, 1.0), ("windowSeconds", 0.1, 600.0)):
+        request[field] = _manual_number(request[field], field, low=low, high=high)
+    key = json.dumps(request, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    with _TRAIT_MATRIX_RESULTS_LOCK:
+        frozen = _TRAIT_MATRIX_RESULTS.get(key)
+        if frozen is not None:
+            _TRAIT_MATRIX_RESULTS.move_to_end(key)
+    if frozen is None:
+        result, ctx = build_weapon_payload(request, return_engine_context=True)
+        with _engine_lock():
+            build, matrix = trait_matrix.calculate(
+                ctx, result, EXPORTS.get("rivenTemplates") or {}, MANUAL_MODS_BY_PATH,
+                WEAPON_MECHANICS_OVERRIDES["mods"],
+            )
+        weapon = ctx["catalogWeapon"]
+        context = result["evaluationContext"]
+        result = {
+            "weapon": {field: weapon[field] for field in ("path", "nameEn", "nameZh", "weaponType", "fireModes")},
+            "fireMode": result["fireMode"],
+            "evaluationTarget": {
+                **result["evaluationTarget"],
+                "enemyPath": result["evaluationTarget"]["path"],
+                "level": context["level"],
+                "steelPath": context["steel_path"],
+                "headshotChance": context["headshotChance"],
+                "windowSeconds": context["windowSeconds"],
+                "armourStrip": context["armour_strip"],
+                "elementalArmourStrip": context["elemental_armour_strip"],
+                "enemyEnhancements": context["enemy_enhancements"],
+            },
+            "evaluationScenario": result["evaluationScenario"],
+            "build": build,
+            "matrix": matrix,
+        }
+        frozen = json.dumps(result, ensure_ascii=False, allow_nan=False)
+        with _TRAIT_MATRIX_RESULTS_LOCK:
+            _TRAIT_MATRIX_RESULTS[key] = frozen
+            _TRAIT_MATRIX_RESULTS.move_to_end(key)
+            while len(_TRAIT_MATRIX_RESULTS) > _TRAIT_MATRIX_RESULTS_MAX:
+                _TRAIT_MATRIX_RESULTS.popitem(last=False)
+    result = json.loads(frozen)
+    if roll != "both":
+        kept = 31 if roll == "3+1-" else 21
+        omitted = 21 if kept == 31 else 31
+        for sign in ("positive", "negative"):
+            for row in result["matrix"][sign]:
+                row[f"shown_{omitted}"] = row[f"pct_{omitted}"] = None
+                if row.pop("elem_build_roll", kept) != kept:
+                    row["elem_build"] = None
     return result
 
 
@@ -5148,11 +5422,20 @@ CATALOG["sentinel"] = sentinel_body.catalog()
 
 
 def _manual_number(value: Any, label: str, *, low: float | None = None, high: float | None = None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise SimulationError(f"{label} must be a finite number")
-    value = float(value)
-    if low is not None and value < low or high is not None and value > high:
+    try:
+        value = float(value)
+    except OverflowError as exc:
+        raise SimulationError(f"{label} must be a finite number") from exc
+    if not math.isfinite(value):
+        raise SimulationError(f"{label} must be a finite number")
+    if low is not None and high is not None and not low <= value <= high:
         raise SimulationError(f"{label} must be between {low:g} and {high:g}")
+    if low is not None and value < low:
+        raise SimulationError(f"{label} must be at least {low:g}")
+    if high is not None and value > high:
+        raise SimulationError(f"{label} must be at most {high:g}")
     return value
 
 
@@ -5186,6 +5469,14 @@ def _solve_profile(value: Any, default: str = "standard") -> str:
 def _custom_enemy_snapshot(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise SimulationError("defenseSnapshot must be an object")
+    for canonical, alias in (("armour", "armor"), ("armourType", "armorType")):
+        if canonical in value and alias in value and value[canonical] != value[alias]:
+            raise SimulationError(f"defenseSnapshot.{canonical} conflicts with {alias}")
+    fields = {"health", "armour", "armor", "shield", "healthType", "armourType", "armorType",
+              "shieldType", "baseLevel", "factionResistance"}
+    unknown = set(value) - fields
+    if unknown:
+        raise SimulationError("defenseSnapshot has unsupported fields: " + ", ".join(sorted(unknown)))
 
     def amount(key: str, *, minimum: float) -> float:
         raw = value.get(key, 0.0)
@@ -5196,16 +5487,15 @@ def _custom_enemy_snapshot(value: Any) -> dict[str, Any]:
     if "armor" in value and "armour" not in value:
         armour = amount("armor", minimum=0.0)
     shield = amount("shield", minimum=0.0)
-    health_type = str(value.get("healthType") or "").strip()
-    armour_type = str(value.get("armourType") or value.get("armorType") or "").strip()
-    shield_type = str(value.get("shieldType") or "").strip()
+    def kind(key, raw):
+        if not isinstance(raw, str) or not re.fullmatch(r"RK_[A-Z0-9_]+", raw.strip()):
+            raise SimulationError(f"defenseSnapshot.{key} must be an RK_ resistance token")
+        return raw.strip()
+
+    health_type = kind("healthType", value.get("healthType"))
+    armour_type = kind("armourType", value.get("armourType", value.get("armorType")))
+    shield_type = kind("shieldType", value.get("shieldType"))
     base_level = _manual_int(value.get("baseLevel", 0), "defenseSnapshot.baseLevel", high=9999)
-    if not health_type:
-        raise SimulationError("defenseSnapshot.healthType is required")
-    if not armour_type:
-        raise SimulationError("defenseSnapshot.armorType is required (use RK_NONE when armor is zero)")
-    if not shield_type:
-        raise SimulationError("defenseSnapshot.shieldType is required (use RK_NONE when shield is zero)")
     return {
         "path": "__custom_enemy__",
         "name": "Custom defense snapshot",
@@ -5218,7 +5508,7 @@ def _custom_enemy_snapshot(value: Any) -> dict[str, Any]:
         "healthType": health_type,
         "armourType": armour_type,
         "shieldType": shield_type,
-        "factionResistance": str(value.get("factionResistance") or "RK_GRINEER_FACTION"),
+        "factionResistance": kind("factionResistance", value.get("factionResistance", "RK_GRINEER_FACTION")),
         "damageController": "custom",
         # A standard head (GrineerHead): DamageAtten 2 (3x with the fixed 1.5x)
         # and CriticalMultiplier 2, the critical-headshot doubling.
@@ -5232,6 +5522,80 @@ def _manual_bool(value: Any, label: str) -> bool:
     return value
 
 
+def _armour_strips(payload):
+    strips = {}
+    for key, alias in (("armourStrip", "armorStrip"), ("elementalArmourStrip", "elementalArmorStrip")):
+        values = [_manual_number(payload[name], name, low=0.0, high=1.0)
+                  for name in (key, alias) if name in payload]
+        if len(values) == 2 and values[0] != values[1]:
+            raise SimulationError(f"{key} conflicts with {alias}")
+        if values:
+            strips[key] = values[0]
+    return strips
+
+
+def _analysis_benchmark(request):
+    raw = request.get("benchmarkTarget")
+    if raw is not None and not isinstance(raw, Mapping):
+        raise SimulationError("benchmarkTarget must be an object")
+    raw = dict(raw or {})
+    target = {
+        "enemy": _BENCHMARK_ENEMY_PATH,
+        "level": _BENCHMARK_LEVEL,
+        "steelPath": True,
+        "eximus": False,
+        "enemyEnhancements": dict(_BENCHMARK_ENHANCEMENTS),
+        "windowSeconds": _BENCHMARK_WINDOW_SECONDS,
+        "armourStrip": 0.0,
+        "headshotChance": 0.0,
+    } if not raw else dict(raw)
+    merged = _loadout_target_fields(request)
+    mode = raw.get("damageModel", request.get("damageModel"))
+    if mode is not None and mode not in ("target", "custom"):
+        raise SimulationError("analysis damageModel must be target or custom")
+    defense = None
+    snapshot = raw.get("defenseSnapshot", raw.get("customDefense"))
+    if snapshot is None:
+        snapshot = request.get("defenseSnapshot", request.get("customDefense"))
+    if mode == "custom" or snapshot is not None:
+        defense = _custom_enemy_snapshot(snapshot)
+        target["enemy"] = defense["path"]
+    else:
+        enemy = merged.get("enemy", _BENCHMARK_ENEMY_PATH)
+        if not isinstance(enemy, str) or enemy not in MANUAL_ENEMIES_BY_PATH:
+            raise SimulationError("benchmarkTarget.enemy must be a portable enemy path")
+        target["enemy"] = enemy
+    target.update(_armour_strips(merged))
+    target.pop("armorStrip", None)
+    target.pop("elementalArmorStrip", None)
+    for key, low, high in (("windowSeconds", 0.1, 600.0), ("headshotChance", 0.0, 1.0)):
+        if key in merged:
+            target[key] = _manual_number(merged[key], key, low=low, high=high)
+    if "level" in target or "level" in request:
+        target["level"] = _manual_int(raw.get("level", request.get("level", _BENCHMARK_LEVEL)), "level")
+    if "steelPath" in target or "steelPath" in request:
+        target["steelPath"] = _manual_bool(raw.get("steelPath", request.get("steelPath", True)), "steelPath")
+    if "hitLocation" in target and target["hitLocation"] not in ("body", "head"):
+        raise SimulationError("benchmarkTarget.hitLocation must be body or head")
+    for key in ("eximus", "archimedea", "empowered"):
+        if key in raw:
+            _manual_bool(raw[key], f"benchmarkTarget.{key}")
+    if "enemyEnhancements" in merged:
+        enhancements = merged["enemyEnhancements"]
+        from wfarsenal.damage import _enemy_enhancement_options
+        try:
+            normalized = _enemy_enhancement_options(enhancements)
+        except (TypeError, ValueError) as exc:
+            raise SimulationError(str(exc)) from exc
+        enhancements = dict(enhancements)
+        if "shieldOverride" in normalized:
+            enhancements["shieldOverride"] = normalized["shieldOverride"]
+        else:
+            enhancements.pop("shieldOverride", None)
+        target["enemyEnhancements"] = enhancements
+    return target, defense
+
+
 def _manual_enemy_enhancements(
     payload: Mapping[str, Any], *, steel_path: bool
 ) -> tuple[dict[str, Any], list[str]]:
@@ -5241,13 +5605,19 @@ def _manual_enemy_enhancements(
         return {"eximus": False, "archimedea": False, "empowered": False, "playerCount": None, "magneticStacks": 0}, []
     if not isinstance(raw, Mapping):
         raise SimulationError("enemyEnhancements must be an object")
-    allowed = {"eximus", "archimedea", "empowered", "playerCount", "magneticStacks", "steelPath"}
+    allowed = {"eximus", "archimedea", "empowered", "playerCount", "magneticStacks",
+               "steelPath", "noOverguard", "shieldOverride"}
     unknown = sorted(str(key) for key in raw if str(key) not in allowed)
     if unknown:
         raise SimulationError(f"enemyEnhancements contains unsupported keys: {', '.join(unknown)}")
     selected: dict[str, Any] = {}
     for key in ("eximus", "archimedea", "empowered"):
         selected[key] = _manual_bool(raw.get(key, False), f"enemyEnhancements.{key}")
+    if "noOverguard" in raw:
+        selected["noOverguard"] = _manual_bool(raw["noOverguard"], "enemyEnhancements.noOverguard")
+    shield_override = raw.get("shieldOverride")
+    if shield_override is not None:
+        selected["shieldOverride"] = _manual_number(shield_override, "enemyEnhancements.shieldOverride", low=0.0)
     if "steelPath" in raw:
         nested_steel_path = _manual_bool(raw["steelPath"], "enemyEnhancements.steelPath")
         if nested_steel_path != steel_path:
@@ -5470,7 +5840,7 @@ _RIVEN_FIXED_POLARITIES = {"AP_ATTACK", "AP_DEFENSE", "AP_TACTIC"}
 def _manual_riven_slot_drain(
     payload: Mapping[str, Any], slot_polarities: Any
 ) -> int:
-    """Capacity cost of the equipped custom Riven (18 base, polarity-scaled).
+    """Capacity cost of the equipped custom Riven (10 + rank, polarity-scaled).
 
     The Riven's effects ride the passive channel (never in the kernel mod list),
     so the loadout validation never saw its drain — this reproduces the frontend
@@ -5480,7 +5850,7 @@ def _manual_riven_slot_drain(
     riven = payload.get("riven")
     if not isinstance(riven, Mapping) or not isinstance(riven.get("stats"), list):
         return 0
-    base = 18
+    base = 10 + _manual_int(riven.get("rank", 8), "riven.rank", high=8)
     polarity = str(riven.get("polarity") or "")
     slot = riven.get("slot")
     if polarity not in _RIVEN_FIXED_POLARITIES or not isinstance(slot, int) or slot < 0:
@@ -5508,6 +5878,8 @@ def _manual_resolve_sim_context(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(weapon_path, str) or weapon_path.strip() not in CATALOG_WEAPONS_BY_PATH:
         raise SimulationError("weapon must be an exported portable weapon path")
     weapon = CATALOG_WEAPONS_BY_PATH[weapon_path.strip()]
+    if is_companion(weapon):
+        optimizer._requested_scenario(payload, "manual")
     payload = companion_payload(payload, weapon)
     payload = _exalted_payload(payload, weapon)
     selected_catalog_weapon = _special_slot_override(
@@ -5545,9 +5917,12 @@ def _manual_resolve_sim_context(payload: Mapping[str, Any]) -> dict[str, Any]:
         enemy_value_unsupported.append("enemy-base-level-unverified")
     defense_snapshot = None
     if damage_model == "custom":
-        defense_snapshot = _custom_enemy_snapshot(
-            payload.get("defenseSnapshot") or payload.get("customDefense")
-        )
+        raw_defense = payload.get("defenseSnapshot")
+        if raw_defense is None:
+            raw_defense = payload.get("customDefense")
+        defense_snapshot = _custom_enemy_snapshot(raw_defense)
+    elif payload.get("defenseSnapshot") is not None:
+        raise SimulationError("defenseSnapshot requires damageModel=custom")
     fire_mode = _manual_int(payload.get("fireMode", 0), "fireMode")
     kitgun_parts = _manual_kitgun_parts(payload.get("kitgunParts"))
     # Kitgun base records carry empty fireModes — the modes come from the
@@ -5583,8 +5958,9 @@ def _manual_resolve_sim_context(payload: Mapping[str, Any]) -> dict[str, Any]:
         slot_polarities = None
     mods = _manual_normalize_mods(raw_mods, slot_count)
     level = _manual_int(payload.get("level", 160), "level")
-    armour_strip = _manual_number(payload.get("armourStrip", 0.0), "armourStrip", low=0.0, high=1.0)
-    elemental_strip = _manual_number(payload.get("elementalArmourStrip", 0.0), "elementalArmourStrip", low=0.0, high=1.0)
+    strips = _armour_strips(payload)
+    armour_strip = strips.get("armourStrip", 0.0)
+    elemental_strip = strips.get("elementalArmourStrip", 0.0)
     steel_path = payload.get("steelPath", False)
     if not isinstance(steel_path, bool):
         raise SimulationError("steelPath must be a boolean")
@@ -5592,8 +5968,8 @@ def _manual_resolve_sim_context(payload: Mapping[str, Any]) -> dict[str, Any]:
         payload, steel_path=steel_path
     )
     enemy_enhancements = _external_enemy_enhancements(payload.get("externalBuffs"), enemy_enhancements)
-    headshot_chance = _manual_number(payload.get("headshotChance", 0.0), "headshotChance", low=0.0, high=1.0)
-    if headshot_chance and not enemy.get("hasHeadProxy"):
+    headshot_chance = _manual_number(_scenario_input(payload, "headshotChance", 0.0), "headshotChance", low=0.0, high=1.0)
+    if headshot_chance and defense_snapshot is None and not enemy.get("hasHeadProxy"):
         raise SimulationError("headshotChance requires an enemy with a verified head proxy")
     scenario = optimizer._requested_scenario(payload, 'manual')
     weapon_record = optimizer.resolve_record(EXPORTS["weapons"], weapon_path.strip(), kind="weapon")
@@ -5629,36 +6005,20 @@ def _manual_resolve_sim_context(payload: Mapping[str, Any]) -> dict[str, Any]:
     exilus_mod = None
     exilus_incompatible = False
     if exilus_raw is not None:
-        if not isinstance(exilus_raw, Mapping):
-            raise SimulationError("exilus must be an object when supplied")
-        exilus_path = exilus_raw.get("path") or exilus_raw.get("query")
-        if not isinstance(exilus_path, str) or exilus_path not in UTILITY_MODS_BY_PATH:
-            raise SimulationError("exilus must use a supported utility MOD path")
-        utility = UTILITY_MODS_BY_PATH[exilus_path]
+        utility = _exilus_row(exilus_raw)
+        exilus_path = utility["path"]
         if not _utility_matches_weapon(utility, selected_weapon, weapon):
             # 前端选择器与旧存档可能仍携带不兼容的功能槽卡（如仅限回旋镖
             # 家族的「旋风」）。这类卡基本不影响伤害解算：按「不计入」降级
             # 处理并在诊断里注明，而不是让整个解算失败。
             exilus_incompatible = True
-        max_rank = int(utility.get("rank") if utility.get("rank") is not None else utility.get("maxRank") or 0)
-        exilus_rank = _manual_int(exilus_raw.get("rank", max_rank), "exilus.rank", high=max_rank)
-        raw_drain = int(utility.get("drain") or 0) - max_rank + exilus_rank
         exilus_slot_polarity = _special_slot_polarities(
             selected_weapon, weapon["weaponType"]
         )["exilus"]
-        exilus_drain, exilus_relation = _polarity_adjusted_drain(
-            raw_drain, utility.get("polarity"), exilus_slot_polarity
-        )
-        exilus = {
-            **utility,
-            "rank": exilus_rank,
-            "drain": exilus_drain,
-            "slotPolarity": exilus_slot_polarity,
-            "polarityRelation": exilus_relation,
-        }
+        exilus = _exilus_at_rank(utility, exilus_raw.get("rank"), exilus_slot_polarity)
         # 不兼容卡不进内核（它对当前武器根本装不上），容量也按未装备计。
         if not exilus_incompatible and utility.get("catalogJoined"):
-            exilus_mod = {"path": exilus_path, "rank": exilus_rank, "slot": slot_count}
+            exilus_mod = {"path": exilus_path, "rank": exilus["rank"], "slot": slot_count}
     metric = str(payload.get("metric") or (
         "attackDps" if weapon["weaponType"] in {"melee", "zaw"} else "sustainedDps"
     ))
@@ -6550,7 +6910,7 @@ def simulate_manual_payload(payload: Any) -> dict[str, Any]:
             }
         if _replay_ctx.get("target") is not None:
             modded = result.get("moddedStats") or {}
-            if isinstance(modded, Mapping) and modded.get("sustainedDps"):
+            if isinstance(modded, Mapping) and modded.get("sustainedDps") is not None:
                 replay_stats = _benchmark_timeline_stats(modded)
                 # 触发源打包：已配赋能 + 镀层 MOD + 灵化 on-kill 进化的层数
                 # 规格，窗口模型按 emergent 模拟爬升并输出覆盖率折线。
@@ -6600,6 +6960,11 @@ def simulate_manual_payload(payload: Any) -> dict[str, Any]:
                     "windowSeconds": windowed.get("windowSeconds"),
                     "killsPerMinute": windowed.get("killsPerMinute"),
                     "windowDps": windowed.get("windowDps"),
+                    "directWindow": windowed.get("directWindow"),
+                    "dotWindow": windowed.get("dotWindow"),
+                    "dotByType": windowed.get("dotByType"),
+                    "procCounts": windowed.get("procCounts"),
+                    "hitProbability": replay_stats.hit_probability,
                     "totalWindowDamage": windowed.get("totalWindowDamage"),
                     "killsInWindow": windowed.get("killsInWindow"),
                     "targetTotalEhp": windowed.get("targetTotalEhp"),
@@ -6897,7 +7262,8 @@ def mod_gains_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         # re-simulate. Ranks come from the request's arcanes[] entries.
         if path.startswith("__arcane__:"):
             arcane_path = path.split(":", 1)[1]
-            if arcane_path in MANUAL_ARCANES_BY_PATH and path not in seen:
+            meta = MANUAL_ARCANES_BY_PATH.get(arcane_path)
+            if meta and not meta.get("scoreExcluded") and path not in seen:
                 seen.add(path)
                 candidates.append(path)
             continue
@@ -7411,6 +7777,7 @@ class PortableHandler(BaseHTTPRequestHandler):
             "/api/arena/standing-point": arena_standing_point_payload,
             "/api/analyze": analyze_payload,
             "/api/build": build_weapon_route,
+            "/api/trait-matrix": trait_matrix_payload,
             "/api/simulate": simulate_manual_payload,
             "/api/mod-gains": mod_gains_payload,
             "/api/part-values": part_values_payload,

@@ -363,8 +363,9 @@ def prepare(
     companion_sequence = projectile_sequence(weapon, mode_index)
     from .projectile_lanes import profile as physical_lane_profile, lane_mode as physical_lane_mode
     from .event_profiles import base_profile
-    physical_lanes = physical_lane_profile(base_profile(weapon, mode_index))
-    periodic=base_profile(weapon,mode_index).get('periodicTriggers') or []
+    selected_attack = base_profile(weapon, mode_index)
+    physical_lanes = physical_lane_profile(selected_attack)
+    periodic = selected_attack.get('periodicTriggers') or []
     if any(field.get('expiresWithSourceOwner') for field in periodic):
         notes.append('source-owned-field-same-frame-enter-update-and-replacement-order-approximated')
     if any(field.get('defaultEnabled') and field.get('refreshPolicy')=='independent-finite-fields-no-source-replacement' for field in periodic):
@@ -621,10 +622,16 @@ def prepare(
     from .melee_sequence import build_schedule
     melee = None
     combo_tier_keys = {}
-    if weapon.get("slot") in ("melee", "arch_melee") and mode_index == 0 and not weapon.get("isIncarnonForm"):
+    if (weapon.get("slot") in ("melee", "arch_melee") and not weapon.get("isIncarnonForm")
+            and (mode_index == 0 or scenario.heavy_attack)):
         state = scenario.combat_state
         melee = build_schedule(weapon, state.get("meleeRoute"), stance=state.get("meleeStance"),
-                               combo=state.get("meleeCombo"), target_distance=state.get("meleeTargetDistance"))
+                               combo=state.get("meleeCombo"), target_distance=state.get("meleeTargetDistance"),
+                               heavy_attack=scenario.heavy_attack)
+        if melee:
+            # The schedule supplies throw/slam damage multipliers, so use
+            # the ordinary melee values even if the selected export is a throw.
+            mode_index = 0
     for q in sources:
         if q.get('meleeRoutes') and (not melee or melee.get('route') not in q['meleeRoutes']):
             # A slam passive on a route without slams never triggers.
@@ -661,13 +668,12 @@ def prepare(
         dynamic.append((native_trigger['id'], [ModEffect(e['upgradeType'], e['operation'], e['value'], damage_type=e.get('damageType'), source_path=native_trigger['source']) for e in native_trigger['effects']]))
     profile = ref["incarnon"].get(weapon.get("path"))
     modes = weapon["fireModes"]
-    from .event_profiles import base_profile, native_burst, reloads_after_every_shot
+    from .event_profiles import native_burst, reloads_after_every_shot
     base_attack = base_profile({**weapon, 'isIncarnonForm': False, '__selectedFireMode__': 0}, 0)
     if modes[0].get('trigger')=='/Lotus/Language/Menu/Loadout_TriggerSemiAutoFireOnUp':
         # Press/release pairs keep the native per-shot timer. No assumed
         # release speed or extra shots are granted by treating them as a pair.
         base_attack={**base_attack,'burst':{'count':2,'delay_seconds':1./float(modes[0]['fireRate'])}}
-    selected_attack = base_profile(weapon, mode_index)
     from .projectile_events import quanta_strategy, quanta_strategy_cycle, grimoire_strategy
     paid_cube = quanta_strategy(weapon, mode_index, scenario.combat_state)
     chain_orb = grimoire_strategy(weapon, mode_index, scenario.combat_state)
@@ -708,6 +714,9 @@ def prepare(
         if cycle_enabled and weapon.get("isIncarnonForm") and profile and len(modes) > 1
         else None
     )
+    if (cycle and scenario.combat_state.get('gaugeChargingHeadshots')
+            and cycle.get('chargeOn') not in ('direct_hits', 'kills')):
+        cycle = {**cycle, 'gaugeChargingHeadshots': True}
     if cycle_enabled and weapon.get("isIncarnonForm") and not cycle:
         notes.append("incarnon-cycle-data-unavailable")
     from .event_profiles import kill_charge_cycle
@@ -755,7 +764,8 @@ def prepare(
     }
 
     form_weapons = {}
-    # The event profile of each form record (read only below).
+    original_profiles = {mode_index: selected_attack}
+    # Scenario-adjusted profiles preserve their existing per-mode scope.
     form_profiles = {}
 
     def live_co_callback(unit, wp, source_form):
@@ -853,8 +863,8 @@ def prepare(
                           if companion_sequence else None)
         volley_rounds = float(stacks.get('__chargeVolleyRounds', 1.))
         form_key = (form != "base", idx, sequence_index, volley_rounds,physical_index)
-        wp = form_weapons.get(form_key)
-        if wp is None:
+        prepared_form = form_weapons.get(form_key)
+        if prepared_form is None:
             wp = {
                 **weapon,
                 "isIncarnonForm": form != "base" and weapon.get("isIncarnonForm", False),
@@ -886,24 +896,28 @@ def prepare(
                 # the heavy-attack record (x6 on a hammer, the whole throw on
                 # a glaive).
                 wp.pop('heavyAttack', None)
-            form_weapons[form_key] = wp
+            prepared_form = wp, base_profile(wp, idx)
+            form_weapons[form_key] = prepared_form
+        wp, raw_form_profile = prepared_form
         if wp.get('isIncarnonForm'):
             for terms in form_dynamic:
                 fx.extend(terms)
-        if (last_round and last_round_multishot and form != 'incarnon' and not wp.get('isIncarnonForm')
-                and not base_profile(weapon, idx).get('chargeVolley')):
-            fx.append(ModEffect('WEAPON_FIRE_ITERATIONS', 'ADD', last_round_multishot,
-                                source_path='incarnon:last-round-multishot'))
+        if last_round and last_round_multishot and form != 'incarnon' and not wp.get('isIncarnonForm'):
+            if idx not in original_profiles:
+                original_profiles[idx] = base_profile(weapon, idx)
+            if not original_profiles[idx].get('chargeVolley'):
+                fx.append(ModEffect('WEAPON_FIRE_ITERATIONS', 'ADD', last_round_multishot,
+                                    source_path='incarnon:last-round-multishot'))
         form_scenario = scenario_with(
             scenario, incarnon_cycle=False, victim_status_count=count_ceiling,
-            heavy_attack=bool(stacks.get('__heavy')) or scenario.heavy_attack,
+            heavy_attack=bool(stacks.get('__heavy')) or (melee is None and scenario.heavy_attack),
         )
         battery_parameter_fx = []
-        if base_profile(wp, idx).get('fullClipCharge'):
+        if raw_form_profile.get('fullClipCharge'):
             scoped = {'WEAPON_BATTERY_REGEN_RATE', 'WEAPON_RELOAD_EMPTY_BATTERY'}
             battery_parameter_fx = [e for e in fx if e.upgrade_type in scoped]
             fx = ModEffectList([e for e in fx if e.upgrade_type not in scoped], skipped=fx.skipped)
-        direct_shiver=bool(base_profile(wp,idx).get('directTakesVictimStackDamage'))
+        direct_shiver=bool(raw_form_profile.get('directTakesVictimStackDamage'))
         direct_shiver_fixed=None
         if direct_shiver:
             direct_shiver_fixed=max((float(e.runtime_chance or 0.) for e in fx
@@ -963,10 +977,10 @@ def prepare(
             radial._co_spec = radial_spec
         extra = form_profiles.get((form != "base", idx))
         if physical_index is not None:
-            extra={**base_profile(wp,idx),'radials':[physical_lanes['lanes'][physical_index]['radial']]}
+            extra={**raw_form_profile,'radials':[physical_lanes['lanes'][physical_index]['radial']]}
         if extra is None:
             from .event_profiles import perfect_release
-            extra, _ = perfect_release(base_profile(wp, idx), modes[idx], scenario.combat_state)
+            extra, _ = perfect_release(raw_form_profile, modes[idx], scenario.combat_state)
             form_profiles[(form != "base", idx)] = extra
         stackable = extra.get('stackable')
         if stackable:
@@ -1044,6 +1058,7 @@ def prepare(
         child_groups = {}
         if extra.get('embedded'):
             components = [*components, dict(extra['embedded'], __embedded=True)]
+        radial_scenario = None
         for component in components:
             if component and component.get('currentSourceCoFraction'):
                 fractions=component['currentSourceCoFraction']
@@ -1093,9 +1108,11 @@ def prepare(
                     # its field, so it stays.
                     part_fx = ModEffectList(e for e in part_fx
                                             if not (e.upgrade_type == 'WEAPON_DAMAGE_AMOUNT' and e.operation == 'ADD_BASE'))
+                if radial_scenario is None:
+                    radial_scenario = scenario_with(scenario, incarnon_cycle=False, victim_status_count=count_ceiling)
                 part, part_spec = apply_mods_spec(
                     _part_record(wp, ('radial', idx, repr(component), repr(extra.get('compression'))), radial_part),
-                    part_fx, scenario=replace(scenario, incarnon_cycle=False, victim_status_count=count_ceiling))
+                    part_fx, scenario=radial_scenario)
                 if component.get('__grimoirePart') is not None:
                     part=copy(part)
                     scale=float(component.get('damageMultiplier',1.))
@@ -1120,15 +1137,22 @@ def prepare(
                     scale = st.headshot_bonus_multiplier
                     part = replace(part,damage_types={k:v*scale for k,v in part.damage_types.items()},
                                    dot_base_damage=part.dot_base_damage*scale if part.dot_base_damage is not None else None)
-                part = replace(part, radial_only=True, radial_victim_crit=bool(component.get("takes_victim_crit")), weakpoint_damage_bonus=0.0, weakpoint_crit_chance_bonus=0.0, weakpoint_crit_chance_relative=0.0, headshot_bonus_multiplier=1.0)
+                # apply_mods_spec returns owned stats; set contact flags before
+                # publishing or retaining any reference to this packet.
+                part.radial_only = True
+                part.radial_victim_crit = bool(component.get('takes_victim_crit'))
+                part.weakpoint_damage_bonus = 0.0
+                part.weakpoint_crit_chance_bonus = 0.0
+                part.weakpoint_crit_chance_relative = 0.0
+                part.headshot_bonus_multiplier = 1.0
                 if component.get('takes_multishot') is False:
-                    part = replace(part, multishot=1.0)
+                    part.multishot = 1.0
                 if component.get('parentMultishotPolicy'):
                     parents = (min(1., st.multishot) if component['parentMultishotPolicy'] == 'normal-parent'
                                else max(0., st.multishot - 1.))
-                    part = replace(part, multishot=parents)
+                    part.multishot = parents
                 if component.get('count'):
-                    part = replace(part, multishot=part.multishot * float(component['count']))
+                    part.multishot *= float(component['count'])
                 if component.get('__phantasmaChild'):
                     part._phantasma_child = True
                 part._co_spec = part_spec
@@ -1654,9 +1678,12 @@ def prepare(
         return resolve_cache[key]
 
     entry = cached if resolve_cache is not None else resolve
-    from .delayed_radial_events import profile_admitted, components as event_components
+    from .delayed_radial_events import admitted as event_admitted, components as event_components
+    parts = [part for attack in (base_attack, selected_attack) for part in event_components(attack)]
+    from .magnetic_break import weapon_weakness
     return dict(
         resolve=entry,
+        magneticWeaknessBonus=weapon_weakness(weapon.get('path')),
         projectileSequence=companion_sequence,
         sourceOwnedFields=any(field.get('defaultEnabled') and field.get('expiresWithSourceOwner') for field in periodic),
         finiteFields=any(field.get('defaultEnabled') and field.get('refreshPolicy')=='independent-finite-fields-no-source-replacement' for field in periodic),
@@ -1671,11 +1698,11 @@ def prepare(
         chargeVolley=any(attack.get('chargeVolley') for attack in (base_attack, selected_attack)),
         chargeBeforeFire=bool(selected_attack.get('fullClipCharge') or (selected_attack.get('charge') or {}).get('beforeFire')),
         nativeFireGate=bool(selected_attack.get('nativeFireCooldownSeconds')),
-        delayedRadialEvents=bool(paid_cube or zymos_policy or chain_orb or selected_attack.get('attachedTicks') or selected_attack.get('noxAvatarLifecycle')) or any(profile_admitted(attack) for attack in (base_attack, selected_attack)),
-        victimStackParts=bool(zymos_policy) or bool(selected_attack.get('directTakesVictimStackDamage')) or any(part.get('takes_victim_stack_damage') for attack in (base_attack,selected_attack) for part in event_components(attack)),
-        radialCritStatus=bool(zymos_policy or chain_orb or selected_attack.get('noxAvatarLifecycle')) or any(part.get('takes_victim_crit') for attack in (base_attack,selected_attack)
-                             for part in event_components(attack)),
+        delayedRadialEvents=bool(paid_cube or zymos_policy or chain_orb or selected_attack.get('attachedTicks') or selected_attack.get('noxAvatarLifecycle')) or any(event_admitted(part) for part in parts),
+        victimStackParts=bool(zymos_policy) or bool(selected_attack.get('directTakesVictimStackDamage')) or any(part.get('takes_victim_stack_damage') for part in parts),
+        radialCritStatus=bool(zymos_policy or chain_orb or selected_attack.get('noxAvatarLifecycle')) or any(part.get('takes_victim_crit') for part in parts),
         melee=melee,
+        meleeStartingTier=scenario.combo_tier if melee else 0,
         comboTierKeys=combo_tier_keys,
         beamRampFloors={
             'base':floor_for(base_attack if base_attack.get('source') else ref.get('coProfiles',{}).get(weapon.get('path'),{}).get('0',{})),

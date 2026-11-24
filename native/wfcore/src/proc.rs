@@ -4,7 +4,7 @@
 
 use crate::pymath::{erfc, expm1, floor_i, log, pmax, pmin, pow, psum, sqrt, ceil_i};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::rc::Rc;
 
 // Electricity/Gas conditional moments, in reference operation order.
@@ -29,11 +29,13 @@ pub struct PileBucket {
 pub struct PileKernel {
     pub rows: Vec<PileBucket>,
     pub mass: f64,
+    low: Vec<PileOutcome>,
 }
 
 impl PileKernel {
     pub fn new(outcomes: &[PileOutcome]) -> Self {
         let mut rows: Vec<PileBucket> = Vec::new();
+        let mut low = Vec::new();
         for o in outcomes {
             let q = o.probability;
             if q <= 0.0 { continue; }
@@ -44,6 +46,7 @@ impl PileKernel {
             let v = &mut rows[index].values;
             v[0] += q;
             if o.count > 0 {
+                if o.seed < 0.5 { low.push(*o); }
                 v[1] += q*o.seed;
                 v[2] += q*o.accumulator;
                 v[3] += q*o.landing;
@@ -56,7 +59,7 @@ impl PileKernel {
         }
         rows.sort_by_key(|r|r.count);
         let mass=psum(rows.iter().map(|r|r.values[0]));
-        Self {rows,mass}
+        Self {rows,mass,low}
     }
 }
 
@@ -75,6 +78,8 @@ pub struct ProcPile {
     pub next: Option<f64>,
     pub token: u64,
     cached: Option<(f64, [f64; 4], Option<u8>, Option<usize>)>,
+    low_count: usize,
+    pub radial_floor_limited: bool,
 }
 
 pub struct PileTick {
@@ -89,10 +94,12 @@ pub struct PileTick {
 
 impl ProcPile {
     pub fn new(cap: Option<usize>) -> Self {
-        Self { cap, events: Vec::new(), next: None, token: 1, cached: None }
+        Self { cap, events: Vec::new(), next: None, token: 1, cached: None,
+            low_count: 0, radial_floor_limited: false }
     }
     pub fn reset(&mut self) {
         self.events.clear();
+        self.low_count = 0;
         self.next = None;
         self.token += 1;
         self.cached = None;
@@ -105,6 +112,7 @@ impl ProcPile {
             Some((t, self.token))
         } else { None };
         let end = self.next.unwrap() + (ceil_i(duration - 1e-9).max(1) as f64) - 1.0;
+        self.low_count += usize::from(!kernel.low.is_empty());
         self.events.push(PileEvent { end, kernel, origin, source });
         self.cached = None;
         schedule
@@ -112,16 +120,33 @@ impl ProcPile {
     pub fn moments(&mut self, t: f64) -> [f64; 4] {
         if let Some((when, value, _, _)) = self.cached { if when == t { return value; } }
         let _timer = crate::counters::Timer::start(crate::counters::PILE_MOMENTS);
-        let cap = self.cap.unwrap_or(1);
-        let mut dp = [[0.0; 9]; 11];
+        let (mut result, origin, source) = match self.cap {
+            Some(10) => self.compute_moments::<true, 11>(10, t),
+            Some(cap) => self.compute_moments::<true, 11>(cap, t),
+            None => self.compute_moments::<false, 2>(1, t),
+        };
+        if self.low_count != 0 {
+            if let Some(correction) = self.floor_correction(t) {
+                result[0] += correction[0]; result[1] += correction[1];
+            } else {
+                self.radial_floor_limited = true;
+            }
+        }
+        self.cached = Some((t, result, origin, source));
+        result
+    }
+    fn compute_moments<const BOUNDED: bool, const ROWS: usize>(&self, cap: usize, t: f64)
+        -> ([f64; 4], Option<u8>, Option<usize>) {
+        let cutoff = t - 1e-9;
+        let mut dp = [[0.0; 9]; ROWS];
         dp[0][0] = 1.0;
         let (mut origin, mut source) = (None, None);
         for event in self.events.iter().rev() {
-            let live = event.end >= t - 1e-9;
-            let mut next = [[0.0; 9]; 11];
+            let live = event.end >= cutoff;
+            let mut next = [[0.0; 9]; ROWS];
             for (k, row) in dp[..=cap].iter().enumerate() {
                 if row[0] <= 0.0 { continue; }
-                if self.cap.is_some() && k == cap {
+                if BOUNDED && k == cap {
                     for (i, value) in row.iter().enumerate() { next[cap][i] += event.kernel.mass * value; }
                     continue;
                 }
@@ -129,13 +154,13 @@ impl ProcPile {
                     let [q,b,c,l,hn,bl,bh,cl,ch] = bucket.values;
                     if q <= 0.0 { continue; }
                     let n = bucket.count;
-                    let dest = if self.cap.is_some() { cap.min(k + n) } else { usize::from(k > 0 || n > 0) };
+                    let dest = if BOUNDED { cap.min(k + n) } else { usize::from(k > 0 || n > 0) };
                     let mut values = row.map(|x|q*x);
                     if n > 0 && k == 0 {
                         values[1] = row[0]*l;
                         values[2] = row[0]*hn;
                     }
-                    let kept = if self.cap.is_some() { n.min(cap-k) } else { n };
+                    let kept = if BOUNDED { n.min(cap-k) } else { n };
                     if kept > 0 && live {
                         origin = event.origin; source = event.source;
                         if k == 0 {
@@ -157,11 +182,51 @@ impl ProcPile {
             }
             dp = next;
         }
-        let mut totals = [0.0; 9];
-        for i in 0..9 { totals[i] = psum(dp[..=cap].iter().map(|row| row[i])); }
-        let result = [totals[3] + totals[5], totals[4] + totals[6], totals[7], totals[8]];
-        self.cached = Some((t, result, origin, source));
-        result
+        let total = |i: usize| psum(dp[..=cap].iter().map(|row| row[i]));
+        let result = [total(3) + total(5), total(4) + total(6), total(7), total(8)];
+        (result, origin, source)
+    }
+    fn floor_correction(&self, t: f64) -> Option<[f64; 2]> {
+        // Only worlds below a summed half-seed of .5 need a correction.
+        let mut dp = BTreeMap::from([((0usize, 0u64, false), [1.0, 0.0, 0.0])]);
+        for event in self.events.iter().rev() {
+            let live = event.end >= t - 1e-9;
+            let mut next = BTreeMap::<_, [f64; 3]>::new();
+            for (&(k, bits, paid), &[p, f, h]) in &dp {
+                if p <= 0.0 { continue; }
+                let mut add = |key, values: [f64; 3]| {
+                    for (row, v) in next.entry(key).or_insert([0.0; 3]).iter_mut().zip(values) { *row += v; }
+                    next.len() <= 4096
+                };
+                if self.cap == Some(k) {
+                    let mass = event.kernel.mass;
+                    if !add((k, bits, paid), [mass*p, mass*f, mass*h]) { return None; }
+                    continue;
+                }
+                let mut visit = |n: usize, q: f64, half_seed: f64, landing: f64, weak: f64| {
+                    let kept = if live { self.cap.map_or(n, |cap| n.min(cap-k)) } else { 0 };
+                    let seed = f64::from_bits(bits) + kept as f64 * half_seed;
+                    if q <= 0.0 || seed >= 0.5 { return true; }
+                    let rank = self.cap.map_or(usize::from(k != 0 || n != 0), |cap| cap.min(k+n));
+                    let values = if n != 0 && k == 0 { [q*p, p*landing, p*weak] } else { [q*p,q*f,q*h] };
+                    add((rank, seed.to_bits(), paid || kept != 0), values)
+                };
+                for bucket in &event.kernel.rows {
+                    let r = bucket.values;
+                    if (!live || bucket.count == 0) && !visit(bucket.count, r[0], 0.0, r[3], r[4]) { return None; }
+                }
+                if live {
+                    for o in &event.kernel.low {
+                        let landing = o.probability * o.landing;
+                        if !visit(o.count, o.probability, o.seed, landing, if o.weak { landing } else { 0.0 }) { return None; }
+                    }
+                }
+            }
+            dp = next;
+            if dp.is_empty() { break; }
+        }
+        Some([1, 2].map(|i| psum(dp.iter().filter(|((_, _, paid), _)| *paid)
+            .map(|((_, bits, _), v)| (0.5 - f64::from_bits(*bits)) * v[i]))))
     }
     pub fn tick(&mut self, t: f64, token: u64) -> Option<PileTick> {
         if token != self.token || self.next.is_none() || (t-self.next.unwrap()).abs() > 1e-8 { return None; }
@@ -172,6 +237,7 @@ impl ProcPile {
         let schedule = match oldest {
             None => { self.reset(); None },
             Some(i) => {
+                self.low_count -= self.events[..i].iter().filter(|e| !e.kernel.low.is_empty()).count();
                 self.events.drain(..i);
                 self.cached = None;
                 Some((t + 1.0, self.token))
@@ -183,9 +249,24 @@ impl ProcPile {
 
 // ── CappedPool ────────────────────────────────────────────────────────────
 
+#[path = "bake_pool.rs"]
+pub(crate) mod bake_pool;
+
 pub type Kernel = Vec<(usize, f64)>;
 
-pub fn arrival_kernel(absence: f64, count: f64, cap: usize) -> Option<Kernel> {
+#[derive(Clone)]
+struct Arrival {
+    terms: [(usize, f64); 3],
+    len: usize,
+}
+
+impl Arrival {
+    fn terms(&self) -> &[(usize, f64)] {
+        &self.terms[..self.len]
+    }
+}
+
+fn arrival(absence: f64, count: f64, cap: usize) -> Option<Arrival> {
     let p = pmin(1.0, pmax(0.0, 1.0 - absence));
     if p <= 0.0 || count <= 0.0 {
         return None;
@@ -193,22 +274,32 @@ pub fn arrival_kernel(absence: f64, count: f64, cap: usize) -> Option<Kernel> {
     let size = count / p;
     let low = floor_i(size + 1e-9);
     let frac = pmax(0.0, size - low as f64);
-    let mut kernel: Kernel = Vec::new();
+    let mut kernel = Arrival { terms: [(0, 0.0); 3], len: 0 };
     for (shift, weight) in [(0i64, 1.0 - p), (low, p * (1.0 - frac)), (low + 1, p * frac)] {
         if weight > 0.0 {
             let key = (shift.max(0) as usize).min(cap);
-            if let Some(slot) = kernel.iter_mut().find(|(k, _)| *k == key) {
+            if let Some(slot) = kernel.terms[..kernel.len].iter_mut().find(|(k, _)| *k == key) {
                 slot.1 += weight;
             } else {
-                kernel.push((key, weight));
+                kernel.terms[kernel.len] = (key, weight);
+                kernel.len += 1;
             }
         }
     }
     Some(kernel)
 }
 
+pub fn arrival_kernel(absence: f64, count: f64, cap: usize) -> Option<Kernel> {
+    arrival(absence, count, cap).map(|kernel| kernel.terms().to_vec())
+}
+
 pub fn fold(dist: &[f64], kernel: &Kernel, cap: usize) -> Vec<f64> {
     let mut out = vec![0.0; cap + 1];
+    fold_into(dist, kernel, cap, &mut out);
+    out
+}
+
+fn fold_into(dist: &[f64], kernel: &[(usize, f64)], cap: usize, out: &mut [f64]) {
     for &(shift, weight) in kernel {
         for (k, &value) in dist.iter().enumerate() {
             if value != 0.0 {
@@ -216,16 +307,20 @@ pub fn fold(dist: &[f64], kernel: &Kernel, cap: usize) -> Vec<f64> {
             }
         }
     }
-    out
 }
 
 #[derive(Clone)]
 pub struct CappedPool {
     pub cap: usize,
-    front: Vec<(f64, Kernel, Vec<f64>)>,
-    back: Vec<(f64, Kernel)>,
+    front: Vec<f64>,
+    front_dists: Vec<f64>,
+    back: Vec<(f64, Arrival)>,
     back_dist: Vec<f64>,
-    dist: Option<Vec<f64>>,
+    fold_scratch: Vec<f64>,
+    bake_prefix: Option<bake_pool::Key>,
+    bake_enabled: bool,
+    dist: Vec<f64>,
+    dist_valid: bool,
     stats: Option<(f64, f64)>,
     pub version: u64,
 }
@@ -233,30 +328,36 @@ pub struct CappedPool {
 impl CappedPool {
     pub fn new(cap: f64) -> Self {
         let cap = cap as usize;
-        let mut pool = CappedPool {
+        let mut back_dist = vec![0.0; cap + 1];
+        back_dist[0] = 1.0;
+        CappedPool {
             cap,
             front: Vec::new(),
+            front_dists: Vec::new(),
             back: Vec::new(),
-            back_dist: Vec::new(),
-            dist: None,
+            back_dist,
+            fold_scratch: Vec::new(),
+            bake_prefix: None,
+            bake_enabled: cap == bake_pool::CAP && bake_pool::enabled(),
+            dist: Vec::new(),
+            dist_valid: false,
             stats: None,
-            version: 0,
-        };
-        pool.reset();
-        pool
+            version: 1,
+        }
     }
 
-    fn unit(&self) -> Vec<f64> {
-        let mut v = vec![0.0; self.cap + 1];
-        v[0] = 1.0;
-        v
+    fn reset_back_distribution(&mut self) {
+        self.back_dist.fill(0.0);
+        self.back_dist[0] = 1.0;
+        self.bake_prefix = None;
     }
 
     pub fn reset(&mut self) {
         self.front.clear();
+        self.front_dists.clear();
         self.back.clear();
-        self.back_dist = self.unit();
-        self.dist = None;
+        self.reset_back_distribution();
+        self.dist_valid = false;
         self.stats = None;
         self.version += 1;
     }
@@ -266,25 +367,40 @@ impl CappedPool {
     }
 
     pub fn add(&mut self, end: f64, absence: f64, count: f64) -> bool {
-        let kernel = match arrival_kernel(absence, count, self.cap) {
+        let kernel = match arrival(absence, count, self.cap) {
             Some(k) => k,
             None => return false,
         };
-        self.back_dist = fold(&self.back_dist, &kernel, self.cap);
+        if !self.bake_enabled || !bake_pool::copy_prefix(
+            &mut self.bake_prefix, self.back.len() + 1, absence, count, &mut self.back_dist,
+        ) {
+            self.fold_scratch.resize(self.cap + 1, 0.0);
+            self.fold_scratch.fill(0.0);
+            fold_into(&self.back_dist, kernel.terms(), self.cap, &mut self.fold_scratch);
+            std::mem::swap(&mut self.back_dist, &mut self.fold_scratch);
+        }
         self.back.push((end, kernel));
-        self.dist = None;
+        self.dist_valid = false;
         self.stats = None;
         self.version += 1;
         true
     }
 
     fn transfer(&mut self) {
-        let mut dist = self.unit();
+        self.reset_back_distribution();
+        let width = self.cap + 1;
+        self.front.reserve(self.back.len());
+        self.front_dists.reserve(width * self.back.len());
+        // Rolling front suffixes occupy one buffer; each fold reads the
+        // preceding suffix and writes directly into the newly appended row.
         while let Some((end, kernel)) = self.back.pop() {
-            dist = fold(&dist, &kernel, self.cap);
-            self.front.push((end, kernel, dist.clone()));
+            let offset = self.front_dists.len();
+            self.front_dists.resize(offset + width, 0.0);
+            let (previous, out) = self.front_dists.split_at_mut(offset);
+            let dist = if offset == 0 { &self.back_dist } else { &previous[offset - width..] };
+            fold_into(dist, kernel.terms(), self.cap, out);
+            self.front.push(end);
         }
-        self.back_dist = self.unit();
     }
 
     pub fn expire(&mut self, t: f64) {
@@ -295,43 +411,43 @@ impl CappedPool {
                 }
                 self.transfer();
             }
-            if self.front.last().unwrap().0 >= t - 1e-9 {
+            if *self.front.last().unwrap() >= t - 1e-9 {
                 return;
             }
             self.front.pop();
-            self.dist = None;
+            self.front_dists.truncate(self.front.len() * (self.cap + 1));
+            self.dist_valid = false;
             self.stats = None;
             self.version += 1;
         }
     }
 
     pub fn distribution(&mut self) -> &Vec<f64> {
-        if self.dist.is_none() {
-            let d = if self.front.is_empty() {
-                self.back_dist.clone()
-            } else {
-                let cap = self.cap;
-                let mut out = vec![0.0; cap + 1];
-                let agg = &self.front.last().unwrap().2;
-                for (i, &x) in agg.iter().enumerate() {
-                    if x != 0.0 {
-                        for (j, &y) in self.back_dist.iter().enumerate() {
-                            if y != 0.0 {
-                                out[(i + j).min(cap)] += x * y;
-                            }
+        if self.front.is_empty() {
+            return &self.back_dist;
+        }
+        if !self.dist_valid {
+            let cap = self.cap;
+            self.dist.resize(cap + 1, 0.0);
+            self.dist.fill(0.0);
+            let agg = &self.front_dists[self.front_dists.len() - (cap + 1)..];
+            for (i, &x) in agg.iter().enumerate() {
+                if x != 0.0 {
+                    for (j, &y) in self.back_dist.iter().enumerate() {
+                        if y != 0.0 {
+                            self.dist[(i + j).min(cap)] += x * y;
                         }
                     }
                 }
-                out
-            };
-            self.dist = Some(d);
+            }
+            self.dist_valid = true;
         }
-        self.dist.as_ref().unwrap()
+        &self.dist
     }
 
     pub fn stats(&mut self) -> (f64, f64) {
         if self.stats.is_none() {
-            let dist = self.distribution().clone();
+            let dist = self.distribution();
             let present = 1.0 - dist[0];
             let mean = psum(dist.iter().enumerate().map(|(k, v)| k as f64 * *v));
             self.stats = Some((present, mean));

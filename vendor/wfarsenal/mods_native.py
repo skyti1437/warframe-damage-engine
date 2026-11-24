@@ -30,7 +30,7 @@ try:  # pragma: no cover - exercised when the native core is built
 except ImportError:  # pragma: no cover
     wfcore = None
 
-ENABLED = (wfcore is not None and hasattr(wfcore, "ModsPrep") and getattr(wfcore,"NATIVE_TYPE_QUANTIZATION",0) and getattr(wfcore, "RELOAD_SCALED_TRANSFORMS", 0) and os.environ.get("WF_NATIVE") != "0"
+ENABLED = (wfcore is not None and hasattr(wfcore, "ModsPrep") and getattr(wfcore,"NATIVE_CRIT_FACTOR",0) and getattr(wfcore, "RELOAD_SCALED_TRANSFORMS", 0) and os.environ.get("WF_NATIVE") != "0"
            and os.environ.get("WF_NATIVE_MODS") != "0")
 SHADOW = os.environ.get("WF_NATIVE_SHADOW") == "1"
 
@@ -45,7 +45,7 @@ class Unsupported(Exception):
 
 
 class Prep:
-    __slots__ = ("weapon", "pinned", "core", "zoom", "candidates", "base_obj", "base_total_obj")
+    __slots__ = ("weapon", "pinned", "core", "zoom", "candidates", "base_obj", "base_total_obj", "ignore_headshot_bonus")
 
 
 def _scenario_key(scenario) -> tuple:
@@ -73,7 +73,7 @@ def _build(weapon: Mapping[str, Any], fire_mode: int, scenario) -> Prep:
         SUPPORTED_WEAPON_UPGRADE_TYPES, _KNOWN_MULTIPART_PATHS, _qualifier_rejection, _read_innate_elements,
         _require_nonnegative_finite, archgun_arcane_type_applies,
     )
-    from .event_profiles import (base_profile, co_profile, perfect_release, reloads_after_every_shot,
+    from .event_profiles import (base_profile, co_profile, ignores_headshot_bonus, perfect_release, reloads_after_every_shot,
                                  super_crit_on_status, super_status_on_crit)
     from .sniper import zoom_effects
     from .beam_ramp import is_furis_beam
@@ -244,10 +244,12 @@ def _build(weapon: Mapping[str, Any], fire_mode: int, scenario) -> Prep:
         orbStacks=state.get('orbStacks', 1),
         orbSpecial=bool(state.get('orbSpecialShield', False)),
         radialOnly=damage.get('source') in ('ExplosiveAttack', 'RadialDamage', 'EmbedDeathAttack', 'StackingAttack'),
+        ignoreHeadshotBonus=ignores_headshot_bonus(weapon, fire_mode),
         forced=list(forced.items()),
         ammoCost=float(mode.get("ammoCost") or 1),
     )
     prep = Prep()
+    prep.ignore_headshot_bonus = config['ignoreHeadshotBonus']
     prep.weapon = weapon
     prep.pinned = pin(weapon)
     prep.zoom = list(zoom_effects(weapon, fire_mode, scenario))
@@ -263,7 +265,7 @@ def _build(weapon: Mapping[str, Any], fire_mode: int, scenario) -> Prep:
 
 def apply(weapon, effects, fire_mode, scenario, *, need_spec=True):
     """(ModdedStats, CoSpec) like the reference, or Unsupported."""
-    from .damage import CoSpec, ModdedStats, ModEffectList, innate_terms_for, with_innate
+    from .damage import CoSpec, ModdedStats, ModEffectList, innate_terms_for, motovore_wheel_effects, with_innate
 
     if innate_terms_for(weapon, fire_mode):
         effects = with_innate(weapon, ModEffectList(list(effects), skipped=getattr(effects, "skipped", ())), fire_mode)
@@ -272,23 +274,27 @@ def apply(weapon, effects, fire_mode, scenario, *, need_spec=True):
             and heavy.get("components"):
         raise Unsupported("heavy components")
     skipped = list(getattr(effects, "skipped", ()))
-    if SHADOW and not isinstance(effects, list):
+    if (SHADOW or scenario.model_spread) and not isinstance(effects, list):
         from .damage import ModEffectList
         effects = ModEffectList(list(effects), skipped=skipped)
+    native_effects = motovore_wheel_effects(weapon, effects, fire_mode, scenario)
     prep = prep_for(weapon, fire_mode, scenario)
-    fields, spec_parts = wfcore.apply_mods(prep.core, effects, skipped, scenario.victim_status_count, need_spec)
+    fields, spec_parts = wfcore.apply_mods(prep.core, native_effects, skipped, scenario.victim_status_count, need_spec)
     fields["innate_element_candidates"] = prep.candidates
     source_mode=weapon['fireModes'][fire_mode]
     if source_mode.get('nativeAmmoFree'):fields['ammo_cost']=0.
     if source_mode.get('nativeFireCooldownSeconds'):
         fields['fire_rate']=min(fields['fire_rate'],1./source_mode['nativeFireCooldownSeconds'])
-    from .event_profiles import ignores_headshot_bonus
-    ignored = ignores_headshot_bonus(weapon, fire_mode)
-    fields = {name:value for key,value in fields.items() for name,value in
-              ([(key,value),('radial_victim_crit',False),('ignore_headshot_bonus',ignored)] if key=='radial_only' else [(key,value)])}
+    if 'ignore_headshot_bonus' not in fields:  # Compatibility with an older Portable core.
+        fields = {name:value for key,value in fields.items() for name,value in
+                  ([(key,value),('radial_victim_crit',False),('ignore_headshot_bonus',prep.ignore_headshot_bonus)]
+                   if key=='radial_only' else [(key,value)])}
     fields.setdefault("delayed_radial_hit_event", False)
     stats = ModdedStats.__new__(ModdedStats)
     stats.__dict__.update(fields)
+    if scenario.model_spread:
+        from .deferred_spread import apply_spread
+        apply_spread(stats, weapon, fire_mode, native_effects, scenario)
     if not need_spec:
         if SHADOW:
             shadow((stats, None), weapon, effects, fire_mode, scenario)

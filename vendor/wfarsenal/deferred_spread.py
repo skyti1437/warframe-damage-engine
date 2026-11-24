@@ -1,16 +1,45 @@
-"""Deferred spread experiment (2026-09-30 user preference).
-
-Not imported by damage, replay, search, or contribution code. Geometry and native
-angle reduction are retained for future research, NOT game-measured hit accuracy.
-To reconnect: revalidate hitbox/angle semantics and wire all scoring paths together.
-"""
+"""Opt-in one-target spread model for the pinned weapon profiles."""
 from __future__ import annotations
+import json
 import math
-from .damage import ModdedStats, _bucket, _combine
+import sys
+from functools import lru_cache
+from pathlib import Path
+from .damage import ModdedStats, _bucket, _combine, _qualifier_rejection
+
+
+@lru_cache(maxsize=1)
+def _profiles():
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+    try:
+        return json.loads((root / "data/mechanics/deferred-spread-profiles.json").read_bytes())["profiles"]
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
+def apply_spread(stats, weapon, fire_mode, effects, scenario):
+    if not scenario.model_spread or not scenario.distance or stats.radial_only:
+        return
+    profile = _profiles().get(weapon.get("path"))
+    index = weapon.get("__selectedFireMode__", fire_mode)
+    if profile is None or index != profile["fireMode"] or stats.continuous:
+        return
+    weapon_types = {str(path).rstrip("/") for path in (*tuple(weapon.get("ancestry") or ()), weapon.get("path")) if path}
+    spread_effects = [
+        effect for effect in effects
+        if effect.upgrade_type == "WEAPON_SPREAD" and effect.supported
+        and (not effect.valid_type or effect.valid_type.rstrip("/") in weapon_types)
+        and not _qualifier_rejection(effect, weapon, scenario)
+    ]
+    stats.spread_min_deg, stats.spread_max_deg = resolved_angles(profile, spread_effects, aiming=scenario.aiming)
+    stats.hit_probability = spread_hit_probability(stats, scenario.distance, body_radius=profile["bodyRadiusM"])
+    # Replay already consumes fractional pellet counts for direct damage,
+    # status and on-hit triggers. The paid firing clock is unchanged.
+    stats.multishot *= stats.hit_probability
 
 
 def resolved_angles(profile, effects, *, aiming):
-    """Research only: callers must supply already weapon-filtered effects."""
+    """Resolve absolute angles with already weapon-filtered effects."""
     cone = profile['spreadAim' if aiming else 'spreadHip']
     terms = _bucket(effects)['WEAPON_SPREAD']
     return (max(0., _combine(cone['min_deg'], terms)),

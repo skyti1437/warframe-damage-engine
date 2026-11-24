@@ -33,7 +33,7 @@ _UNSUPPORTED_COMBAT = (
 
 
 def supported(stats, options) -> bool:
-    if not ENABLED or not getattr(wfcore,"ELECTRIC_GAS_PROC_PILE",0) or not getattr(wfcore,"NATIVE_TYPE_QUANTIZATION",0) or options.get("collect_timeline", True):
+    if not ENABLED or getattr(wfcore,"ELECTRIC_GAS_PROC_PILE",0) < 2 or not getattr(wfcore,"NATIVE_CRIT_FACTOR",0) or options.get("collect_timeline", True):
         return False
     draw = options.get("weak_draw")
     if draw is not None and not callable(getattr(draw, "native_spec", None)):
@@ -44,6 +44,8 @@ def supported(stats, options) -> bool:
     combat = options.get("combat")
     if not combat or not combat.get("resolve"):
         return False
+    if combat.get("meleeStartingTier"):
+        return False  # The native schedule starts from the MOD-provided floor.
     if ((combat.get('manualDetonation') or {}).get('impactThenEmbed')
             and getattr(wfcore,'ALT_EMBEDDED_LIFECYCLE',0)<3):
         return False
@@ -86,6 +88,8 @@ def supported(stats, options) -> bool:
     if combat.get('quantaStrategy') and not getattr(wfcore,'QUANTA_PAID_PRIMARY',0):
         return False
     if combat.get('nativeFireGate') and not getattr(wfcore, 'NATIVE_FIRE_COOLDOWN', 0):
+        return False
+    if (combat.get('fireRateSpool') or {}).get('nativeMaxShots') and not getattr(wfcore, 'NATIVE_CONTINUOUS_RATE_REFIRE', 0):
         return False
     if combat.get('chargeBeforeFire') and not getattr(wfcore, 'ORDINARY_CHARGED_WINDUP', 0):
         return False
@@ -387,7 +391,7 @@ def _target_tables(target, locations):
         if overguard > 0.0:
             value = _overguard_damage_multiplier(interaction, magnetic_stacks)
         else:
-            value = _target_damage_multiplier(interaction, dot_target, armour=armour, faction_deltas=faction_deltas,
+            value = _target_damage_multiplier(interaction, shielded=False, armour=armour, faction_deltas=faction_deltas,
                                               armour_bypass=armour_bypass, shield_bypass=shield_bypass)
             if defenses["shield"] > 0.0 and interaction not in shield_bypass:
                 value *= _magnetic_defense_multiplier(magnetic_stacks)
@@ -402,10 +406,11 @@ _TARGET_SETUPS: dict = {}
 
 
 def _target_setup(target, level, armour_strip, steel_path, enemy_enhancements):
-    from .damage import (enemy_defenses, _hit_location_info, _faction_damage_deltas, _damage_type_set,
-                         faction_bracket, DEFAULT_ARMOUR_BYPASS_DAMAGE_TYPES, DEFAULT_SHIELD_BYPASS_DAMAGE_TYPES)
+    from .damage import (enemy_defenses, _enemy_enhancement_cache_key, _hit_location_info, _faction_damage_deltas, _damage_type_set,
+                         devourer_blocks_radiation, faction_bracket, DEFAULT_ARMOUR_BYPASS_DAMAGE_TYPES,
+                         DEFAULT_SHIELD_BYPASS_DAMAGE_TYPES)
     try:
-        options = None if enemy_enhancements is None else tuple(sorted(enemy_enhancements.items()))
+        options = _enemy_enhancement_cache_key(enemy_enhancements)
         from .record_keys import record_key
         key = (record_key(target), level, armour_strip, steel_path, options)
         hash(key)
@@ -422,6 +427,7 @@ def _target_setup(target, level, armour_strip, steel_path, enemy_enhancements):
         enemy_enhancements=enemy_enhancements,
     )
     full = [float(defenses.get(k) or 0.0) for k in ("overguard", "shield", "health")]
+    from .magnetic_break import electricity_immune, target_proxy
     ehp = sum(full)
     armour_base = float(defenses.get("armour") or 0.0)
     cache = dict(
@@ -434,6 +440,9 @@ def _target_setup(target, level, armour_strip, steel_path, enemy_enhancements):
         ),
         target_faction=str(target.get("faction") or ""),
         faction_bracket=faction_bracket(target),
+        magnetic_proxy=target_proxy(target) if full[0] or full[1] else None,
+        magnetic_electric_immune=electricity_immune(target),
+        blocks_radiation=devourer_blocks_radiation(target),
     )
     locations = {}
     for location in ("body", "head"):
@@ -468,7 +477,10 @@ def _projectile_state(state):
 def _cycle_spec(cycle):
     if not cycle:
         return None
-    return {key: cycle.get(key) for key in ('hits', 'enterSeconds', 'exitSeconds', 'pool', 'chargeOn', 'killCharged', 'chargeBeforeFire', 'damageScale', 'sourceModeKillChargeTrue')}
+    spec = {key: cycle.get(key) for key in ('hits', 'enterSeconds', 'exitSeconds', 'pool', 'chargeOn', 'killCharged', 'chargeBeforeFire', 'damageScale', 'sourceModeKillChargeTrue')}
+    if cycle.get('gaugeChargingHeadshots') and spec.get('chargeOn') not in ('direct_hits', 'kills'):
+        spec['chargeOn'] = 'direct_hits'
+    return spec
 
 
 def trajectory(
@@ -523,6 +535,15 @@ def trajectory(
     rate = max(0.0, float(attacks_per_second))
     defenses, full, ehp, armour_base, cache, locations, bare_def, tables = _target_setup(
         target, level, armour_strip, steel_path, enemy_enhancements)
+    magnetic_packet = getattr(wfcore, 'MAGNETIC_BREAK_PACKET', 0)
+    tau_runtime = getattr(wfcore, 'TAU_STATUS_VULNERABILITY', 0)
+    has_tau = ('DT_SENTIENT' in stats.damage_types or 'DT_SENTIENT' in (forced_procs or {})
+               or 'DT_SENTIENT' in stats.native_forced_procs or 'DT_SENTIENT' in stats.independent_proc_chances)
+    if ((not magnetic_packet and (full[0] or full[1]))
+            or (has_tau and not tau_runtime)
+            or (cache['blocks_radiation'] and not getattr(wfcore, 'DEVOURER_RADIATION_ACCEPTANCE', 0))):
+        STATS['fallback'] += 1
+        return None
     execute = float((combat or {}).get('executeBelow') or 0.0)
     if execute:
         # combat_replay: Enkaus's dissolve leaves only the health above it.
@@ -592,11 +613,15 @@ def trajectory(
                             segments=helper.melee_segments())
     config = dict(
         stats=stats, resolver=combat['resolve'], window=window, head=head, rate=rate,
+        scoreOnly=bool(score_only and life_curve is None and not collect_timeline),
         punctureCap=proc_stack_cap(stats, 'DT_PUNCTURE', 5.0),
         statusRateMultiplier=float(status_rate_multiplier), damageRateMultiplier=float(damage_rate_multiplier),
         full=full, ehp=float(ehp), armourBase=armour_base, elementalArmourStrip=float(elemental_armour_strip),
         forcedProcs=dict(forced_procs or {}), factionDeltas=dict(cache['faction_deltas']),
         armourBypass=list(cache['armour_bypass']), shieldBypass=list(cache['shield_bypass']),
+        magneticProxy=cache['magnetic_proxy'], magneticWeaknessBonus=combat.get('magneticWeaknessBonus'),
+        magneticElectricImmune=cache['magnetic_electric_immune'],
+        blocksRadiation=cache['blocks_radiation'],
         extraHits=[(dtype, float(share)) for dtype, share, _forced in extra_hits], extraScale=float(extra_scale),
         weaponSlot=str(combat.get("weaponSlot") or ""), distance=combat.get("distance"),
         punchthrough=float(state.get('punchthroughTargets', 0) or 0),
@@ -639,6 +664,9 @@ def trajectory(
             targets = []
             for enhancements in health_targets:
                 _, pools, _, _, _, _, _, _ = _target_setup(target, level, armour_strip, steel_path, enhancements)
+                if not magnetic_packet and (pools[0] or pools[1]):
+                    STATS['fallback'] += 1
+                    return None
                 pools = list(pools)
                 if execute:
                     pools[2] *= 1.0 - execute
@@ -670,14 +698,16 @@ def trajectory(
         q["stacks"] = stacks
     pools = core["pools"]
     kills = core["kills"]
+    score = kills + (1 - sum(pools) / ehp if ehp else 0.0)
+    if config['scoreOnly']:
+        overflows = core['mineOverflows'] if 'mineOverflows' in core else core['mines'][3]
+        unsupported.extend(['talons-single-throw-deployment-overflow-unmodeled'] * overflows)
+        damage = sum(core['totals'])
+        return dict(killsPerMinute=score * 60 / window if window else 0.0,
+                    windowDps=damage / window if window else 0.0,
+                    totalWindowDamage=damage, unsupported=unsupported, limitations=[])
     totals = dict(zip(("direct", "dot", "nonDot", "syndicate", "arcane"), core["totals"]))
     averaged = {k: 0.0 for k in names.values()}
-    score = kills + (1 - sum(pools) / ehp if ehp else 0.0)
-    if score_only and life_curve is None and not collect_timeline:
-        unsupported.extend(['talons-single-throw-deployment-overflow-unmodeled'] * core["mines"][3])
-        return dict(killsPerMinute=score * 60 / window if window else 0.0,
-                    windowDps=sum(totals.values()) / window if window else 0.0,
-                    totalWindowDamage=sum(totals.values()), unsupported=unsupported, limitations=[])
     initial = damage_against_cached_armour(
         stats, armour_base, defenses, target=target, _target_cache=locations["body"]
     )
@@ -832,9 +862,12 @@ def trajectory(
             "magnetic-break-ordinary-electric-source-context",
             "electric-gas-adjacent-count-arrival",
             "gas-mixed-duration-cumulative-newer-rank",
-            'spread-hit-loss-not-modeled',
+            *(['spread-uniform-cone-expected-pellets'] if stats.spread_min_deg is not None
+              else ['spread-hit-loss-not-modeled']),
         ] + (['spool-linear-rate-from-raw-max-shots','spool-idle-threshold-reset-no-partial-decay'] if combat.get('spool') else [])
-          + (['fire-rate-spool-reference-transcribed','fire-rate-spool-resets-on-any-pause'] if combat.get('fireRateSpool') else [])
+          + ((
+              [] if combat['fireRateSpool'].get('nativeMaxShots') else ['fire-rate-spool-reference-transcribed']
+          ) + ['fire-rate-spool-resets-on-any-pause'] if combat.get('fireRateSpool') else [])
           + ([('alternox-full-batch-ordered-expected-slots' if manual_detonation.get('impactThenEmbed') else 'talons-expected-projectile-capacity'),'manual-detonation-explicit-player-cadence'] if manual_detonation else [])
           + (['onos-native-alignment-shots-held-rate-and-postfire-cadence','onos-radial-target-coverage-explicit']
              if combat.get('onosCharge') else [])

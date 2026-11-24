@@ -11,7 +11,7 @@ os.environ["WF_ANALYSIS_STATICS_CACHE_PATH"] = str(Path(__file__).with_name("ana
 import app
 from wfarsenal import native_replay
 
-FINGERPRINT = "85ec9cdb3461c01c"
+FINGERPRINT = "535ed49f5a51149d"
 BUILD = "2026.08.13.13.24"
 
 
