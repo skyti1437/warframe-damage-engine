@@ -33,11 +33,11 @@ pub(super) fn archgun_scope(path: &str, base: &str) -> bool {
         matches!(base, "/Lotus/Weapons/Tenno/LotusLongGun" | "/Lotus/Weapons/Tenno/Pistol/LotusPistol")
 }
 
-fn applies(arcane: &Value, req: &Request<'_>, frame: bool) -> bool {
+pub(super) fn applies(arcane: &Value, req: &Request<'_>, frame: bool) -> bool {
     let weapon = req.weapon;
     let path = text(&arcane["path"]);
     let base = text(&arcane["compatibility"]);
-    if arcane["equipmentType"] == "Kitgun Arcane" && !rows(&weapon["ancestry"]).iter()
+    if arcane["equipmentType"] == "Kitgun Arcane" && !truth(&weapon["kitgunParts"]) && !rows(&weapon["ancestry"]).iter()
         .any(|v| text(v).to_ascii_lowercase().contains("modular")) { return false; }
     if compatible(arcane, weapon) || weapon["slot"] == "arch_gun" && archgun_scope(path, base) { return true; }
     if !frame { return false; }

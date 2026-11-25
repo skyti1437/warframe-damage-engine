@@ -1,10 +1,16 @@
 # wfcore-server
 
-Phase 2a 独立服务。工作区发行版构建命令为 `python tools/build_rust_workspace.py --offline --server-only`。运行 `rust/target/release/wfcore-server --probe` 检查数据和目录，运行 `rust/target/release/wfcore-server --port 8765` 启动 HTTP 服务。Windows 的二进制带 `.exe` 后缀。
+Phase 3a 独立服务。工作区发行版构建命令为 `python tools/build_rust_workspace.py --offline --server-only`。运行 `rust/target/release/wfcore-server --probe` 检查数据和目录，运行 `rust/target/release/wfcore-server --port 8765` 启动 HTTP 服务。Windows 的二进制带 `.exe` 后缀。
 
 `--data-dir` 接受项目根或 `data` 目录。省略时从当前目录及可执行文件位置向上查找。默认监听 `127.0.0.1:8765`，`WF_SERVER_THREADS` 可覆盖两个 HTTP 工作线程的默认配置。健康指纹由加载的数据文件和内置兼容规则计算。
 
 Rust 在启动时应用快照修正、合并条目、计算公开标记并序列化目录。`--dump-catalog` 输出与 HTTP 共用的目录缓存，供禁止监听端口的环境对拍。`EngineData` 保留路径索引与战斗输入，后续计算路由可复用。
+
+## 计算入口
+
+`POST /api/simulate` 计算已装备配装。`POST /api/build` 从导出的卡池搜索配装，复用模拟的面板和事件回放，并返回所选卡片、容量、Forma 和评分。服务也提供 `GET /api/health` 和 `GET /api/catalog`。`POST /api/analyze` 与 `POST /api/trait-matrix` 返回 501。
+
+`--simulate-batch <JSON_PATH>` 和 `--build-batch <JSON_PATH>` 接受由 `{"id": "case", "body": {...}}` 条目组成的 JSON 数组。标准输出按输入顺序给出每项的 `id`、`status` 和 `response`。每个请求体与 HTTP 使用相同的 128 KiB 上限和校验。显赫武器的战甲联动配卡仍依赖战甲计算器。
 
 ## 冻结的目录兼容规则
 
@@ -15,7 +21,7 @@ Rust 在启动时应用快照修正、合并条目、计算公开标记并序列
 - `incarnon_details.json` 保存 `_incarnon_options` 中依赖计算模型的效果说明和未建模提示。路线、名称与推荐项仍取自灵化导出、文本及默认策略。
 - `mod_rules.json`、`arcane_rules.json`、`riven_rules.json` 和 `factions.json` 保存 Python 规则的卡片修正、支持表、套装及词条映射、赋能控制和派系回退值。`display.json` 保存公开的外部增益与哨兵展示信息。两套目录在 Python 测试中按全部 JSON 字段对拍。
 
-对应的伤害、配卡和事件实现迁移后，可以用共享的 Rust 计算替换冻结基线和计算标记。更新快照或补丁时应重新对拍上述规则。
+配卡与模拟共享磁力破盾回放。`magnetic_weakness.json` 保留 WFSim `27f4b19fa3` 的原始武器弱点标量，来源与 Python 参考实现相同。更新快照或补丁时应重新对拍上述规则。
 
 ## HTTP 传输
 

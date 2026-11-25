@@ -22,6 +22,7 @@ pub(crate) struct Rules {
     pub factions: Value,
     pub riven: Value,
     pub display: Value,
+    pub magnetic_weakness: Value,
 }
 
 impl Rules {
@@ -39,6 +40,7 @@ impl Rules {
             factions: parse("factions", include_str!("../compat/factions.json"))?,
             riven: parse("riven_rules", include_str!("../compat/riven_rules.json"))?,
             display: parse("display", include_str!("../compat/display.json"))?,
+            magnetic_weakness: parse("magnetic_weakness", include_str!("../compat/magnetic_weakness.json"))?,
         })
     }
 }

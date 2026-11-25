@@ -277,7 +277,7 @@ fn floor(profile: &Value, co: &Value) -> f64 {
 pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &ModdedFields,
                          req: &Request<'_>, target: &Target<'_>, level: u64, steel: bool, enhancements: &Value,
                          effects: &Effects, schedule: Option<&Schedule>, arcanes: &arcane::Equipped<'_>,
-                         status_rate: f64, damage_rate: f64) -> SimResult<Value> {
+                         status_rate: f64, damage_rate: f64, score_only: bool) -> SimResult<Value> {
     let defenses = target.defenses(level, steel, req.strip, 0.0, enhancements);
     let full = defenses.full;
     let ehp = psum(full);
@@ -349,6 +349,9 @@ pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &Mod
     let track_kills = sources.iter().any(|source| !source.actor_only && source.per_event != 0.0
         && source.kind.as_deref() == Some("on-headshot-kill"));
     let feedback = track_kills || sources.iter().any(|source| !source.actor_only && source.per_event != 0.0 && source.free_ammo);
+    let magnetic_proxy = super::magnetic::proxy(target.record);
+    let magnetic_weakness = super::magnetic::weakness(weapon.data, weapon.path);
+    let magnetic_electric_immune = super::magnetic::electricity_immune(target.record);
     let run = |weak_draw| {
         let input = TrajectoryInput {
             window: req.window, rate: melee_rate.unwrap_or_else(|| weapon::attack_rate(fields)), forced_procs: forced_procs.clone(),
@@ -370,18 +373,40 @@ pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &Mod
             weapon_slot: text(&req.weapon["slot"]).into(), lane_stratum: 0.5, selected_incarnon: is_incarnon && cycle.is_none(),
             reload_after_every_shot: !is_incarnon && truth(weapon.mode_profile("reload-after-shot", req.mode)),
             last_burst: evolution.last_burst,
+            tap: effects.double_tap,
+            puncture_armor_strip: evolution.puncture_strip,
+            magnetic_proxy, magnetic_weakness, magnetic_electric_immune,
             infinite_ammo: req.scenario.state.and_then(|state| state.get("infiniteAmmo")) == Some(&Value::Bool(true)),
             puncture_cap: 5.0 + fields.proc_max_stacks.iter().find(|(dtype, _)| dtype == "DT_PUNCTURE").map_or(0.0, |v| v.1),
             blocks_radiation: target.record["path"] == "/Lotus/Types/Enemies/Grineer/Disruption/Avatars/DemoDevourerAvatar",
             encumber, cryogenic: cryogenic.map(|(stacks, uptime, _)| (stacks, uptime)), empowered, fortifier, enervate: enervate.clone(),
             status_pool: status_pool.clone(), actor_events: actor_events.clone(), energy_rate: num(state("energySpendPerSecond")),
-            sources: sources.clone(), types: types.clone(), initial,
+            sources: sources.clone(), types: types.clone(), initial, score_only,
             ..TrajectoryInput::default()
         };
-        let output = replay::trajectory_sampled(input, &provider).map_err(|error| error.to_string())?;
+        let output = if score_only { replay::trajectory(input, &provider) }
+            else { replay::trajectory_sampled(input, &provider) }
+            .map_err(|error| error.to_string())?;
         Ok::<_, String>(output)
     };
+    let kills = |output: &replay::TrajectoryOutput| {
+        output.kills as f64 + if ehp != 0.0 { 1.0 - psum(output.pools) / ehp } else { 0.0 }
+    };
+    let golden = (5.0_f64.sqrt() - 1.0) / 2.0;
+    let first = run(feedback.then_some((true, 0.0, golden, track_kills)))?;
+    let branches = if feedback && first.weak_uncertainty >= 0.05 {
+        Some((0..16).map(|i| run(Some((false, (i as f64 + 0.5) / 16.0, golden, true))))
+            .collect::<SimResult<Vec<_>>>()?)
+    } else { None };
+    if score_only {
+        let kpm = |output| kills(output) * 60.0 / req.window;
+        let score = branches.as_ref().map_or_else(|| kpm(&first), |outputs| {
+            psum(outputs.iter().map(kpm)) / outputs.len() as f64
+        });
+        return Ok(json!(score));
+    }
     let serialize = |output: replay::TrajectoryOutput| {
+        let score = kills(&output);
         let details = output.details.expect("展示回放必须有事件统计");
         let gauge_limit = weapon.incarnon["hits"].as_i64();
         let mut points = Vec::with_capacity(output.samples.len());
@@ -449,7 +474,6 @@ pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &Mod
         if cryogenic.is_some() { limitations.push("cryogenic-single-target-expected-procs-no-neighbor-burst"); }
         if empowered.is_some() { limitations.extend(["empowered-grouped-expected-instances", "empowered-derived-script-procs-excluded"]); }
         if fortifier.is_some() { limitations.extend(["fortifier-raw-multiply-r5-x8-reference-x9-conflict", "fortifier-player-overguard-no-incoming-damage"]); }
-        let score = output.kills as f64 + if ehp != 0.0 { 1.0 - psum(output.pools) / ehp } else { 0.0 };
         let total = psum(output.totals);
         let named = |values: replay::NamedDamage| -> Value {
             Value::Object(values.into_iter().map(|(k, v)| (k, json!(v))).collect())
@@ -478,15 +502,12 @@ pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &Mod
                 "level": level, "steelPath": steel, "enhancements": enhancements},
         })
     };
-    if !feedback {
-        return run(None).map(serialize);
+    if let Some(outputs) = branches {
+        let branches: Vec<_> = outputs.into_iter().map(serialize).collect();
+        Ok(merge_branches(&branches))
+    } else {
+        Ok(serialize(first))
     }
-    let golden = (5.0_f64.sqrt() - 1.0) / 2.0;
-    let probe = run(Some((true, 0.0, golden, track_kills)))?;
-    if probe.weak_uncertainty < 0.05 { return Ok(serialize(probe)); }
-    let branches = (0..16).map(|i| run(Some((false, (i as f64 + 0.5) / 16.0, golden, true))).map(&serialize))
-        .collect::<SimResult<Vec<_>>>()?;
-    Ok(merge_branches(&branches))
 }
 
 fn merge_branches(branches: &[Value]) -> Value {

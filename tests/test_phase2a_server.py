@@ -225,7 +225,7 @@ class Phase2aServerTests(unittest.TestCase):
         ]
         cases.extend(
             ("POST", f"/api/{endpoint}", "2", b"{}", 501, "not_implemented")
-            for endpoint in ("build", "analyze", "trait-matrix")
+            for endpoint in ("analyze", "trait-matrix")
         )
         for method, path, length, body, expected_status, code in cases:
             with self.subTest(method=method, path=path, length=length, body=body):

@@ -9,6 +9,8 @@ use wfcore_lib::{
 
 pub(super) const BENCHMARK_TARGET: &str = "/Lotus/Types/Enemies/Duviri/Avatars/DuviriMeleeAvatar";
 
+#[derive(Clone)]
+
 pub(super) struct Target<'a> {
     pub record: &'a Value,
     pub bracket: f64,
@@ -159,8 +161,10 @@ impl<'a> Target<'a> {
             (enemy["path"] == "/Lotus/Types/Enemies/Orokin/RifleSpacemanAvatar"
                 && enemy["damageController"] == "/Lotus/Types/Enemies/Corpus/Spaceman/AIWeek/RifleSpacemanDamageController").then_some(1.0)
         });
+        let aura_armour = num(&selected["auraArmourReduction"]);
+        let aura_shield = num(&selected["auraShieldReduction"]);
         let shield_native = shield_level.filter(|_| shield > 0.0 && !eximus && !empowered)
-            .map(|base| native_shield(shield, (scaled_level - base).max(0.0), shield_curve, steel))
+            .map(|base| native_shield(shield, (scaled_level - base).max(0.0), shield_curve, steel, aura_shield))
             .filter(|v| v.is_finite());
         let delta = base_level.map_or(0.0, |base| (scaled_level - base).max(0.0));
         let steel_multiplier = if steel { 2.5 } else { 1.0 };
@@ -172,7 +176,7 @@ impl<'a> Target<'a> {
                 else { scaling(delta, [0.005, 1.75, 0.4, 0.75]) };
             (num(&enemy["armour"]) * scale).clamp(200.0, 2700.0)
         } else { 0.0 };
-        let armour = (armour_base * (1.0 - strip)) * (1.0 - elemental);
+        let armour = (armour_base * (1.0 - strip)) * (1.0 - elemental) * (1.0 - aura_armour);
         let mut overguard = num(&enemy["overguard"]) * overguard_scale(scaled_level);
         if standard_eximus {
             overguard = overguard.max(12.0 * overguard_scale(scaled_level));
@@ -182,6 +186,7 @@ impl<'a> Target<'a> {
         let empowerment = if empowered { 2.0 + 0.5 * selected["playerCount"].as_f64().unwrap_or(1.0) } else { 1.0 };
         health *= empowerment;
         shield *= empowerment;
+        if shield_native.is_none() { shield *= 1.0 - aura_shield; }
         if selected["archimedea"] == true { overguard += health * 0.5; }
         if selected["noOverguard"] == true { overguard = 0.0; }
         if ["damageAttenuation", "hasDamageAttenuation", "dynamicDamageResistance"].iter().any(|key| truth(&enemy[*key])) {
@@ -280,7 +285,7 @@ fn scaling(delta: f64, [low, lo_exp, high, hi_exp]: [f64; 4]) -> f64 {
     1.0 + lo + (hi - lo) * (3.0 * pow(t, 2.0) - 2.0 * pow(t, 3.0))
 }
 
-fn native_shield(base: f64, delta: f64, curve: [f64; 4], steel: bool) -> f64 {
+fn native_shield(base: f64, delta: f64, curve: [f64; 4], steel: bool, aura: f64) -> f64 {
     let [lo, lo_exp, hi, hi_exp] = curve.map(|v| v as f32);
     let delta = delta as f32;
     let low = 1.0 + lo * pow(delta as f64, lo_exp as f64) as f32;
@@ -291,7 +296,7 @@ fn native_shield(base: f64, delta: f64, curve: [f64; 4], steel: bool) -> f64 {
     let sp = if steel { 1.58114_f32 } else { 1.0 };
     let initial = (base as f32 * sp + 0.5).floor();
     let stored = (initial * value + 0.5).floor();
-    (stored * sp + 0.5).floor() as f64
+    (stored * sp * (1.0 - aura as f32) + 0.5).floor() as f64
 }
 
 fn overguard_scale(level: f64) -> f64 {

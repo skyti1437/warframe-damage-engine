@@ -4,6 +4,21 @@ use super::{loadout::terms, num, rows, text, Request};
 use super::weapon::Effect;
 use serde_json::{json, Value};
 
+pub(super) const DOUBLE_TAP: &str = "/Lotus/Upgrades/Mods/PvPMods/Rifle/MoreDamageonTripleTapRifleMod";
+pub(super) const CONSECUTIVE_DAMAGE: &str = "RUNTIME_CONSECUTIVE_HIT_DAMAGE";
+
+pub(super) fn double_tap(record: &Value, rank: u64) -> Option<(f64, f64, f64)> {
+    let script = &record["runtimeScripts"]["apply"];
+    if record["path"] != DOUBLE_TAP || record["maxRank"] != 3 || rank > 3 ||
+        script["Script"] != "/Lotus/Upgrades/CosmeticEnhancers/Offensive/BonusDamageOnNextHit.lua" ||
+        script["Function"] != "ApplyUpgrade" || (num(&script["_bonusDamagePercent"]) - 0.05).abs() > 1e-5 ||
+        (num(&script["_multTimeWindow"]) - 0.5).abs() > 1e-5 {
+        return None;
+    }
+    let per_hit = 0.05 * (rank + 1) as f64;
+    Some((per_hit, (4.0 / per_hit + 1e-9).floor(), 0.5 * (rank + 1) as f64))
+}
+
 pub(super) fn effects(card: &Value, rank: u64, req: &Request<'_>, skipped: &mut Vec<String>) -> Option<Vec<Effect>> {
     let path = text(&card["path"]);
     let scripts = &card["runtimeScripts"];
@@ -16,6 +31,9 @@ pub(super) fn effects(card: &Value, rank: u64, req: &Request<'_>, skipped: &mut 
         Effect::export(&json!({"upgradeType": upgrade, "operation": operation, "valuePerRank": value}), path)
     };
     let normal = || terms(&card["effects"], path, rank, 1.0);
+    if let Some((damage, _, _)) = double_tap(card, rank) {
+        return Some(vec![add(CONSECUTIVE_DAMAGE, "ADD", damage)]);
+    }
     match filename {
         "LimitMultishot.lua" | "LimitFireRate.lua" => {
             let multishot = filename == "LimitMultishot.lua";

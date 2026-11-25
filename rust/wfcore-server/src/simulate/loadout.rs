@@ -45,11 +45,11 @@ pub(super) fn combo_gate(condition: &Value) -> bool {
     rows(&condition["conditions"]).iter().any(|s| text(s).ends_with("/OnComboTierCondition"))
 }
 
-fn keys(condition: &Value) -> impl Iterator<Item = &str> {
+pub(super) fn keys(condition: &Value) -> impl Iterator<Item = &str> {
     [&condition["sourcePath"], &condition["conditionTag"]].into_iter().filter_map(Value::as_str).filter(|s| !s.is_empty())
 }
 
-fn kill_gate(condition: &Value) -> bool {
+pub(super) fn kill_gate(condition: &Value) -> bool {
     keys(condition).chain(rows(&condition["conditions"]).iter().filter_map(Value::as_str))
         .any(|key| key.to_ascii_lowercase().contains("killcondition"))
 }
@@ -65,6 +65,12 @@ pub(super) struct Card<'a> {
     slot: usize,
     explicit_slot: bool,
     meta: Option<&'a Value>,
+}
+
+impl<'a> Card<'a> {
+    pub fn installed(raw: &'a Value, rank: u64) -> Self {
+        Self { raw, rank, compatible: true, slot: 0, explicit_slot: false, meta: None }
+    }
 }
 
 pub(super) struct Loadout<'a> {
@@ -83,11 +89,11 @@ pub(super) struct Loadout<'a> {
     pub notes: Vec<String>,
 }
 
-fn set_key(value: &Value) -> String {
+pub(super) fn set_key(value: &Value) -> String {
     text(value).trim().replace('\\', "/").trim_end_matches('/').to_lowercase()
 }
 
-fn expand(card: &Value, rank: u64, req: &Request<'_>, stacks: &Map<String, Value>, skipped: &mut Vec<String>) -> Vec<Effect> {
+pub(super) fn expand(card: &Value, rank: u64, req: &Request<'_>, stacks: &Map<String, Value>, skipped: &mut Vec<String>) -> Vec<Effect> {
     let source = text(&card["path"]);
     let mut effects = if truth(&card["runtimeScripts"]) {
         let Some(effects) = super::mod_runtime::effects(card, rank, req, skipped) else {
@@ -311,7 +317,7 @@ impl<'a> Loadout<'a> {
 
 }
 
-fn riven_terms(data: &EngineData, raw: &Value) -> SimResult<(Vec<Effect>, Vec<String>)> {
+pub(super) fn riven_terms(data: &EngineData, raw: &Value) -> SimResult<(Vec<Effect>, Vec<String>)> {
     let mut effects = Vec::new();
     let mut skipped = Vec::new();
     for (index, row) in rows(raw).iter().enumerate() {

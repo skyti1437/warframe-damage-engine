@@ -1,10 +1,14 @@
 //! 手动模拟请求的编排，以及 HTTP 与离线批处理共用的响应契约。
 
+#[path = "build/mod.rs"]
+pub(crate) mod build;
+
 mod arcane;
 mod arcane_status;
 mod damage;
 mod events;
 mod loadout;
+mod magnetic;
 mod melee;
 mod mod_runtime;
 mod request;
@@ -80,11 +84,11 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
             json!({"eximus": false, "noOverguard": true}))
     };
     let replay_target = Target::new(replay_target, data);
-    let replay_effects = events::Effects::prepare(&req, &loadout, &arcanes, effects.clone(), &evolution,
+    let replay_effects = events::Effects::prepare(&req, &loadout.cards, &arcanes, effects.clone(), &evolution,
         schedule.as_ref().map(|s| s.route.as_str()), &data.mechanics["infinite-conditions"]["sources"],
         rows(&weapon.mechanics("weapon-passives")["innate"]));
     let timeline = timeline::calculate(&weapon, &evolution, &fields, &req, &replay_target,
-        replay_level, replay_steel, &replay_enhancements, &replay_effects, schedule.as_ref(), &arcanes, stance_status, stance_damage)?;
+        replay_level, replay_steel, &replay_enhancements, &replay_effects, schedule.as_ref(), &arcanes, stance_status, stance_damage, false)?;
     let mut unsupported: BTreeSet<String> = fields.unsupported.iter().chain(&evolution.notes)
         .chain(&req.enhancement_notes).chain(&loadout.notes).chain(&arcane.notes).cloned().collect();
     for list in [&result["targetDamage"]["unsupported"], &result["killMetrics"]["unsupported"],

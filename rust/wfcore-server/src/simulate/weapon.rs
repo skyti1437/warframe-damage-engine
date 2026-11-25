@@ -105,7 +105,7 @@ impl Effect {
         }
     }
 
-    fn rejection(&self, req: &Request<'_>, heavy: bool) -> Option<String> {
+    pub fn rejection(&self, req: &Request<'_>, heavy: bool) -> Option<String> {
         if !matches!(self.operation.as_str(), "ADD" | "ADD_BASE" | "SET" | "SET_BASE" | "MULTIPLY" | "STACKING_MULTIPLY") {
             return Some(format!("cannot evaluate operation {}", self.operation));
         }
@@ -183,6 +183,7 @@ pub(super) struct Evolution {
     pub replay_notes: Vec<String>,
     pub last_multishot: f64,
     pub last_burst: bool,
+    pub puncture_strip: f64,
     pub sources: Vec<Trigger>,
 }
 
@@ -249,7 +250,7 @@ impl Evolution {
     pub fn resolve(data: &EngineData, req: &Request<'_>) -> SimResult<Self> {
         let mut result = Self {
             choices: json!({}), policy: json!({}), effects: Vec::new(), notes: Vec::new(), replay_notes: Vec::new(),
-            last_multishot: 0.0, last_burst: false, sources: Vec::new(),
+            last_multishot: 0.0, last_burst: false, puncture_strip: 0.0, sources: Vec::new(),
         };
         let incarnon = &req.weapon["incarnon"];
         let tiers = rows(&incarnon["tiers"]);
@@ -354,6 +355,19 @@ impl Evolution {
         let path = text(&branch["path"]);
         let id = text(&branch["id"]);
         let conditions = rows(&branch["conditionalEffects"]);
+        // Audited Puncture-triggered strip is consumed by replay, with no
+        // unconditional panel contribution from its flattened child row.
+        if path.contains("/LatronIncarnonEvolutions/") && conditions.iter().any(|condition| {
+            let script = &condition["runtimeScripts"]["apply"];
+            script["Script"] == "/Lotus/Upgrades/Boons/Offensive/ReduceArmor.lua"
+                && script["Function"] == "ReduceArmor"
+                && (num(&script["_armorReduction"]) - 0.2).abs() < 1e-5
+                && script["_operationType"] == "STACKING_MULTIPLY"
+                && condition_kind(condition) == Some("proc-DT_PUNCTURE")
+        }) {
+            self.puncture_strip = 0.2;
+            return;
+        }
         let mut unknown_conditions = false;
         for (index, condition) in conditions.iter().enumerate() {
             let source = condition["sourcePath"].as_str().unwrap_or(path);
@@ -408,7 +422,7 @@ impl Evolution {
 }
 
 pub(super) fn is_weapon_effect(upgrade: &str) -> bool {
-    mods::supports_effect(upgrade)
+    mods::supports_effect(upgrade) || upgrade == super::mod_runtime::CONSECUTIVE_DAMAGE
 }
 
 pub(super) struct Weapon<'a> {
@@ -589,7 +603,8 @@ impl<'a> Weapon<'a> {
         let native_multishot = nonzero(&mode["multishot"], 1.0);
         let proc = num(&damage["procChance"]);
         let force = forced(&damage["forcedProcs"]);
-        let is_incarnon = self.is_incarnon(index);
+        let is_incarnon = if self.req.exported_mode_panel { truth(&self.req.weapon["isIncarnonForm"]) }
+            else { self.is_incarnon(index) };
         let pool = self.incarnon["pool"].as_f64().filter(|v| *v > 0.0);
         let radial = matches!(text(&damage["source"]), "ExplosiveAttack" | "RadialDamage" | "EmbedDeathAttack" | "StackingAttack");
         let charge = &profile["charge"];
@@ -618,6 +633,9 @@ impl<'a> Weapon<'a> {
                     c["effectiveness"].as_f64().unwrap_or(1.0), c["stacking"] == "adds")
             }),
             base: base.into_iter().map(|(name, value)| (mods::intern(&name), value * scaling)).collect(),
+            innate: rows(&self.req.weapon["innateElements"]).iter().filter_map(|entry| {
+                Some((entry["damageType"].as_str()?.to_owned(), entry["value"].as_f64()?))
+            }).collect(),
             aiming: self.req.scenario.aiming,
             co_base_fraction: co["baseFraction"].as_f64().unwrap_or(1.0),
             gunco_present: truth(co), gunco_base_fraction: co["baseFraction"].as_f64(),
@@ -655,10 +673,29 @@ impl<'a> Weapon<'a> {
             orb_stacks: 1, forced: force, ammo_cost: nonzero(&mode["ammoCost"], 1.0), ..ModsPrep::default()
         };
         let result = mods::apply_mods(&prep, ModsInput {
-            effects: installed.iter().enumerate().map(|(index, e)| e.classify(index, self.req, heavy)).collect(),
+            effects: installed.iter().filter(|effect| effect.upgrade != super::mod_runtime::CONSECUTIVE_DAMAGE)
+                .enumerate().map(|(index, e)| e.classify(index, self.req, heavy)).collect(),
             skipped: skipped.to_vec(), victim_status_count: status_count, need_spec: false,
         }, std::iter::empty::<Result<_, std::convert::Infallible>>()).unwrap();
-        Ok(result.fields)
+        let mut fields = result.fields;
+        if self.req.scenario.spread && !fields.radial_only && !fields.continuous {
+            let spread = &self.data.mechanics.get("deferred-spread-profiles").unwrap_or(&Value::Null)["profiles"][self.path];
+            if spread["fireMode"] == index {
+                if let Some(distance) = self.req.scenario.distance.filter(|distance| *distance > 0.0) {
+                    let scope = if self.req.scenario.aiming { "spreadAim" } else { "spreadHip" };
+                    let terms: Vec<_> = installed.iter().filter(|e| e.upgrade == "WEAPON_SPREAD" && e.classify(0, self.req, heavy).status == 0)
+                        .map(|e| (wfcore_lib::co::op_code(&e.operation), e.value)).collect();
+                    let angle = wfcore_lib::co::combine(num(&spread[scope]["min_deg"]), &[&terms], None).max(0.0);
+                    let radius = num(&spread["bodyRadiusM"]);
+                    if angle > 0.0 && distance - radius > radius {
+                        let threshold = (radius / (distance - radius)).asin().to_degrees();
+                        fields.hit_probability = (threshold / angle).clamp(0.0, 1.0);
+                        fields.multishot *= fields.hit_probability;
+                    }
+                }
+            }
+        }
+        Ok(fields)
     }
 }
 

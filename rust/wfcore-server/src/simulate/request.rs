@@ -3,12 +3,13 @@ use crate::data::{EngineData, Records};
 use serde_json::{json, Map, Value};
 
 pub(crate) struct SimCatalog {
-    weapons: Records,
+    pub weapons: Records,
     pub mods: Records,
     pub arcanes: Records,
     pub utility: Records,
     pub stances: Vec<Value>,
-    enemies: Records,
+    pub enemies: Records,
+    pub build_options: Value,
 }
 
 impl SimCatalog {
@@ -25,10 +26,12 @@ impl SimCatalog {
             (!utility.contains_key(path)).then(|| (path.to_owned(), row.clone()))
         }));
         Self { weapons: index("weapons"), enemies: index("enemies"), mods,
+            build_options: catalog["buildOptions"].clone(),
             arcanes: index("arcanes"), utility, stances: rows(&catalog["stances"]).to_vec() }
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Scenario<'a> {
     pub aiming: bool,
     pub cycle: bool,
@@ -43,12 +46,14 @@ pub(super) struct Scenario<'a> {
     pub state: Option<&'a Map<String, Value>>,
 }
 
+#[derive(Clone)]
 pub(super) struct Request<'a> {
     pub body: &'a Map<String, Value>,
     pub melee: bool,
     pub stance_polarity: Value,
     pub weapon: &'a Value,
     pub mode: usize,
+    pub exported_mode_panel: bool,
     pub target: Value,
     pub damage_model: String,
     pub enhancements: Value,
@@ -112,12 +117,17 @@ pub(super) fn polarity(value: &Value) -> Value {
 
 impl<'a> Request<'a> {
     pub fn parse(data: &'a EngineData, catalog: &'a SimCatalog, body: &'a Map<String, Value>) -> SimResult<Self> {
+        Self::parse_weapon(data, catalog, body, None)
+    }
+
+    pub fn parse_weapon(data: &'a EngineData, catalog: &'a SimCatalog, body: &'a Map<String, Value>,
+        resolved_weapon: Option<&'a Value>) -> SimResult<Self> {
         let get = |key: &str| body.get(key).unwrap_or(&Value::Null);
         let weapon_path = text(get("weapon")).trim();
         let weapon_meta = catalog.weapons.get(weapon_path)
             .ok_or("weapon 必须是已导出的武器路径")?;
-        let weapon = data.weapons.get(weapon_path).ok_or("weapon 缺少战斗数据")?;
-        if weapon_meta["available"] == false {
+        let weapon = resolved_weapon.or_else(|| data.weapons.get(weapon_path)).ok_or("weapon 缺少战斗数据")?;
+        if resolved_weapon.is_none() && weapon_meta["available"] == false {
             return Err(weapon_meta["issue"].as_str().unwrap_or("weapon 不可用").into());
         }
         let mode = integer(body.get("fireMode").unwrap_or(&json!(0)), "fireMode", 0, u64::MAX)? as usize;
@@ -256,7 +266,7 @@ impl<'a> Request<'a> {
         }) || !get("innateElement").is_null() {
             return Err("当前模拟范围未支持此配装".into());
         }
-        Ok(Self { body, melee, stance_polarity, weapon, mode, target, damage_model, enhancements, enhancement_notes, level, steel,
+        Ok(Self { body, melee, stance_polarity, weapon, mode, exported_mode_panel: false, target, damage_model, enhancements, enhancement_notes, level, steel,
             strip: strip_ratio(body, "armourStrip", "armorStrip")?,
             elemental_strip: strip_ratio(body, "elementalArmourStrip", "elementalArmorStrip")?,
             aim, window, forced, scenario, slot_count,

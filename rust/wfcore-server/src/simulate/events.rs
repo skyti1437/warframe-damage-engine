@@ -10,6 +10,7 @@ pub(super) struct Effects {
     pub sources: Vec<Trigger>,
     pub tier_terms: Vec<(String, f64, Vec<Effect>)>,
     pub notes: Vec<String>,
+    pub double_tap: Option<(f64, f64, f64)>,
 }
 
 pub(super) fn condition_text(kind: &str) -> &str {
@@ -115,11 +116,12 @@ pub(super) fn source(record: &Value, condition: &Value, index: usize, kind: &str
 }
 
 impl Effects {
-    pub fn prepare(req: &Request<'_>, loadout: &loadout::Loadout<'_>, arcanes: &arcane::Equipped<'_>,
+    pub fn prepare(req: &Request<'_>, cards: &[loadout::Card<'_>], arcanes: &arcane::Equipped<'_>,
                    effects: Vec<Effect>, evolution: &Evolution, route: Option<&str>, infinite: &Value, innate: &[Value]) -> Self {
-        let mut result = Self { static_terms: effects, sources: Vec::new(), tier_terms: Vec::new(), notes: Vec::new() };
+        let double_tap = cards.iter().find_map(|card| super::mod_runtime::double_tap(card.raw, card.rank));
+        let mut result = Self { static_terms: effects, sources: Vec::new(), tier_terms: Vec::new(), notes: Vec::new(), double_tap };
         let mut innate_start = None;
-        for (record, rank, arcane) in loadout.cards.iter().map(|c| (c.raw, c.rank, None))
+        for (record, rank, arcane) in cards.iter().map(|c| (c.raw, c.rank, None))
                         .chain(arcanes.cards.iter().map(|c| (c.record, c.rank, Some(c))))
             .chain(innate.iter().filter(|row| !truth(&row["fireModes"]) || rows(&row["fireModes"]).iter().any(|v| v == req.mode))
                 .map(|row| (row, 0, None))) {

@@ -3,6 +3,7 @@
 use super::{num, rows, text, truth, Request, SimResult};
 use crate::data::EngineData;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use wfcore_lib::replay::{HitSpec, MeleeHit, MeleeSegment, MeleeSpec, Types};
 
 pub(super) const ROUTES: [&str; 5] = ["combo", "slam", "slamBullet", "slamContinuous", "glaive"];
@@ -118,8 +119,14 @@ fn loop_rate(segments: &[Segment]) -> f64 {
     if seconds > 0.0 { damage / seconds } else { 0.0 }
 }
 
-fn record<'a>(reference: &'a Value, weapon: &Value) -> &'a Value {
-    &reference["weapons"][weapon["meleePath"].as_str().unwrap_or(text(&weapon["path"]))]
+fn record<'a>(reference: &'a Value, weapon: &Value) -> Cow<'a, Value> {
+    let base = &reference["weapons"][weapon["meleePath"].as_str().unwrap_or(text(&weapon["path"]))];
+    let hand = &reference["zaws"][text(&weapon["zawStrike"])][text(&weapon["zawHanded"])];
+    if !base.is_object() || !hand.is_object() { return Cow::Borrowed(base); }
+    let mut row = base.clone();
+    row["tree"] = hand["tree"].clone();
+    row["slams"] = json!(rows(&hand["slams"]));
+    Cow::Owned(row)
 }
 
 fn has_tag(weapon: &Value, tag: &str) -> bool {
@@ -143,7 +150,7 @@ fn charge_time(reference: &Value, row: &Value) -> (f64, bool) {
 
 fn build(reference: &Value, weapon: &Value, route: Option<&str>, stance: Option<&str>,
          combo: Option<&str>, distance: Option<f64>, heavy: bool) -> SimResult<Option<Schedule>> {
-    let row = record(reference, weapon);
+    let row = &record(reference, weapon);
     if !truth(row) { return Ok(None); }
     let mut route = route.unwrap_or_else(|| default_route(weapon, row));
     if route == "slamContinuous" && !has_tag(weapon, "HAMMERS_STANCE") && !text(&row["tree"]).ends_with("/HammerMeleeTree") {
@@ -317,7 +324,7 @@ pub(super) fn stance(data: &EngineData, catalog: &[Value], req: &Request<'_>) ->
             .map_or_else(|| num(&s["bestComboData"]["dpsMultiplier"]), |r| loop_rate(&r.segments));
         (s, rate)
     }).collect();
-    let preferred = if default_route(req.weapon, record(reference, req.weapon)) == "glaive" {
+    let preferred = if default_route(req.weapon, &record(reference, req.weapon)) == "glaive" {
         Some("/Lotus/Weapons/Tenno/Melee/MeleeTrees/GlaiveCmbTwoMeleeTree")
     } else { None };
     let name = |v: &Value| v["nameZh"].as_str().unwrap_or(text(&v["nameEn"])).to_lowercase();
