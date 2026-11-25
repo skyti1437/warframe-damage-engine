@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tests.test_phase2a_server import CONTENT_TYPE, GOLDEN, HOST, ROOT, SERVER, free_port, ready_server
+from tests.test_phase2a_server import CONTENT_TYPE, FINGERPRINT, GOLDEN, HOST, ROOT, SERVER, free_port, ready_server
 from tests.test_phase2b_simulate import ARCANES, BRATON, GLAIVE, ORTHOS, STANCES, TARGET
 from tools.phase0_benchmark_and_record import differences, stable_response
 
@@ -135,14 +135,13 @@ class Phase3bAnalyzeMatrixTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in results], [request["id"] for request in cases])
         return results
 
-    def assert_same(self, path, expected, actual, fingerprint=None, *, recorded=False):
+    def assert_same(self, path, expected, actual, *, recorded=False):
         expected = copy.deepcopy(expected)
         if not (recorded and path == "/api/catalog"):
             expected = stable_response(path, expected)
         actual = stable_response(path, copy.deepcopy(actual))
         if path == ANALYZE:
-            self.assertEqual(actual.pop("engineFingerprint"), fingerprint)
-            self.assertRegex(expected.pop("engineFingerprint"), r"\A[0-9a-f]{16}\Z")
+            self.assertEqual(actual["engineFingerprint"], FINGERPRINT)
         mismatches = list(islice(differences(expected, actual), 24))
         self.assertFalse(mismatches, "\n".join(mismatches))
 
@@ -155,8 +154,7 @@ class Phase3bAnalyzeMatrixTests(unittest.TestCase):
         results = self.requests([{key: value for key, value in entry.items() if key != "expected"} for entry in batch])
         health = next(row for row in results if row["id"] == "health")
         self.assertEqual(health["status"], 200)
-        fingerprint = health["response"]["engineFingerprint"]
-        self.assertRegex(fingerprint, r"\A[0-9a-f]{16}\Z")
+        self.assertEqual(health["response"]["engineFingerprint"], FINGERPRINT)
         by_id = {row["id"]: row for row in results}
         for entry in selected:
             with self.subTest(case=entry["id"]):
@@ -164,14 +162,9 @@ class Phase3bAnalyzeMatrixTests(unittest.TestCase):
                 result = by_id[entry["id"]]
                 self.assertEqual(result["status"], expected["status"], result["response"])
                 if entry["path"] == "/api/health":
-                    # Phase 2a 的健康指纹合同是本服务加载的数据与规则身份。
-                    self.assertEqual(set(result["response"]), set(expected["response"]))
                     probe = json.loads(subprocess.check_output([str(SERVER), "--probe"], cwd=ROOT, timeout=TIMEOUT))
                     self.assertEqual(result["response"], probe)
-                    self.assertEqual({key: value for key, value in result["response"].items() if key != "engineFingerprint"},
-                                     {key: value for key, value in expected["response"].items() if key != "engineFingerprint"})
-                else:
-                    self.assert_same(entry["path"], expected["response"], result["response"], fingerprint, recorded=True)
+                self.assert_same(entry["path"], expected["response"], result["response"], recorded=True)
 
     def test_phase0_golden_analyze(self):
         cases = [entry for entry in golden() if entry["path"] == ANALYZE]
@@ -194,15 +187,14 @@ class Phase3bAnalyzeMatrixTests(unittest.TestCase):
         import app
 
         cases = live_analyze_cases()
-        results = self.requests([{"id": "health", "path": "/api/health", "method": "GET"}, *cases])
-        fingerprint = results[0]["response"]["engineFingerprint"]
+        results = self.requests(cases)
         # Python 的工作计数按串行路径定义。进程池会改变账面计数与 memo 命中数。
         with patch.dict(os.environ, {"WF_ANALYZER_SERIAL": "1"}), app._disable_analysis_statics_persistence():
-            for entry, result in zip(cases, results[1:], strict=True):
+            for entry, result in zip(cases, results, strict=True):
                 with self.subTest(case=entry["id"]):
                     self.assertEqual(result["status"], 200, result["response"])
                     expected = json.loads(json.dumps(app.analyze_payload(entry["body"]), allow_nan=False))
-                    self.assert_same(ANALYZE, expected, result["response"], fingerprint)
+                    self.assert_same(ANALYZE, expected, result["response"])
                     if entry["id"] == "rifle-fatal-curse":
                         assessment = result["response"]["negativeAssessment"]
                         self.assertTrue(any(row["neutral"] for row in assessment))

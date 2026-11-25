@@ -1,0 +1,190 @@
+name: Build Rust standalone bundles
+
+'on':
+  workflow_dispatch:
+  push:
+    tags:
+      - 'portable-rust-*'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - 'tools/package_rust_bundle.py'
+      - 'tests/test_phase4a_packaging.py'
+      - 'tests/test_phase2a_server.py'
+      - '.github/workflows/build-rust-standalone.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GitHub retired macos-14 in November 2026. Keep 14.0 as the deployment target.
+          - platform: darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      TARGET: ${{ matrix.target }}
+      BINARY: rust/target/${{ matrix.target }}/release/wfcore-server
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable "$TARGET"
+
+      - name: Install native musl linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          case "$TARGET" in
+            x86_64-unknown-linux-musl) echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' ;;
+            aarch64-unknown-linux-musl) echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' ;;
+          esac >> "$GITHUB_ENV"
+
+      - name: Restore and check frozen data inputs
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          import zipfile
+          from urllib.parse import quote
+          from tools.package_rust_bundle import (
+              INCARNON_DEFAULTS, LEGACY_BUNDLE, ROOT, UPSTREAM,
+              file_sha256, frozen_data_hashes, require_sha256,
+          )
+
+          base = f"https://raw.githubusercontent.com/superexboom/warframe-weapon-loadout-build/{UPSTREAM}"
+          with zipfile.ZipFile(LEGACY_BUNDLE) as legacy:
+              for name, expected in frozen_data_hashes().items():
+                  destination = ROOT / name
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  if name == INCARNON_DEFAULTS:
+                      destination.write_bytes(legacy.read(name))
+                  else:
+                      subprocess.run([
+                          "curl", "--fail", "--location", "--silent", "--show-error", "--retry", "3",
+                          "--connect-timeout", "15", "--max-time", "120", "--output", str(destination),
+                          f"{base}/{quote(name)}",
+                      ], check=True)
+                  require_sha256(name, file_sha256(destination), expected)
+          PY
+
+      - name: Test Rust workspace
+        run: cargo +stable test --manifest-path rust/Cargo.toml -p wfcore-lib -p wfcore-server --locked
+
+      - name: Build release binary
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            export MACOSX_DEPLOYMENT_TARGET=14.0
+          fi
+          cargo +stable build --manifest-path rust/Cargo.toml -p wfcore-server --bin wfcore-server \
+            --release --locked --target "$TARGET"
+
+      - name: Verify executable and linkage
+        run: |
+          export LC_ALL=C
+          description=$(file "$BINARY")
+          echo "$description"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            [[ "$(lipo -archs "$BINARY")" == arm64 ]]
+            otool -L "$BINARY"
+            [[ "$(otool -L "$BINARY" | awk 'NR > 1 {print $1}')" == /usr/lib/libSystem.B.dylib ]]
+          else
+            [[ "$description" == *"statically linked"* || "$description" == *"static-pie linked"* ]]
+            dependencies=$(ldd "$BINARY" 2>&1) || true
+            echo "$dependencies"
+            [[ "$dependencies" == *"not a dynamic executable"* || "$dependencies" == *"statically linked"* ]]
+          fi
+
+      - name: Package and probe
+        run: |
+          python3 tools/package_rust_bundle.py --platform "$PLATFORM" --binary "$BINARY" \
+            --output "artifacts/portable-rust-$PLATFORM.zip" --metadata-out artifacts/metadata.json --verify
+
+      - name: Verify isolated install and six endpoints
+        run: WFCORE_SERVER_BINARY="$BINARY" python3 -m unittest tests.test_phase4a_packaging -v
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable-rust-${{ matrix.platform }}
+          path: |
+            artifacts/portable-rust-${{ matrix.platform }}.zip
+            artifacts/metadata.json
+          if-no-files-found: error
+
+  summarize:
+    name: Assemble candidate release metadata
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: portable-rust-*
+          path: artifacts
+
+      - name: Validate and merge the three platform manifests
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          platforms = ("darwin-arm64", "linux-x86_64", "linux-arm64")
+          identity_keys = ("runtime", "binary", "fingerprint", "runtimeDigest", "dataVersion", "upstream")
+          assets = {}
+          identity = None
+          for platform in platforms:
+              prefix = f"portable-rust-{platform}"
+              artifact = Path("artifacts", prefix)
+              metadata = json.loads((artifact / "metadata.json").read_bytes())
+              if metadata["platform"] != platform or metadata["name"] != f"{prefix}.zip":
+                  raise SystemExit(f"Invalid platform metadata for {platform}")
+              bundle = artifact / metadata["name"]
+              sha256 = hashlib.sha256(bundle.read_bytes()).hexdigest()
+              if metadata["sha256"] != sha256 or metadata["size"] != bundle.stat().st_size:
+                  raise SystemExit(f"Invalid bundle hash or size for {platform}")
+              current = {key: metadata[key] for key in identity_keys}
+              if identity is not None and current != identity:
+                  raise SystemExit(f"Bundle identity mismatch for {platform}")
+              identity = current
+              assets[platform] = metadata
+
+          fingerprint = identity.pop("fingerprint")
+          tag = os.environ["GITHUB_REF"].removeprefix("refs/tags/")
+          if not tag.startswith("portable-rust-"):
+              tag = f"portable-rust-{fingerprint}"
+          release = dict(identity, tag=tag, engineFingerprint=fingerprint, assets=assets)
+          Path("release-rust.json").write_text(json.dumps(release, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-rust
+          path: release-rust.json
+          if-no-files-found: error

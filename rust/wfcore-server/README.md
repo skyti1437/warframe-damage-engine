@@ -1,8 +1,22 @@
 # wfcore-server
 
-Phase 3b 纯 Rust 独立服务。工作区发行版构建命令为 `python tools/build_rust_workspace.py --offline --server-only`。运行 `rust/target/release/wfcore-server --probe` 检查数据和目录，运行 `rust/target/release/wfcore-server --port 8765` 启动 HTTP 服务。Windows 的二进制带 `.exe` 后缀。
+纯 Rust 独立服务。工作区发行版构建命令为 `python tools/build_rust_workspace.py --offline --server-only`。运行 `rust/target/release/wfcore-server --probe` 检查数据和目录，运行 `rust/target/release/wfcore-server --port 8765` 启动 HTTP 服务。Windows 的二进制带 `.exe` 后缀。
 
 `--data-dir` 接受项目根或 `data` 目录。省略时从当前目录及可执行文件位置向上查找。默认监听 `127.0.0.1:8765`，`WF_SERVER_THREADS` 可覆盖两个 HTTP 工作线程的默认配置。健康指纹由加载的数据文件和内置兼容规则计算。
+
+## 独立运行包
+
+构建二进制后，从仓库根目录执行：
+
+```sh
+python3 tools/package_rust_bundle.py --verify
+```
+
+默认在临时目录生成本机平台的 `portable-rust-*.zip`。`--binary` 和 `--output` 可指定二进制及输出路径，`--metadata-out` 可生成含 SHA-256 和包大小的 JSON。运行包支持 `darwin-arm64`、`linux-x86_64` 和 `linux-arm64`。`--verify` 会在同平台隔离解包，补齐数据并执行 `--probe`。
+
+部署时解包并按 `manifest.json` 的 `upstreamFiles` 从固定上游提交取回 42 个数据文件，保留相对路径并逐个核对 `files` 中的 SHA-256。确保 `wfcore-server` 权限为 `0755`，在解包目录运行 `./wfcore-server --probe` 或 `./wfcore-server --port 8765`。运行进程只需要本机二进制和数据文件。
+
+冻结数据与内置规则的 FNV-1a 摘要为 `3ea749df5c3de728`，对应已发布评分指纹 `535ed49f5a51149d`。`--probe`、`/api/health` 和 `/api/analyze` 复用此评分指纹。加载的输入字节发生变化，且摘要未命中兼容表时，服务返回新的原始摘要。
 
 Rust 在启动时应用快照修正、合并条目、计算公开标记并序列化目录。`--dump-catalog` 输出与 HTTP 共用的目录缓存，供禁止监听端口的环境对拍。`EngineData` 保留路径索引与战斗输入，后续计算路由可复用。
 

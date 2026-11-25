@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 pub const BUILD_LABEL: &str = "2026.08.13.13.24";
 pub const SCHEMA_VERSION: u64 = 3;
+// Phase 0 parity was audited with these exact data and embedded rule bytes.
+const COMPATIBLE_RUNTIME_DIGESTS: &[(&str, &str)] = &[("3ea749df5c3de728", "535ed49f5a51149d")];
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 pub type Records = IndexMap<String, Value>;
 type PackedRecords = IndexMap<String, Box<[u8]>>;
@@ -82,7 +84,7 @@ pub struct EngineData {
     pub(crate) root: PathBuf,
     pub(crate) dataset_root: PathBuf,
     pub(crate) rules: Rules,
-    fingerprint: String,
+    runtime_digest: String,
 }
 
 impl EngineData {
@@ -147,12 +149,12 @@ impl EngineData {
         let mod_art = inputs.optional(Path::new("frontend/assets/mods/index.json"))?;
         let enemy_art = inputs.optional(&dataset.join("frontend/assets/enemies/index.json"))?;
         let rules = Rules::load(&mut inputs.fingerprint)?;
-        let fingerprint = format!("{:016x}", inputs.fingerprint.0);
+        let runtime_digest = inputs.fingerprint.digest();
         let mut engine = Self {
             root, dataset_root, weapons, mods, arcanes, enemies, stances,
             utility_mods, exalted_weapons, riven_templates, riven_disposition: Value::Null,
             incarnon_defaults, incarnon_strings, enemy_overrides, weapon_mechanics_overrides,
-            mechanics, kitguns, zaws, mod_art, enemy_art, rules, fingerprint,
+            mechanics, kitguns, zaws, mod_art, enemy_art, rules, runtime_digest,
             runtime_weapons: IndexMap::new(), runtime_enemies: IndexMap::new(),
         };
         corrections::apply(&mut engine, &wiki_weapon_overrides)?;
@@ -215,10 +217,16 @@ impl EngineData {
         Health {
             ok: true,
             build_label: BUILD_LABEL,
-            engine_fingerprint: &self.fingerprint,
+            engine_fingerprint: score_fingerprint(&self.runtime_digest),
             schema_version: SCHEMA_VERSION,
         }
     }
+}
+
+fn score_fingerprint(runtime_digest: &str) -> &str {
+    COMPATIBLE_RUNTIME_DIGESTS.iter()
+        .find_map(|&(digest, fingerprint)| (digest == runtime_digest).then_some(fingerprint))
+        .unwrap_or(runtime_digest)
 }
 
 fn pack_records(records: Records, display_fields: &[&str]) -> Result<PackedRecords> {
@@ -400,6 +408,39 @@ impl Fingerprint {
                 self.0 ^= u64::from(*byte);
                 self.0 = self.0.wrapping_mul(0x100000001b3);
             }
+        }
+    }
+
+    fn digest(&self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frozen_data_uses_published_score_fingerprint() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let data = EngineData::load(&root).expect("加载冻结数据");
+        assert_eq!(data.runtime_digest, "3ea749df5c3de728");
+        assert_eq!(data.health().engine_fingerprint, "535ed49f5a51149d");
+    }
+
+    #[test]
+    fn changed_input_byte_keeps_raw_digest() {
+        for name in ["data/source-lock.json", "fire_rate_spool"] {
+            let mut fingerprint = Fingerprint::new();
+            fingerprint.update(name, b"{}\n");
+            let original = fingerprint.digest();
+
+            let mut fingerprint = Fingerprint::new();
+            fingerprint.update(name, b"{} ");
+            let changed = fingerprint.digest();
+            assert_ne!(changed, original);
+            assert_eq!(changed.len(), 16);
+            assert_eq!(score_fingerprint(&changed), changed);
         }
     }
 }

@@ -25,6 +25,7 @@ SERVER = ROOT / "rust" / "target" / "release" / ("wfcore-server.exe" if os.name 
 GOLDEN = ROOT / "tests" / "golden" / "phase0_golden.json"
 HOST = "127.0.0.1"
 BUILD = "2026.08.13.13.24"
+FINGERPRINT = "535ed49f5a51149d"
 CONTENT_TYPE = "application/json; charset=utf-8"
 TIMEOUT = 15
 
@@ -52,8 +53,8 @@ def free_port():
 
 
 @contextmanager
-def running(command, **options):
-    with subprocess.Popen(command, cwd=ROOT, **options) as process:
+def running(command, *, cwd=ROOT, **options):
+    with subprocess.Popen(command, cwd=cwd, **options) as process:
         try:
             yield process
         finally:
@@ -67,10 +68,10 @@ def running(command, **options):
 
 
 @contextmanager
-def ready_server(command, port):
+def ready_server(command, port, *, cwd=ROOT):
     with tempfile.TemporaryFile() as log:
         start = time.perf_counter()
-        with running([*command, "--port", str(port)], stdout=log, stderr=subprocess.STDOUT) as process:
+        with running([*command, "--port", str(port)], cwd=cwd, stdout=log, stderr=subprocess.STDOUT) as process:
             while process.poll() is None and time.perf_counter() - start < TIMEOUT:
                 try:
                     status, headers, health = request(port, "GET", "/api/health")
@@ -144,7 +145,7 @@ class Phase2aServerTests(unittest.TestCase):
         self.assertEqual(health["buildLabel"], BUILD)
         self.assertIs(type(health["schemaVersion"]), int)
         self.assertEqual(health["schemaVersion"], 3)
-        self.assertRegex(health["engineFingerprint"], r"\A[0-9a-f]{16}\Z")
+        self.assertEqual(health["engineFingerprint"], FINGERPRINT)
 
     def assert_headers(self, headers, cache):
         self.assertEqual(headers["Content-Type"], CONTENT_TYPE)
