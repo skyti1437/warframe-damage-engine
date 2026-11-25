@@ -1,4 +1,4 @@
-"""将独立 Rust 工作区的 Python 扩展构建到 rust/target。"""
+"""将 Rust 独立服务和 Python 扩展构建到 rust/target。"""
 
 import argparse
 import os
@@ -16,6 +16,9 @@ def main() -> int:
     profile = parser.add_mutually_exclusive_group()
     profile.add_argument("--debug", action="store_true", help="构建调试版")
     profile.add_argument("--release", action="store_true", help="构建发行版（默认）")
+    packages = parser.add_mutually_exclusive_group()
+    packages.add_argument("--server-only", action="store_true", help="仅构建 Rust 独立服务")
+    packages.add_argument("--py-only", action="store_true", help="仅构建 Python 扩展")
     parser.add_argument("--offline", action="store_true", help="仅使用本机 Cargo 缓存")
     args = parser.parse_args()
 
@@ -31,20 +34,38 @@ def main() -> int:
     target.mkdir(exist_ok=True)
     # 构建产物停留在工作区的 target 目录，保持发布目录原样。
     (target / ".gitignore").write_text("*\n", encoding="utf-8")
-    command = [cargo, "rustc", "-p", "wfcore-py", "--lib", "--locked", "--target-dir", str(target)]
+    flags = ["--locked", "--target-dir", str(target)]
     if not args.debug:
-        command.append("--release")
+        flags.append("--release")
     if args.offline:
-        command.append("--offline")
-    if sys.platform == "darwin":
-        command.extend(["--", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"])
-    env = dict(os.environ, PYO3_PYTHON=sys.executable)
+        flags.append("--offline")
+    env = os.environ.copy()
     env.setdefault("CARGO_BUILD_JOBS", "4")
-    build = subprocess.run(command, cwd=WORKSPACE, env=env, stderr=subprocess.STDOUT)
-    if build.returncode:
-        return build.returncode
-
     profile_dir = target / ("debug" if args.debug else "release")
+
+    if not args.py_only:
+        command = [cargo, "build", "-p", "wfcore-server", "--bin", "wfcore-server", *flags]
+        build = subprocess.run(command, cwd=WORKSPACE, env=env, stderr=subprocess.STDOUT)
+        if build.returncode:
+            return build.returncode
+        server = profile_dir / ("wfcore-server.exe" if os.name == "nt" else "wfcore-server")
+        print(f"已构建 {server}")
+
+    if not args.server_only:
+        command = [cargo, "rustc", "-p", "wfcore-py", "--lib", *flags]
+        if sys.platform == "darwin":
+            command.extend(["--", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"])
+        build = subprocess.run(
+            command, cwd=WORKSPACE, env=dict(env, PYO3_PYTHON=sys.executable),
+            stderr=subprocess.STDOUT,
+        )
+        if build.returncode:
+            return build.returncode
+        install_python_extension(profile_dir)
+    return 0
+
+
+def install_python_extension(profile_dir: Path) -> None:
     library = {"win32": "wfcore.dll", "darwin": "libwfcore.dylib"}.get(sys.platform, "libwfcore.so")
     output = profile_dir / ("wfcore.pyd" if os.name == "nt" else "wfcore.so")
     temporary = output.with_name(f".{output.name}.{os.getpid()}")
@@ -61,7 +82,6 @@ def main() -> int:
     finally:
         temporary.unlink(missing_ok=True)
     print(f"已构建 {output}")
-    return 0
 
 
 if __name__ == "__main__":

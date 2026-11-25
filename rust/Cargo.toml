@@ -1,5 +1,5 @@
 [workspace]
-members = ["wfcore-lib", "wfcore-py"]
+members = ["wfcore-lib", "wfcore-py", "wfcore-server"]
 resolver = "2"
 
 [profile.release]
@@ -7,3 +7,6 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[patch.crates-io]
+tiny_http = { path = "wfcore-server/vendor/tiny_http" }
