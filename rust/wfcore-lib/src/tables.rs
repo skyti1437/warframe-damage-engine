@@ -175,12 +175,12 @@ fn weakpoint_noncrit_scale(s: &Core, hm: f64) -> f64 {
     scale
 }
 
-pub(crate) fn location_hit_factor(s: &Core, hm: f64, hcm: f64) -> f64 {
+pub fn location_hit_factor(s: &Core, hm: f64, hcm: f64) -> f64 {
     effective_hit_multiplier(location_crit_chance(s, hm > 1.0 + 1e-9), s.crit_multiplier,
         s.noncrit_damage_multiplier, hcm, s.double_crit_chance) * weakpoint_noncrit_scale(s, hm)
 }
 
-pub(crate) fn quantize(damage: &Vector, modded_base: f64) -> Vector {
+pub fn quantize(damage: &Vector, modded_base: f64) -> Vector {
     if modded_base <= 0.0 {
         return damage.clone();
     }
@@ -389,10 +389,19 @@ pub struct Row {
     pub branches: Vec<LandingBranch>,
 }
 
+/// 单击状态说明和回放伤害表共用同一组种子及命中条件。
+pub struct SeedDetails {
+    pub tiers: Vec<(f64, f64)>,
+    pub crit: f64,
+    pub crit_share: f64,
+    pub radial_per_second: f64,
+}
+
 pub struct Status {
     pub procs: Vector,
     pub rows: Vec<(D, Row)>,
     pub non: Vec<(D, f64)>,
+    pub seeds: Vec<SeedDetails>,
 }
 
 fn dot_multiplier(tables: &TargetTables, d: D) -> f64 {
@@ -401,6 +410,14 @@ fn dot_multiplier(tables: &TargetTables, d: D) -> f64 {
 
 /// 对给定部位的单位持续伤害目标计算 `expected_status_damage`。
 pub(crate) fn status(s: &Core, loc_index: usize, tables: &TargetTables) -> Status {
+    status_impl(s, loc_index, tables, false)
+}
+
+pub fn status_details(s: &Core, loc_index: usize, tables: &TargetTables) -> Status {
+    status_impl(s, loc_index, tables, true)
+}
+
+fn status_impl(s: &Core, loc_index: usize, tables: &TargetTables, detailed: bool) -> Status {
     let loc = if s.radial_only { tables.dot[0] } else { tables.dot[loc_index] };
     let (hm, hcm) = (loc.hit_multiplier, if s.ignore_headshot_bonus { 1.0 } else { loc.hit_critical_multiplier });
     let applied_hm = if s.ignore_headshot_bonus || s.area_direct { 1.0 } else { hm };
@@ -420,6 +437,7 @@ pub(crate) fn status(s: &Core, loc_index: usize, tables: &TargetTables) -> Statu
     let proc_damage = pmax(s.proc_damage_multiplier, 0.0);
     let faction_mod = s.faction_mod(tables);
     let mut rows = Vec::new();
+    let mut seeds = Vec::new();
     for (d, coefficient) in DOT_COEFFICIENTS {
         let count = get(&procs, d).unwrap_or(0.0);
         if count == 0.0 {
@@ -468,7 +486,19 @@ pub(crate) fn status(s: &Core, loc_index: usize, tables: &TargetTables) -> Statu
         }
         let tiers = seed_tiers.clone().map(|(w,f)| ((1.0-crit_share)*w, unit*f*weak_seed_scale))
             .chain(crit_seed_tiers.clone().into_iter().flatten().map(|(w,f)| (crit_share*w, unit*f*crit_seed_scale)));
-        let seed = psum(tiers.filter(|(w,_)| *w > 0.0).map(|(w,ps)| w*ps));
+        let tiers = tiers.filter(|(w, _)| *w > 0.0);
+        if detailed {
+            seeds.push(SeedDetails {
+                tiers: tiers.clone().collect(),
+                crit: (1.0 - crit_share) * psum(seed_tiers.clone().map(|(w, f)| w * f))
+                    + crit_share * psum(crit_seed_tiers.clone().into_iter().flatten().map(|(w, f)| w * f)),
+                crit_share,
+                radial_per_second: if part_landing {
+                    psum(tiers.clone().map(|(w, seed)| w * (coefficient + seed).max(1.0))) * landing
+                } else { 0.0 },
+            });
+        }
+        let seed = psum(tiers.map(|(w,ps)| w*ps));
         let duration = 6.0 * s.duration_scale(d);
         let accumulator = accumulator * accumulator_multiplier;
         let pellets = pmax(s.multishot, 0.0);
@@ -499,7 +529,7 @@ pub(crate) fn status(s: &Core, loc_index: usize, tables: &TargetTables) -> Statu
             * applied_hm * target_multiplier * pow(pmax(faction_mod, 0.0), 2.0);
         non.push((EXPLOSION, per_proc));
     }
-    Status { procs, rows, non }
+    Status { procs, rows, non, seeds }
 }
 
 /// `attack_data(st, aim)` 返回伤害向量、异常数、持续伤害及其他异常伤害。

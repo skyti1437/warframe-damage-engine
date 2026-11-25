@@ -1,5 +1,5 @@
 mod arcanes;
-mod enemies;
+pub(crate) mod enemies;
 mod modular;
 mod mods;
 mod riven;

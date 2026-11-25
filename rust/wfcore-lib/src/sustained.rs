@@ -28,7 +28,7 @@ pub struct SustainedTarget {
 }
 
 /// 对应 `_magnetic_defense_multiplier` 的磁力防御倍率。
-fn magnetic_defense(stacks: i64) -> f64 {
+pub fn magnetic_defense(stacks: i64) -> f64 {
     if stacks != 0 {
         pmin(2.0 + 0.25 * (stacks - 1) as f64, 4.25)
     } else {
@@ -37,7 +37,7 @@ fn magnetic_defense(stacks: i64) -> f64 {
 }
 
 /// 对应 `_armour_reduction` 的护甲减伤。
-fn armour_reduction(armour: f64) -> f64 {
+pub fn armour_reduction(armour: f64) -> f64 {
     if armour <= 0.0 {
         return 0.0;
     }
@@ -166,7 +166,34 @@ pub struct SustainedInput<'a> {
     pub first_shot_bonus: f64,
 }
 
+/// 展示所需的稳态状态快照，沿用寻优器的伤害计算。
+pub struct SustainedSnapshot {
+    pub stacks: [f64; 6],
+    pub ramp: f64,
+    pub elemental_strip: f64,
+    pub corrosive_strip: f64,
+    pub heat_strip: f64,
+    pub cold_crit: f64,
+    pub cold_uptime: f64,
+    pub puncture_crit: f64,
+    pub viral_multiplier: f64,
+    pub magnetic_multiplier: f64,
+    pub combined_magnetic: f64,
+    pub direct_dps: f64,
+    pub baseline_direct_dps: f64,
+    pub adjusted: Core,
+    pub damage_rate: f64,
+}
+
 pub fn sustained_status(target: &SustainedTarget, input: SustainedInput<'_>) -> f64 {
+    calculate(target, input, &Vec::new(), false).0
+}
+
+pub fn sustained_snapshot(target: &SustainedTarget, input: SustainedInput<'_>, forced: &Vector) -> SustainedSnapshot {
+    calculate(target, input, forced, true).1.expect("已请求稳态快照")
+}
+
+fn calculate(target: &SustainedTarget, input: SustainedInput<'_>, forced: &Vector, detailed: bool) -> (f64, Option<SustainedSnapshot>) {
     let SustainedInput {
         types, core, attacks_per_second, status_rate_multiplier,
         damage_rate_multiplier, total, magazine, first_shot_bonus,
@@ -193,7 +220,7 @@ pub fn sustained_status(target: &SustainedTarget, input: SustainedInput<'_>) -> 
     }
     // 用目标命中部位算出探测射击的预期异常数。
     let (_, _, head) = ctx.location(core);
-    let procs = tables::expected_status_procs(core, &Vec::new(), head);
+    let procs = tables::expected_status_procs(core, forced, head);
     let proc_of = |d: D| tables::get(&procs, d).unwrap_or(0.0);
     let stacks = |d: D, duration: f64, cap: f64| pmin(pmax(proc_of(d) * proc_rate * duration * core.duration_scale(d), 0.0), cap);
     let viral_count = stacks(viral, 6.0, 10.0);
@@ -212,10 +239,12 @@ pub fn sustained_status(target: &SustainedTarget, input: SustainedInput<'_>) -> 
     let elemental = target.elemental_armour_strip;
     let combined_strip = 1.0 - ((1.0 - elemental) * (1.0 - corrosive_strip) * (1.0 - heat_strip));
     let cold_proc_rate = proc_of(cold) * proc_rate;
+    let mut cold_uptime = 0.0;
     let cold_crit = if cold_count >= 10.0 && cold_proc_rate > 0.0 {
         let freeze_duration = 3.0 * core.duration_scale(cold);
         let rebuild_duration = 7.0 / cold_proc_rate;
         let uptime = if freeze_duration > 0.0 { freeze_duration / (freeze_duration + rebuild_duration) } else { 0.0 };
+        cold_uptime = uptime;
         0.35 * (1.0 - uptime) + uptime
     } else if cold_count < 1.0 {
         0.1 * cold_count
@@ -244,8 +273,25 @@ pub fn sustained_status(target: &SustainedTarget, input: SustainedInput<'_>) -> 
     let direct_total = psum(per_type.iter().map(|e| e.1));
     let weighted_direct = psum(per_type.iter().map(|&(d, v)| v * pool_multiplier(d)));
     let direct_dps = per_shot * (if direct_total > 0.0 { weighted_direct / direct_total } else { 1.0 }) * damage_rate;
+    let snapshot = || detailed.then(|| {
+        let mut ramp: f64 = 0.0;
+        for (dtype, count) in [(viral, viral_count), (corrosive, corrosive_count), (magnetic, magnetic_count),
+            (cold, cold_count), (puncture, puncture_count), (heat, heat_count)] {
+            let per_second = proc_of(dtype) * proc_rate;
+            if count > 0.0 && per_second > 0.0 {
+                ramp = ramp.max(count / per_second);
+            }
+        }
+        SustainedSnapshot {
+            stacks: [heat_count, viral_count, corrosive_count, magnetic_count, cold_count, puncture_count],
+            ramp, elemental_strip: combined_strip, corrosive_strip, heat_strip, cold_crit, cold_uptime,
+            puncture_crit, viral_multiplier, magnetic_multiplier, combined_magnetic, direct_dps,
+            baseline_direct_dps: ctx.damage_against(core, ctx.armour(elemental)).1 * damage_rate,
+            adjusted: adjusted.clone(), damage_rate,
+        }
+    });
     if !total {
-        return direct_dps;
+        return (direct_dps, snapshot());
     }
     // 总 DPS 以直伤 DPS 为基础，再加独立的持续和异常伤害。异常对直伤的增幅已计入直伤 DPS。
     let status = ctx.status(&adjusted, combined_armour, &interactions);
@@ -279,6 +325,6 @@ pub fn sustained_status(target: &SustainedTarget, input: SustainedInput<'_>) -> 
         .map(|&(d, per_proc)| per_proc * blast * damage_rate * pool_multiplier(d))
         .collect();
     let proc_non_dot_dps = psum(non_dot);
-    direct_dps + dot_dps + proc_non_dot_dps
+    (direct_dps + dot_dps + proc_non_dot_dps, snapshot())
 }
 

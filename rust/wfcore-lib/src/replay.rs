@@ -399,6 +399,7 @@ const SHIELD_GATE_LEAK: f64 = 0.05;
 
 #[derive(Clone)]
 enum Kind {
+    Sample,
     Fire,
     ChargedFire,
     ReloadComplete(bool),
@@ -655,6 +656,7 @@ struct EmbeddedEntity {
 struct Replay<'a> {
     provider: &'a dyn ReplayProvider,
     score_only: bool,
+    timeline: Option<Timeline>,
     types: Types,
     // 配置
     window: f64,
@@ -3211,6 +3213,79 @@ fn armour_reduction(armour: f64) -> f64 {
     0.9 * (effective / 2700.0).sqrt()
 }
 
+/// 供展示使用的离散采样点，按事件队列的入队顺序处理同一时刻的事件。
+#[derive(Clone)]
+pub struct Sample {
+    pub time: f64,
+    pub pools: [f64; 3],
+    pub stacks: [f64; 6],
+    pub armour: f64,
+    pub heat_strip: f64,
+    pub puncture_strip: f64,
+    pub heat_seed: f64,
+    pub puncture_crit: f64,
+    pub cold_crit: f64,
+    pub frozen: bool,
+    pub total_strip: f64,
+    pub generation: i64,
+    pub form: &'static str,
+    pub ammo: f64,
+    pub gauge: f64,
+    pub field_duration_ready: bool,
+    pub shots: i64,
+    pub direct_dps: f64,
+    pub dot_dps: f64,
+    pub step_damage: f64,
+    pub affinity: f64,
+    pub trigger_stacks: Vec<f64>,
+}
+
+#[derive(Clone, Default)]
+struct Timeline {
+    points: Vec<Sample>,
+    averaged: [f64; 6],
+    previous_totals: [f64; 5],
+    previous_time: f64,
+}
+
+/// 按固定小数位舍入，保留参考实现对二进制浮点数的十进制舍入行为。
+pub fn round_decimal(value: f64, decimals: usize) -> f64 {
+    format!("{value:.decimals$}").parse().expect("格式化的浮点数")
+}
+
+impl Replay<'_> {
+    fn sample(&mut self, time: f64) {
+        let stacks = [FIRE, VIRAL, CORROSIVE, MAGNETIC, FREEZE, PUNCTURE]
+            .map(|d| round_decimal(self.count(d), 3));
+        let (present, corrosive) = self.pooled[1].stats();
+        let corrosive_strip = (0.20 * present + 0.06 * corrosive).min(0.8);
+        let heat_strip = self.heat_strip(time);
+        let armour = self.armour_base * (1.0 - self.elemental_armour_strip)
+            * (1.0 - corrosive_strip) * (1.0 - heat_strip) * (1.0 - self.puncture_strip);
+        let (puncture_crit, cold_crit) = self.live_crit();
+        let timeline = self.timeline.as_mut().expect("采样已启用");
+        let dt = time - timeline.previous_time;
+        let last = timeline.previous_totals;
+        for (total, stack) in timeline.averaged.iter_mut().zip(stacks) {
+            *total += stack * dt;
+        }
+        timeline.points.push(Sample {
+            time: round_decimal(time, 6), pools: self.pools, stacks, armour, heat_strip,
+            puncture_strip: self.puncture_strip, heat_seed: self.heat_chains.seed(),
+            puncture_crit, cold_crit, frozen: self.frozen_until > time,
+            total_strip: if self.armour_base != 0.0 { 1.0 - armour / self.armour_base } else { 0.0 },
+            generation: self.gen, form: form_name(self.form), ammo: self.ammo, gauge: self.gauge,
+            field_duration_ready: self.field_duration_ready, shots: self.attacks,
+            direct_dps: if dt != 0.0 { (self.totals[DIRECT] + self.totals[ARCANE] - last[DIRECT] - last[ARCANE]) / dt } else { 0.0 },
+            dot_dps: if dt != 0.0 { (self.totals[DOT] - last[DOT]) / dt } else { 0.0 },
+            step_damage: psum(self.totals) - psum(last), affinity: self.affinity,
+            trigger_stacks: self.sources.iter().map(|source| source.stacks).collect(),
+        });
+        timeline.previous_time = time;
+        timeline.previous_totals = self.totals;
+    }
+}
+
 impl Replay<'_> {
     pub fn run(&mut self) -> ReplayResult<()> {
         let mut first_round = true;
@@ -3249,6 +3324,7 @@ impl Replay<'_> {
                 }
             }
             match event.kind {
+                Kind::Sample => self.sample(t),
                 Kind::MeleeBuffBoundary => { self.melee_buff_boundary=f64::INFINITY; }
                 Kind::MeleeRecovery(token,snap) => {
                     if token != self.melee_recovery_token { continue; }
@@ -4670,6 +4746,7 @@ fn prepare_replay(input: TrajectoryInput, provider: &dyn ReplayProvider) -> Repl
     let mut replay = Replay {
         provider,
         score_only: input.score_only,
+        timeline: None,
         window,
         head: input.head,
         rate,
@@ -5014,6 +5091,8 @@ pub struct TrajectoryOutput {
     pub actor_signal_used: bool,
     pub source_stacks: Vec<f64>,
     pub details: Option<TrajectoryDetails>,
+    pub samples: Vec<Sample>,
+    pub averaged_stacks: [f64; 6],
 }
 
 pub struct TrajectoryDetails {
@@ -5048,8 +5127,23 @@ pub struct TrajectoryDetails {
 }
 
 pub fn trajectory(input: TrajectoryInput, provider: &dyn ReplayProvider) -> ReplayResult<TrajectoryOutput> {
+    run_trajectory(input, provider, None)
+}
+
+/// 在完整事件回放中按 0.25 秒采样，末点与窗口结束对齐。
+pub fn trajectory_sampled(input: TrajectoryInput, provider: &dyn ReplayProvider) -> ReplayResult<TrajectoryOutput> {
+    run_trajectory(input, provider, Some(0.25))
+}
+
+fn run_trajectory(input: TrajectoryInput, provider: &dyn ReplayProvider, step: Option<f64>) -> ReplayResult<TrajectoryOutput> {
     let _timer = Timer::start(counters::TOTAL);
     let mut replay = prepare_replay(input, provider)?;
+    if let Some(step) = step {
+        replay.timeline = Some(Timeline::default());
+        for index in 1..=ceil_i(replay.window / step) {
+            replay.push((index as f64 * step).min(replay.window), Kind::Sample, None);
+        }
+    }
     replay.run()?;
     if replay.proc_piles.values().any(|p| p.radial_floor_limited) {
         return Err(unsupported("electric-gas-radial-floor-state-limit"));
@@ -5100,6 +5194,7 @@ pub fn trajectory(input: TrajectoryInput, provider: &dyn ReplayProvider) -> Repl
             }).collect(),
         }
     });
+    let timeline = replay.timeline.unwrap_or_default();
     Ok(TrajectoryOutput {
         kills: replay.kills,
         attacks: replay.attacks,
@@ -5113,5 +5208,7 @@ pub fn trajectory(input: TrajectoryInput, provider: &dyn ReplayProvider) -> Repl
         actor_signal_used: replay.actor_signal_used,
         source_stacks: replay.sources.iter().map(|q| q.stacks).collect(),
         details,
+        samples: timeline.points,
+        averaged_stacks: timeline.averaged.map(|total| if replay.window > 0.0 { total / replay.window } else { 0.0 }),
     })
 }

@@ -1,4 +1,5 @@
 use crate::{catalog, data::{EngineData, Result}};
+use crate::simulate::{self, SimCatalog};
 use serde_json::{json, Value};
 use std::io::{self, Cursor, Read};
 use std::net::SocketAddr;
@@ -11,6 +12,7 @@ const CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 pub struct Service {
     pub data: EngineData,
+    sim_catalog: SimCatalog,
     health_json: Arc<Vec<u8>>,
     catalog_json: Arc<Vec<u8>>,
 }
@@ -18,8 +20,10 @@ pub struct Service {
 impl Service {
     pub fn new(data: EngineData) -> Result<Self> {
         let health_json = Arc::new(serde_json::to_vec(&data.health())?);
-        let catalog_json = Arc::new(serde_json::to_vec(&catalog::build(&data)?)?);
-        Ok(Self { data, health_json, catalog_json })
+        let catalog = catalog::build(&data)?;
+        let sim_catalog = SimCatalog::new(&catalog);
+        let catalog_json = Arc::new(serde_json::to_vec(&catalog)?);
+        Ok(Self { data, sim_catalog, health_json, catalog_json })
     }
 
     pub fn health_json(&self) -> &[u8] { &self.health_json }
@@ -31,7 +35,13 @@ impl Service {
         match (method, path) {
             (Method::Get, "/api/health") => Reply { status: 200, cache: "no-store", body: Arc::clone(&self.health_json) },
             (Method::Get, "/api/catalog") => Reply { status: 200, cache: "no-cache", body: Arc::clone(&self.catalog_json) },
-            (Method::Post, "/api/simulate" | "/api/build" | "/api/analyze" | "/api/trait-matrix") => {
+            (Method::Post, "/api/simulate") => {
+                match parse_object(length, body) {
+                    Err(reply) => reply,
+                    Ok(fields) => self.simulate(fields),
+                }
+            }
+            (Method::Post, "/api/build" | "/api/analyze" | "/api/trait-matrix") => {
                 match parse_object(length, body) {
                     Err(reply) => reply,
                     Ok(_) => Reply::error(501, "not_implemented", "endpoint is not implemented in Phase 2a"),
@@ -39,6 +49,27 @@ impl Service {
             }
             _ => Reply::error(404, "not_found", "endpoint not found"),
         }
+    }
+
+    fn simulate(&self, fields: serde_json::Map<String, Value>) -> Reply {
+        match simulate::run(&self.data, &self.sim_catalog, &fields) {
+            Ok(response) => Reply::json(200, &response),
+            Err(message) => Reply::error(422, "invalid_request", &message),
+        }
+    }
+
+    /// 逐条使用与 HTTP 相同的 JSON 解析、长度限制和业务校验。
+    pub fn simulate_batch(&self, payload: Value) -> Result<Value> {
+        let cases = payload.as_array().ok_or("模拟批处理输入必须为 JSON 数组")?;
+        let results = cases.iter().map(|case| -> Result<Value> {
+            let id = case.get("id").ok_or("模拟批处理条目缺少 id")?;
+            let body = serde_json::to_vec(case.get("body").ok_or("模拟批处理条目缺少 body")?)?;
+            let length = body.len().to_string();
+            let reply = self.dispatch(&Method::Post, "/api/simulate", Some(&length), body.as_slice());
+            let response: Value = serde_json::from_slice(&reply.body)?;
+            Ok(json!({"id": id, "status": reply.status, "response": response}))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Value::Array(results))
     }
 
     fn handle_request(&self, request: &mut Request) -> Reply {
@@ -98,10 +129,13 @@ struct Reply {
 
 impl Reply {
     fn error(status: u16, code: &str, message: &str) -> Self {
-        let body = json!({"error": {"code": code, "message": message}});
+        Self::json(status, &json!({"error": {"code": code, "message": message}}))
+    }
+
+    fn json(status: u16, body: &Value) -> Self {
         Self {
             status, cache: "no-store",
-            body: Arc::new(serde_json::to_vec(&body).expect("错误响应可序列化")),
+            body: Arc::new(serde_json::to_vec(body).expect("JSON 响应可序列化")),
         }
     }
 
@@ -242,14 +276,14 @@ mod tests {
         ] {
             check(&Method::Post, "/api/simulate", length, body, status, code.to_owned());
         }
-        for path in ["/api/simulate", "/api/build", "/api/analyze", "/api/trait-matrix"] {
+        for path in ["/api/build", "/api/analyze", "/api/trait-matrix"] {
             check(&Method::Post, path, Some("2"), b"{}".as_slice(), 501, "not_implemented".to_owned());
         }
         check(&Method::Get, "/missing", None, b"".as_slice(), 404, "not_found".to_owned());
         check(&Method::Post, "/missing", None, b"".as_slice(), 404, "not_found".to_owned());
         let mut max_body = vec![b' '; MAX_REQUEST_BYTES];
         max_body[..2].copy_from_slice(b"{}");
-        check(&Method::Post, "/api/simulate", Some("131072"), &max_body, 501, "not_implemented".to_owned());
+        check(&Method::Post, "/api/simulate", Some("131072"), &max_body, 422, "invalid_request".to_owned());
     }
 
     #[test]

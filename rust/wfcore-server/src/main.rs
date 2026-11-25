@@ -7,16 +7,17 @@ use std::process::ExitCode;
 use wfcore_server::data::{locate_data_root, EngineData, Result};
 use wfcore_server::http::Service;
 
-const HELP: &str = "用法：wfcore-server [--data-dir <PATH>] [--host <IP>] [--port <PORT>] [--probe | --dump-catalog]
+const HELP: &str = "用法：wfcore-server [--data-dir <PATH>] [--host <IP>] [--port <PORT>] [--probe | --dump-catalog | --simulate-batch <JSON_PATH>]
   --data-dir      指定项目根目录或 data 目录，默认从工作目录和可执行文件位置查找
   --host          监听 IP，默认 127.0.0.1
   --port          监听端口，默认 8765
   --probe         加载数据并构建目录，输出健康 JSON 后退出
   --dump-catalog  输出与 GET /api/catalog 相同的 JSON 后退出
+  --simulate-batch  读取 JSON 批次并逐条输出模拟状态与响应
   WF_SERVER_THREADS 指定 HTTP 工作线程数，默认 2";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode { Serve, Probe, Dump }
+#[derive(PartialEq, Eq)]
+enum Mode { Serve, Probe, Dump, SimulateBatch(PathBuf) }
 
 struct Options {
     directory: Option<PathBuf>,
@@ -36,11 +37,15 @@ impl Options {
                 Some("--data-dir") => options.directory = Some(PathBuf::from(argument()?)),
                 Some("--host") => options.host = utf8(argument()?)?.parse().map_err(|_| "--host 必须为有效 IP")?,
                 Some("--port") => options.port = utf8(argument()?)?.parse().map_err(|_| "--port 必须为 0–65535 的整数")?,
-                Some(flag @ ("--probe" | "--dump-catalog")) => {
+                Some(flag @ ("--probe" | "--dump-catalog" | "--simulate-batch")) => {
                     if options.mode != Mode::Serve {
-                        return Err("--probe 与 --dump-catalog 只能指定一个".into());
+                        return Err("--probe、--dump-catalog 和 --simulate-batch 只能指定一个".into());
                     }
-                    options.mode = if flag == "--probe" { Mode::Probe } else { Mode::Dump };
+                    options.mode = match flag {
+                        "--probe" => Mode::Probe,
+                        "--dump-catalog" => Mode::Dump,
+                        _ => Mode::SimulateBatch(PathBuf::from(argument()?)),
+                    };
                 }
                 _ => return Err(format!("未知参数 {}", option.to_string_lossy()).into()),
             }
@@ -63,6 +68,7 @@ fn run() -> Result<()> {
         None => locate_data_root(&env::current_dir()?, &env::current_exe()?)?,
     };
     let service = Service::new(EngineData::load(&root)?)?;
+    let batch;
     let bytes = match options.mode {
         Mode::Serve => {
             let workers = match env::var("WF_SERVER_THREADS") {
@@ -75,6 +81,11 @@ fn run() -> Result<()> {
         }
         Mode::Probe => service.health_json(),
         Mode::Dump => service.catalog_json(),
+        Mode::SimulateBatch(path) => {
+            let input = serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(path)?))?;
+            batch = serde_json::to_vec(&service.simulate_batch(input)?)?;
+            &batch
+        }
     };
     let mut stdout = io::stdout().lock();
     stdout.write_all(bytes)?;

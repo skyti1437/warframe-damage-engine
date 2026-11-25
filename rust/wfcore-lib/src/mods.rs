@@ -21,7 +21,7 @@ impl Default for Num {
 }
 
 impl Num {
-    fn f(self) -> f64 {
+    pub fn f(self) -> f64 {
         match self {
             Num::I(i) => i as f64,
             Num::F(f) => f,
@@ -147,6 +147,11 @@ const BUCKETS: &[&str] = &[
     "RUNTIME_THROW_DAMAGE",
 ];
 const OTHER: usize = BUCKETS.len();
+
+/// 判断效果是否有远程属性结算分组。
+pub fn supports_effect(name: &str) -> bool {
+    bucket_of(name) != OTHER
+}
 
 fn bucket_of(name: &str) -> usize {
     BUCKETS.iter().position(|b| *b == name).unwrap_or(OTHER)

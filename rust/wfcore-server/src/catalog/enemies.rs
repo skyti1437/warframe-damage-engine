@@ -149,7 +149,7 @@ fn image_fields(data: &EngineData, path: &str) -> serde_json::Map<String, Value>
     object(&row)
 }
 
-fn field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
+pub(crate) fn field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
     entries(value).find_map(|(key, value)| {
         names.contains(&fold(key).replace('_', "").as_str()).then_some(value)
     })
@@ -165,7 +165,7 @@ fn normalized(value: &str) -> String {
     fold(value.trim()).replace(['-', ' '], "_")
 }
 
-fn find_head(value: &Value) -> Option<&Value> {
+pub(crate) fn find_head(value: &Value) -> Option<&Value> {
     for (key, nested) in entries(value) {
         if HEAD_ALIASES.contains(&normalized(key).as_str()) {
             if nested.is_object() {
