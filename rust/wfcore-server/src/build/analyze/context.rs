@@ -79,7 +79,7 @@ pub(super) fn benchmark(fields: &Map<String, Value>, data: &EngineData, catalog:
         .unwrap_or(&fallback);
     body.insert("enemyEnhancements".into(), Value::Object(enhancements.clone()));
     body.insert("level".into(), target.get("level").cloned().unwrap_or_else(|| {
-        data.enemies.get(text(&target["enemy"])).and_then(|record| record.get("baseLevel")).cloned().unwrap_or(json!(1))
+        data.enemy(text(&target["enemy"])).and_then(|mut record| record.as_object_mut()?.shift_remove("baseLevel")).unwrap_or(json!(1))
     }));
     body.insert("steelPath".into(), target.get("steelPath").cloned().unwrap_or(json!(false)));
     body.insert("headshotChance".into(), json!(num(&target["headshotChance"])));

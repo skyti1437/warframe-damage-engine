@@ -1,4 +1,4 @@
-use super::{num, SimResult};
+use super::SimResult;
 use super::evaluate::{Evaluation, Evaluator, Metric};
 use super::request::Scope;
 use std::cell::{Cell, RefCell};
@@ -270,9 +270,7 @@ impl<'a> Search<'a> {
         let score = |cards: &[usize]| eval.evaluate(cards, settings.metric, None, eval.fixed_exilus);
         let eligible = |value: &Evaluation| -> SimResult<bool> {
             if let Some(element) = settings.element {
-                let (effects, skipped) = eval.terms(&value.cards, value.riven_slot, eval.fixed_exilus, true);
-                let panel = eval.panel(eval.req, &effects, &skipped, None)?;
-                return Ok(num(&panel.wire["damageTypes"][element]) > 0.0);
+                return eval.has_element(&value.cards, value.riven_slot, element);
             }
             Ok(true)
         };

@@ -35,7 +35,7 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
     let path = fields.get(if legacy { "sourceWeapon" } else { "weapon" }).and_then(Value::as_str)
         .map(str::trim).filter(|v| !v.is_empty()).ok_or("weapon must be an exported weapon path")?;
     let meta = catalog.weapons.get(path).ok_or("weapon is not in the portable Riven catalog")?;
-    let weapon = data.weapons.get(path).ok_or("weapon has no exported combat record")?;
+    let weapon = data.weapon(path).ok_or("weapon has no exported combat record")?;
     let assembled = fields.get("kitgunParts").is_some_and(|value| !value.is_null());
     if !assembled && (meta["available"] != true || meta["analysisAvailable"] != true) {
         return Err(meta["issue"].as_str().or(meta["analysisIssue"].as_str()).unwrap_or("weapon analysis is unavailable").to_owned());
@@ -74,7 +74,7 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
         return Err("portable Riven input requires 2 or 3 positive stats and at most 1 negative stat".into());
     }
     let kind = text(&meta["rivenType"]);
-    let traits = riven_traits::traits(data, kind, weapon);
+    let traits = riven_traits::traits(data, kind, &weapon);
     let mut seen = HashSet::new();
     let mut fusion = 0;
     let mut unsupported = Vec::new();
@@ -129,8 +129,8 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
             "kitgun" => "rifle",
             _ => kind,
         };
-        if !weapon_type.eq_ignore_ascii_case(response::weapon_type(meta, weapon)) {
-            return Err(format!("weaponType {weapon_type} does not match exported weapon type {}", response::weapon_type(meta, weapon)));
+        if !weapon_type.eq_ignore_ascii_case(response::weapon_type(meta, &weapon)) {
+            return Err(format!("weaponType {weapon_type} does not match exported weapon type {}", response::weapon_type(meta, &weapon)));
         }
     }
     let profile = fields.get("profile").filter(|v| !v.is_null()).map(|v| v.as_str().ok_or("profile must be a string"))
@@ -174,7 +174,7 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
             .ok_or("timeline seconds must be greater than zero and at most 300")
     }).transpose()?.or_else(|| rows(fields.get("arcanes").unwrap_or(&Value::Null)).iter()
         .any(|arcane| arcane.get("triggerRate").is_some_and(|v| !v.is_null())).then_some(10.0));
-    if timeline_seconds.is_some() && response::weapon_type(meta, weapon) == "melee" && weapon["heavyAttack"].is_object() {
+    if timeline_seconds.is_some() && response::weapon_type(meta, &weapon) == "melee" && weapon["heavyAttack"].is_object() {
         return Err("timeline seconds are not supported for single heavy/throw damage".into());
     }
     let card = riven_traits::card(data, lines, rank, polarity)?;

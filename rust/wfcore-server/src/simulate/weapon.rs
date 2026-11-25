@@ -1,17 +1,30 @@
 use super::{named, num, rows, text, truth, request::Request, SimResult};
 use crate::data::{EngineData, BUILD_LABEL};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{cell::{OnceCell, RefCell}, ops::Deref, rc::Rc, sync::Arc};
 use wfcore_lib::{
-    mods::{self, ClassifiedEffect, EffectInput, ModdedFields, ModsInput, ModsPrep, Num},
+    fx::FxHashMap, mods::{self, ClassifiedEffect, EffectInput, ModdedFields, ModsPrep, Num, Row},
     pymath::psum, replay::{Stats, Types}, tables::{self, Core},
 };
 
 #[derive(Clone)]
 pub(super) struct Effect {
+    pub value: f64,
+    pub condition: Option<String>,
+    definition: Rc<EffectDefinition>,
+}
+
+impl Deref for Effect {
+    type Target = EffectDefinition;
+
+    fn deref(&self) -> &EffectDefinition { &self.definition }
+}
+
+#[derive(Clone)]
+pub(super) struct EffectDefinition {
+    row: OnceCell<Arc<Row>>,
     pub upgrade: String,
     pub operation: String,
-    pub value: f64,
     pub dtype: Option<String>,
     pub symbol: Option<String>,
     valid_type: Option<String>,
@@ -21,7 +34,6 @@ pub(super) struct Effect {
     postures: Vec<String>,
     proc_types: Vec<String>,
     pub runtime_chance: Option<f64>,
-    pub condition: Option<String>,
     runtime_kind: Option<String>,
     runtime_damage_type: Option<String>,
     runtime_threshold: Option<f64>,
@@ -34,18 +46,37 @@ impl Effect {
     pub fn export(raw: &Value, source: &str) -> Self {
         let string = |key: &str| raw[key].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
         Self {
-            upgrade: string("upgradeType").unwrap_or_else(|| "NONE".into()),
-            operation: string("operation").unwrap_or_else(|| "ADD".into()),
-            value: num(&raw["valuePerRank"]), dtype: raw["damageType"].as_str().map(str::to_owned), symbol: string("symbolFilter"),
-            valid_type: string("validType"), source: source.into(),
-            required: strings(&raw["validModifiers"]), excluded: strings(&raw["invalidModifiers"]),
-            postures: strings(&raw["validPostures"]), proc_types: strings(&raw["validProcTypes"]),
-            runtime_chance: raw["runtimeChance"].as_f64(), runtime_kind: string("runtimeKind"),
-            runtime_damage_type: string("runtimeDamageType"), runtime_threshold: raw["runtimeThreshold"].as_f64(),
-            runtime_multiplier: raw["runtimeMultiplier"].as_f64().unwrap_or(1.0),
-            condition: string("conditionTag"), auto_type: raw["autoType"].clone(),
-            check_type: raw["checkTypeOnInstall"].clone(),
+            value: num(&raw["valuePerRank"]),
+            condition: string("conditionTag"),
+            definition: Rc::new(EffectDefinition {
+                row: OnceCell::new(),
+                upgrade: string("upgradeType").unwrap_or_else(|| "NONE".into()),
+                operation: string("operation").unwrap_or_else(|| "ADD".into()),
+                dtype: raw["damageType"].as_str().map(str::to_owned), symbol: string("symbolFilter"),
+                valid_type: string("validType"), source: source.into(),
+                required: strings(&raw["validModifiers"]), excluded: strings(&raw["invalidModifiers"]),
+                postures: strings(&raw["validPostures"]), proc_types: strings(&raw["validProcTypes"]),
+                runtime_chance: raw["runtimeChance"].as_f64(), runtime_kind: string("runtimeKind"),
+                runtime_damage_type: string("runtimeDamageType"), runtime_threshold: raw["runtimeThreshold"].as_f64(),
+                runtime_multiplier: raw["runtimeMultiplier"].as_f64().unwrap_or(1.0),
+                auto_type: raw["autoType"].clone(), check_type: raw["checkTypeOnInstall"].clone(),
+            }),
         }
+    }
+
+    pub fn set_upgrade(&mut self, upgrade: &str) {
+        let definition = Rc::make_mut(&mut self.definition);
+        definition.upgrade = upgrade.to_owned();
+        definition.row = OnceCell::new();
+    }
+
+    fn row(&self) -> &Arc<Row> {
+        self.row.get_or_init(|| Arc::new(EffectInput {
+            upgrade: self.upgrade.clone(), operation: self.operation.clone(), value: 0.0,
+            damage_type: self.dtype.clone(), symbol: self.symbol.clone(), source: Some(self.source.clone()),
+            runtime_kind: self.runtime_kind.clone(), runtime_damage_type: self.runtime_damage_type.clone(),
+            runtime_chance: self.runtime_chance, runtime_threshold: self.runtime_threshold, runtime_multiplier: self.runtime_multiplier,
+        }.into()))
     }
 
     pub fn last_multishot(value: f64) -> Self {
@@ -79,7 +110,7 @@ impl Effect {
             text(&weapon["path"]).trim_end_matches('/') == name
                 || rows(&weapon["ancestry"]).iter().any(|v| text(v).trim_end_matches('/') == name)
         });
-        let (status, message, unsupported) = if !is_weapon_effect(&self.upgrade) {
+        let (status, message, unsupported) = if !self.row().is_supported() && self.upgrade != super::mod_runtime::CONSECUTIVE_DAMAGE {
             let reason = match self.upgrade.as_str() {
                 "WEAPON_DAMAGE_CONVERSION" => "damage-conversion-phase-unverified",
                 "WEAPON_DAMAGE_TYPE_BIAS" => "damage-type-bias-phase-unverified",
@@ -96,12 +127,7 @@ impl Effect {
         };
         ClassifiedEffect {
             index, status, message, unsupported,
-            row: Arc::new(EffectInput {
-                upgrade: self.upgrade.clone(), operation: self.operation.clone(), value: self.value,
-                damage_type: self.dtype.clone(), symbol: self.symbol.clone(), source: Some(self.source.clone()),
-                runtime_kind: self.runtime_kind.clone(), runtime_damage_type: self.runtime_damage_type.clone(),
-                runtime_chance: self.runtime_chance, runtime_threshold: self.runtime_threshold, runtime_multiplier: self.runtime_multiplier,
-            }.into()),
+            row: Arc::clone(self.row()),
         }
     }
 
@@ -427,6 +453,19 @@ pub(super) fn is_weapon_effect(upgrade: &str) -> bool {
     mods::supports_effect(upgrade) || upgrade == super::mod_runtime::CONSECUTIVE_DAMAGE
 }
 
+#[derive(Default)]
+struct ModeCache {
+    profile: OnceCell<Value>,
+    panel: OnceCell<Result<ModsPrep, String>>,
+    attack: OnceCell<Result<ModsPrep, String>>,
+    innate: OnceCell<Vec<Effect>>,
+    parts: RefCell<FxHashMap<ReplayPart, Rc<ModsPrep>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ReplayPart { Radial(usize), Field, Terminal }
+
+#[derive(Clone)]
 pub(super) struct Weapon<'a> {
     pub data: &'a EngineData,
     pub req: &'a Request<'a>,
@@ -434,6 +473,9 @@ pub(super) struct Weapon<'a> {
     pub modes: &'a [Value],
     pub reference: &'a Value,
     pub incarnon: &'a Value,
+    pub innate: &'a [Value],
+    passive: &'a Value,
+    cache: Rc<[ModeCache]>,
 }
 
 fn numeric(value: &Value, default: Num) -> Num {
@@ -450,8 +492,11 @@ impl<'a> Weapon<'a> {
     pub fn new(data: &'a EngineData, req: &'a Request<'a>) -> Self {
         let path = text(&req.weapon["path"]);
         let reference = data.mechanics.get("combat-reference").unwrap_or(&Value::Null);
-        Self { data, req, path, modes: rows(&req.weapon["fireModes"]),
-            reference, incarnon: &reference["incarnon"][path] }
+        let modes = rows(&req.weapon["fireModes"]);
+        let passive = &data.mechanics.get("weapon-passives").unwrap_or(&Value::Null)["weapons"][path];
+        Self { data, req, path, modes, reference, incarnon: &reference["incarnon"][path],
+            passive, innate: rows(&passive["innate"]),
+            cache: (0..modes.len()).map(|_| ModeCache::default()).collect() }
     }
 
     pub fn is_incarnon(&self, index: usize) -> bool {
@@ -459,7 +504,18 @@ impl<'a> Weapon<'a> {
             .unwrap_or(index > 0 && index + 1 == self.modes.len())
     }
 
-    pub fn profile(&self, index: usize) -> Value {
+    /// Search variants may change aim, window or evolution choices while keeping
+    /// the exported weapon and panel scenario from the original request.
+    pub fn with_request<'b>(&'b self, req: &'b Request<'b>) -> Weapon<'b> {
+        debug_assert!(std::ptr::eq(req.weapon, self.req.weapon));
+        Weapon { req, ..self.clone() }
+    }
+
+    pub fn profile(&self, index: usize) -> &Value {
+        self.cache[index].profile.get_or_init(|| self.prepare_profile(index))
+    }
+
+    fn prepare_profile(&self, index: usize) -> Value {
         let mode = &self.modes[index];
         let root = &self.reference["auditedAttacks"][self.path];
         let selected = if index == 0 { root } else { &root["modes"][index.to_string()] };
@@ -514,29 +570,50 @@ impl<'a> Weapon<'a> {
         } else { &Value::Null }
     }
 
-    fn installed_effects(&self, index: usize, effects: &[Effect]) -> Vec<Effect> {
-        let mut installed = effects.to_vec();
-        for source in rows(&self.mechanics("weapon-passives")["innate"]) {
-            if truth(&source["fireModes"]) && !rows(&source["fireModes"]).iter().any(|v| v == index) { continue; }
-            installed.extend(rows(&source["effects"]).iter()
+    fn innate_effects(&self, index: usize) -> &[Effect] {
+        self.cache[index].innate.get_or_init(|| {
+            self.innate.iter().filter(|source| {
+                !truth(&source["fireModes"]) || rows(&source["fireModes"]).iter().any(|v| v == index)
+            }).flat_map(|source| rows(&source["effects"]).iter()
                 .filter(|effect| is_weapon_effect(text(&effect["upgradeType"])))
-                .map(|effect| Effect::export(effect, text(&source["path"]))));
-        }
-        installed
+                .map(|effect| Effect::export(effect, text(&source["path"]))))
+                .collect()
+        })
     }
 
     fn co_payload(&self, index: usize, effects: &[Effect], fields: &ModdedFields) -> Value {
-        let installed = self.installed_effects(index, effects);
-        json!(fields.co_bucket.iter().map(|&pos| installed[pos].payload()).collect::<Vec<_>>())
+        let innate = self.innate_effects(index);
+        json!(fields.co_bucket.iter().map(|&pos| {
+            effects.get(pos).unwrap_or_else(|| &innate[pos - effects.len()]).payload()
+        }).collect::<Vec<_>>())
+    }
+
+    pub fn uses_status_count(&self, effects: &[Effect]) -> bool {
+        let index = if self.req.scenario.heavy && !rows(&self.req.weapon["heavyAttack"]["components"]).is_empty() {
+            0
+        } else { self.req.mode };
+        effects.iter().chain(self.innate_effects(index)).any(|effect| matches!(effect.upgrade.as_str(),
+            "WEAPON_DAMAGE_IF_VICTIM_PROC_ACTIVE" | "WEAPON_CRIT_CHANCE_IF_VICTIM_PROC_ACTIVE"
+            | "WEAPON_CRIT_UNDER_PROC_THRESHOLD_MAX"))
     }
 
     pub fn panel_fields(&self, effects: &[Effect], status_count: f64, skipped: &[String]) -> SimResult<(ModdedFields, Value)> {
+        self.panel(effects, status_count, skipped, true)
+    }
+
+    pub fn panel_for_score(&self, effects: &[Effect], status_count: f64, skipped: &[String], heavy_metadata: bool)
+        -> SimResult<(ModdedFields, Value)> {
+        self.panel(effects, status_count, skipped, heavy_metadata)
+    }
+
+    fn panel(&self, effects: &[Effect], status_count: f64, skipped: &[String], metadata: bool) -> SimResult<(ModdedFields, Value)> {
         let components = rows(&self.req.weapon["heavyAttack"]["components"]);
         if !self.req.scenario.heavy || components.is_empty() {
-            return self.reduce(self.req.mode, &self.modes[self.req.mode], &self.profile(self.req.mode), effects,
-                self.req.scenario.cycle, status_count, false, self.req.scenario.heavy, skipped).map(|fields| {
-                    let co = self.co_payload(self.req.mode, effects, &fields);
-                    (fields, json!({"co_bucket": co}))
+            return self.reduce_mode(self.req.mode, effects, self.req.scenario.cycle,
+                status_count, self.req.scenario.heavy, skipped).map(|fields| {
+                    let wire = if metadata { json!({"co_bucket": self.co_payload(self.req.mode, effects, &fields)}) }
+                        else { Value::Null };
+                    (fields, wire)
                 });
         }
         let mut first = None;
@@ -555,28 +632,34 @@ impl<'a> Weapon<'a> {
             let mode = json!({"damage": damage, "multishot": count, "fireRate": 0.0, "reloadTime": 0.0});
             let fields = self.reduce(0, &mode, &Value::Null, effects, false, status_count, false, true, skipped)?;
             let count = fields.multishot;
-            let vector: serde_json::Map<_, _> = fields.damage_types.0.iter().map(|&(id, value)| {
-                let amount = value * count;
-                *types.entry(id).or_insert(0.0) += amount;
-                (mods::name(id), json!(amount))
-            }).collect();
-            let sum = psum(vector.values().map(num));
-            let average = psum(fields.damage_types.0.iter().map(|v| v.1)) * tables::effective_hit_multiplier(
-                fields.crit_chance.f(), fields.crit_multiplier, fields.noncrit_damage_multiplier, 1.0, fields.double_crit_chance)
-                * fields.falloff_multiplier;
-            let expected = average * count;
-            total += expected;
-            let shares: serde_json::Map<_, _> = vector.iter().filter(|_| sum != 0.0)
-                .map(|(name, v)| (name.clone(), json!(num(v) / sum))).collect();
-            let mut part = json!({"id": component["id"], "kind": component["kind"], "source": component["source"],
-                "count": count, "damage": {"total": sum, "types": vector, "shares": shares,
-                    "critChance": fields.crit_chance.f(), "critMultiplier": fields.crit_multiplier,
-                    "doubleCritChance": fields.double_crit_chance, "procChance": fields.status_chance},
-                "expectedDamage": expected});
-            for key in ["forcedProcs", "radius", "falloff", "recallMultiplier"] {
-                if !component[key].is_null() { part[key] = component[key].clone(); }
+            if metadata {
+                let vector: serde_json::Map<_, _> = fields.damage_types.0.iter().map(|&(id, value)| {
+                    let amount = value * count;
+                    *types.entry(id).or_insert(0.0) += amount;
+                    (mods::name(id), json!(amount))
+                }).collect();
+                let sum = psum(vector.values().map(num));
+                let average = psum(fields.damage_types.0.iter().map(|v| v.1)) * tables::effective_hit_multiplier(
+                    fields.crit_chance.f(), fields.crit_multiplier, fields.noncrit_damage_multiplier, 1.0, fields.double_crit_chance)
+                    * fields.falloff_multiplier;
+                let expected = average * count;
+                total += expected;
+                let shares: serde_json::Map<_, _> = vector.iter().filter(|_| sum != 0.0)
+                    .map(|(name, v)| (name.clone(), json!(num(v) / sum))).collect();
+                let mut part = json!({"id": component["id"], "kind": component["kind"], "source": component["source"],
+                    "count": count, "damage": {"total": sum, "types": vector, "shares": shares,
+                        "critChance": fields.crit_chance.f(), "critMultiplier": fields.crit_multiplier,
+                        "doubleCritChance": fields.double_crit_chance, "procChance": fields.status_chance},
+                    "expectedDamage": expected});
+                for key in ["forcedProcs", "radius", "falloff", "recallMultiplier"] {
+                    if !component[key].is_null() { part[key] = component[key].clone(); }
+                }
+                payload.push(part);
+            } else {
+                for &(id, value) in &fields.damage_types.0 {
+                    *types.entry(id).or_insert(0.0) += value * count;
+                }
             }
-            payload.push(part);
             unsupported.extend(fields.unsupported.iter().cloned());
             for note in &fields.skipped {
                 if !all_skipped.contains(note) { all_skipped.push(note.clone()); }
@@ -592,12 +675,37 @@ impl<'a> Weapon<'a> {
         fields.falloff_multiplier = 1.0;
         fields.unsupported = unsupported.into_iter().collect();
         fields.skipped = all_skipped;
-        let co = self.co_payload(0, effects, &fields);
-        Ok((fields, json!({"heavy_damage": total, "heavy_components": payload, "co_bucket": co})))
+        let wire = if metadata {
+            json!({"heavy_damage": total, "heavy_components": payload, "co_bucket": self.co_payload(0, effects, &fields)})
+        } else { Value::Null };
+        Ok((fields, wire))
+    }
+
+    pub fn reduce_mode(&self, index: usize, effects: &[Effect], cycle: bool, status_count: f64,
+        heavy: bool, skipped: &[String]) -> SimResult<ModdedFields> {
+        let cache = &self.cache[index];
+        let prep = if cycle { &cache.panel } else { &cache.attack };
+        let prep = prep.get_or_init(|| self.prepare(index, &self.modes[index], self.profile(index), cycle, false))
+            .as_ref().map_err(Clone::clone)?;
+        Ok(self.reduce_prepared(index, prep, effects, status_count, heavy, skipped))
+    }
+
+    pub fn prepare_replay_part(&self, index: usize, part: ReplayPart,
+        prepare_mode: impl FnOnce() -> Value) -> SimResult<Rc<ModsPrep>> {
+        let mut parts = self.cache[index].parts.borrow_mut();
+        if let Some(prep) = parts.get(&part) { return Ok(Rc::clone(prep)); }
+        let prep = Rc::new(self.prepare(index, &prepare_mode(), self.profile(index), false, true)?);
+        parts.insert(part, Rc::clone(&prep));
+        Ok(prep)
     }
 
     pub fn reduce(&self, index: usize, mode: &Value, profile: &Value, effects: &[Effect],
                   cycle: bool, status_count: f64, part: bool, heavy: bool, skipped: &[String]) -> SimResult<ModdedFields> {
+        let prep = self.prepare(index, mode, profile, cycle, part)?;
+        Ok(self.reduce_prepared(index, &prep, effects, status_count, heavy, skipped))
+    }
+
+    fn prepare(&self, index: usize, mode: &Value, profile: &Value, cycle: bool, part: bool) -> SimResult<ModsPrep> {
         if let Some(reason) = mode["unavailableReason"].as_str().filter(|_| mode["behaviorKind"] == "ability-action") {
             return Err(reason.to_owned());
         }
@@ -629,10 +737,9 @@ impl<'a> Weapon<'a> {
         let co = &self.reference["coProfiles"][self.path][index.to_string()];
         let co = if (num(&co["directTotal"]) - psum(base.iter().map(|(_, v)| *v))).abs() <= 0.02
             && co["projectile"] == damage["projectile"] { co } else { &Value::Null };
-        let passive = self.mechanics("weapon-passives");
-        let installed = self.installed_effects(index, effects);
+        let passive = self.passive;
         let copy = &mode["multishotCopy"][if part { "radial" } else { "direct" }];
-        let prep = ModsPrep {
+        Ok(ModsPrep {
             melee: self.req.melee,
             compression: profile["compression"]["radius"].as_f64().map(|radius| {
                 let c = &profile["compression"];
@@ -678,19 +785,22 @@ impl<'a> Weapon<'a> {
             super_status: passive["superStatusOnCrit"]["chance"].as_f64().filter(|_| !is_incarnon)
                 .map(|v| (v, num(&passive["superStatusOnCrit"]["statusChance"]))),
             orb_stacks: 1, forced: force, ammo_cost: nonzero(&mode["ammoCost"], 1.0), ..ModsPrep::default()
-        };
-        let result = mods::apply_mods(&prep, ModsInput {
-            effects: installed.iter().filter(|effect| effect.upgrade != super::mod_runtime::CONSECUTIVE_DAMAGE)
-                .enumerate().map(|(index, e)| e.classify(index, self.req, heavy)).collect(),
-            skipped: skipped.to_vec(), victim_status_count: status_count, need_spec: false,
-        }, std::iter::empty::<Result<_, std::convert::Infallible>>()).unwrap();
-        let mut fields = result.fields;
+        })
+    }
+
+    pub fn reduce_prepared(&self, index: usize, prep: &ModsPrep, effects: &[Effect], status_count: f64,
+        heavy: bool, skipped: &[String]) -> ModdedFields {
+        let innate = self.innate_effects(index);
+        let installed = || effects.iter().chain(innate);
+        let entries: Vec<_> = installed().filter(|effect| effect.upgrade != super::mod_runtime::CONSECUTIVE_DAMAGE)
+            .enumerate().map(|(index, effect)| (effect.classify(index, self.req, heavy), effect.value)).collect();
+        let mut fields = mods::apply_prepared_mods(prep, &entries, skipped.to_vec(), status_count);
         if self.req.scenario.spread && !fields.radial_only && !fields.continuous {
             let spread = &self.data.mechanics.get("deferred-spread-profiles").unwrap_or(&Value::Null)["profiles"][self.path];
             if spread["fireMode"] == index {
                 if let Some(distance) = self.req.scenario.distance.filter(|distance| *distance > 0.0) {
                     let scope = if self.req.scenario.aiming { "spreadAim" } else { "spreadHip" };
-                    let terms: Vec<_> = installed.iter().filter(|e| e.upgrade == "WEAPON_SPREAD" && e.classify(0, self.req, heavy).status == 0)
+                    let terms: Vec<_> = installed().filter(|e| e.upgrade == "WEAPON_SPREAD" && e.classify(0, self.req, heavy).status == 0)
                         .map(|e| (wfcore_lib::co::op_code(&e.operation), e.value)).collect();
                     let angle = wfcore_lib::co::combine(num(&spread[scope]["min_deg"]), &[&terms], None).max(0.0);
                     let radius = num(&spread["bodyRadiusM"]);
@@ -702,7 +812,7 @@ impl<'a> Weapon<'a> {
                 }
             }
         }
-        Ok(fields)
+        fields
     }
 }
 

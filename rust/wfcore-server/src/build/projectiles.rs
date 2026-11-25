@@ -51,7 +51,7 @@ pub(super) fn preview(weapon: &Weapon<'_>, req: &Request<'_>, effects: &[Effect]
                 filtered = effects.iter().filter(|effect| effect.upgrade != "WEAPON_DAMAGE_IF_VICTIM_PROC_ACTIVE").cloned().collect::<Vec<_>>();
                 &filtered
             } else { effects };
-            let fields = weapon.reduce(req.mode, &Value::Object(mode), &profile, effects, req.scenario.cycle, count as f64,
+            let fields = weapon.reduce(req.mode, &Value::Object(mode), profile, effects, req.scenario.cycle, count as f64,
                 false, req.scenario.heavy, skipped)?;
             if blob {
                 row["hitClassification"] = json!("area-direct");

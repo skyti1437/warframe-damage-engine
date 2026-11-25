@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 pub(crate) const DARK_SPLIT: &str =
     "/Lotus/Weapons/Tenno/Melee/Swords/DarkSword/DarkSwordDaggerHybridWeapon";
 
-pub(super) fn apply(engine: &mut EngineData) -> Result<()> {
+pub(super) fn apply(engine: &mut EngineData, wiki_weapon_overrides: &Value) -> Result<()> {
     for (path, weapon) in &mut engine.weapons {
         if path == "/Lotus/Weapons/ClanTech/Energy/Railgun" {
             if let Some(modes) = weapon["fireModes"].as_array_mut() {
@@ -20,10 +20,15 @@ pub(super) fn apply(engine: &mut EngineData) -> Result<()> {
                 }
             }
         }
-        apply_wiki(weapon, &engine.wiki_weapon_overrides["weapons"][path])?;
+        apply_wiki(weapon, &wiki_weapon_overrides["weapons"][path])?;
     }
-    for (path, enemy) in &mut engine.enemies {
-        merge(enemy, &engine.enemy_overrides["data"][path]);
+    // Each override is consumed by a single exported enemy. Moving the fields
+    // keeps the original merge order and releases the duplicate override table.
+    let Value::Object(overrides) = engine.enemy_overrides["data"].take() else { unreachable!("validated by loader") };
+    for (path, patch) in overrides {
+        if let (Some(enemy), Value::Object(patch)) = (engine.enemies.get_mut(&path).and_then(Value::as_object_mut), patch) {
+            enemy.extend(patch);
+        }
     }
     for (path, arcane) in &mut engine.arcanes {
         merge(arcane, &engine.rules.arcanes["supplements"][path]);

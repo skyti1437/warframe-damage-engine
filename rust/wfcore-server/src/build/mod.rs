@@ -40,9 +40,9 @@ fn solve(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, Value>, m
     if raw_weapon["exalted"].is_object() {
         return Err("exalted weapon builds require a linked Warframe configuration calculator".into());
     }
-    let base = data.weapons.get(text(&raw_weapon["path"])).ok_or("weapon has no exported combat record")?;
+    let base = data.weapon(text(&raw_weapon["path"])).ok_or("weapon has no exported combat record")?;
     let parts = body.remove("kitgunParts").unwrap_or(Value::Null);
-    let assembled = modular::assemble(data, base, &parts)?;
+    let assembled = modular::assemble(data, &base, &parts)?;
     if analysis.is_none() && assembled.is_none() && raw_weapon["buildAvailable"] != true {
         return Err(raw_weapon["buildIssue"].as_str().unwrap_or("weapon build is unavailable").into());
     }
@@ -56,7 +56,7 @@ fn solve(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, Value>, m
     if body.get("damageModel").is_some_and(|v| text(v).eq_ignore_ascii_case("panel")) {
         body.insert("damageModel".into(), json!("target"));
     }
-    let mut resolved = assembled.unwrap_or_else(|| base.clone());
+    let mut resolved = assembled.unwrap_or(base);
     if analysis.is_some() && resolved["heavyAttack"]["kind"] == "projectileRecall" {
         let components: Vec<_> = rows(&resolved["heavyAttack"]["components"]).iter()
             .filter(|part| matches!(text(&part["kind"]), "projectileDirect" | "heavyRecall"))
@@ -69,7 +69,7 @@ fn solve(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, Value>, m
     body.remove("innateElement");
     if !innate.is_null() { resolved["innateElements"] = json!([innate]); }
     let external = body.remove("externalBuffs").unwrap_or(Value::Null);
-    let req = Request::parse_weapon(data, catalog, &body, Some(&resolved))?;
+    let req = Request::parse_weapon(data, catalog, &body, &resolved)?;
     let availability = &raw_weapon["fireModes"][req.mode]["metricAvailability"][&scope.metric];
     if analysis.is_none() && parts.is_null() && availability["available"] != true {
         return Err(availability["issue"].as_str().unwrap_or("fire mode metric is unavailable").into());
@@ -95,7 +95,7 @@ fn solve(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, Value>, m
         if value > 0.0 { req.enhancements[key] = json!(value); }
     }
     if analysis.is_none() && !truth(&req.target["health"]) {
-        req.target = data.enemies.get(BENCHMARK_TARGET).ok_or("missing benchmark enemy")?.clone();
+        req.target = data.enemy(BENCHMARK_TARGET).ok_or("missing benchmark enemy")?;
         req.level = 170;
         req.steel = true;
         req.enhancements = json!({"eximus": false, "noOverguard": true});
@@ -138,15 +138,23 @@ fn solve(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, Value>, m
         else { auto::resolve_arcanes(data, catalog, &req, &arcane_rows)? };
     let arcane_panel = arcanes.snapshot(&req, None, None)?;
 
-    let evaluator = Evaluator { data, req: &req, target, stance: &stance, schedule: schedule.as_ref(),
+    let weapon = weapon::Weapon::new(data, &req);
+    let replay_defenses = target.defenses(req.level, req.steel, req.strip, 0.0, &req.enhancements);
+    let proxy_defenses = target.defenses(req.level, req.steel, req.strip, req.elemental_strip, &req.enhancements);
+    let infinite_conditions = &data.mechanics["infinite-conditions"]["sources"];
+    let evaluator = Evaluator { data, req: &req, target: &target, weapon: &weapon, infinite_conditions,
+        replay_defenses: &replay_defenses, proxy_defenses: &proxy_defenses, stance: &stance, schedule: schedule.as_ref(),
         cards: &cards, riven: riven.as_ref(), fixed_exilus: fixed_exilus.as_ref(), arcanes: &arcanes,
         arcane_panel: &arcane_panel, evolution: &evolution, external: &buffs.effects,
-        capacity_limit: capacity_limit - fixed["drain"].as_i64().unwrap_or(0), shells, replay_options: Default::default() };
+        capacity_limit: capacity_limit - fixed["drain"].as_i64().unwrap_or(0), shells: &shells, replay_options: Default::default(), event_scores: None };
     let search = Search::new(&evaluator, &scope)?;
     if let Some(input) = analysis {
         return analyze::calculate(&evaluator, &search, input, catalog, raw_weapon, fixed, rejected);
     }
-    let mut best = search.run(&evaluator, &[], auto_route)?;
+    let scores = evaluate::EventScores::default();
+    let initial = Evaluator { event_scores: Some(&scores), ..evaluator.clone() };
+    let mut best = search.run(&initial, &[], auto_route)?;
+    drop(scores);
     let mut report = Map::new();
     let auto_started = std::time::Instant::now();
     let mut route = None;
@@ -192,7 +200,9 @@ fn solve(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, Value>, m
     let arcane_panel = arcanes.snapshot(&req, None, None)?;
     let evaluator = Evaluator { evolution: route.as_ref().unwrap_or(&evolution), arcanes: &arcanes,
         arcane_panel: &arcane_panel, ..evaluator };
-    best = search.refine(&evaluator, best)?;
+    let scores = evaluate::EventScores::default();
+    best = search.refine(&Evaluator { event_scores: Some(&scores), ..evaluator.clone() }, best)?;
+    drop(scores);
     if (best.cards.is_empty() && scope.min != Some(0)) || !best.score.is_finite() || best.score < 0.0 {
         return Err(format!("optimizer returned no usable MOD build for fire mode {} metric {}", req.mode, scope.metric));
     }

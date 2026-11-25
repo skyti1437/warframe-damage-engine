@@ -659,6 +659,8 @@ struct EmbeddedEntity {
 struct Replay<'a> {
     provider: &'a dyn ReplayProvider,
     score_only: bool,
+    compact_score: bool,
+    track_victim_snapshot: bool,
     timeline: Option<Timeline>,
     types: Types,
     // 配置
@@ -870,6 +872,7 @@ struct Replay<'a> {
     stats: Vec<Stats>,
     views: FxHashMap<ObjectId, usize>,
     co_specs: FxHashMap<ObjectId, Rc<co::CoSpec>>,
+    fixed_model: [Option<(usize, Option<usize>)>; 6],
     model_cache: FxHashMap<(Vec<u64>, u64, bool), (usize, Option<usize>)>,
     /// `model()` 查表命中时复用键的缓冲区。
     model_key: Vec<u64>,
@@ -1202,8 +1205,7 @@ impl Replay<'_> {
 
     fn signal(&mut self, kind: &str, t: f64, weight: f64) {
         let _timer = crate::counters::Timer::start(crate::counters::SIGNAL);
-        for i in 0..self.sources.len() {
-            let q = &mut self.sources[i];
+        for q in &mut self.sources {
             if q.actor_only && !self.actor_signal {
                 continue;
             }
@@ -1373,12 +1375,26 @@ impl Replay<'_> {
     }
 
     fn snapshot_victim_procs(&mut self, t: f64) {
+        if !self.track_victim_snapshot { return; }
+        self.snapshot_victim_procs_required(t);
+    }
+
+    fn snapshot_victim_procs_required(&mut self, t: f64) {
         self.victim_before.clear();
         self.victim_before.extend(self.presence.iter_mut().map(|(&d, presence)| (d, presence.probability(t))));
     }
 
     fn model(&mut self, t: f64) -> ReplayResult<(usize, Option<usize>)> {
         let _timer = crate::counters::Timer::start(crate::counters::MODEL);
+        if !self.live_types_enabled && self.sources.is_empty() && self.melee.is_none() && self.onos.is_none()
+            && !self.heavy_flag && !self.no_co_flag && self.physical_lane_length == 0
+            && self.projectile_sequence_length == 0 && self.volley_rounds == 1.0 {
+            let slot = 2 * usize::from(self.form) + usize::from(self.last_round);
+            if let Some(hit) = self.fixed_model[slot] { return Ok(hit); }
+            let model = self.model_at(vec![self.form as u64, 1.0f64.to_bits()], Vec::new(), 0.0)?;
+            self.fixed_model[slot] = Some(model);
+            return Ok(model);
+        }
         let live_types = if self.live_types_enabled {
             self.live_proc_types(t)
         } else {
@@ -1959,10 +1975,10 @@ impl Replay<'_> {
         self.faction_deltas.iter().find(|x| x.0 == d).map(|x| x.1).unwrap_or(0.0)
     }
 
-    fn health_value(&mut self, d: D, raw: f64, t: f64) -> f64 {
+    fn health_value(&mut self, d: D, raw: f64, t: f64, armour: &mut Option<f64>) -> f64 {
         let mut mult = pmax(0.0, 1.0 + self.faction_delta(d)) * self.vulnerability(VIRAL);
         if !self.armour_bypass.contains(&d) {
-            mult *= self.armour_factor(t);
+            mult *= *armour.get_or_insert_with(|| self.armour_factor(t));
         }
         raw * mult
     }
@@ -2067,6 +2083,7 @@ impl Replay<'_> {
         let mut remaining = 0.0;
         let mut overguard_broke = false;
         let mut shield_broke = false;
+        let mut armour = None;
         if self.pools[0] > 0.0 {
             let mut value = psum(vector.iter().map(|(k, raw)| raw * if *k == VOID || *k == RADIANT { 1.5 } else { 1.0 }))
                 * self.vulnerability(MAGNETIC);
@@ -2104,7 +2121,7 @@ impl Replay<'_> {
             let mut s = PySum::new();
             for (k, raw) in vector.iter() {
                 if self.shield_bypass.contains(k) {
-                    s.add(self.health_value(*k, *raw, t));
+                    s.add(self.health_value(*k, *raw, t, &mut armour));
                 }
             }
             let bypass = s.value();
@@ -2129,7 +2146,7 @@ impl Replay<'_> {
         if left > 0.0 && self.pools[1] <= 1e-9 && self.pools[2] > 0.0 {
             let mut s = PySum::new();
             for (k, raw) in vector.iter() {
-                s.add(self.health_value(*k, *raw, t));
+                s.add(self.health_value(*k, *raw, t, &mut armour));
             }
             let value = s.value();
             let mut amount = value * left;
@@ -2149,10 +2166,9 @@ impl Replay<'_> {
             remaining += drain;
         }
         self.totals[source] += applied;
-        if source == DOT && vector.len() == 1 {
+        if !self.compact_score && source == DOT && vector.len() == 1 {
             let d = vector[0].0;
-            let prev = *self.dot_by_type.get(&d).unwrap_or(&0.0);
-            self.dot_by_type.insert(d, prev + applied);
+            *self.dot_by_type.entry(d).or_insert(0.0) += applied;
         }
         let weak = match weak_kill {
             WeakKill::Flag(true) => self.head,
@@ -2657,17 +2673,21 @@ impl Replay<'_> {
         } else {
             &data.procs
         };
+        let rate = pmax(self.status_rate_multiplier, 0.0);
         for &(d, n0) in procs.iter() {
             let scale = self.stats[st].core.duration_scale(d);
-            let n = n0 * pmax(self.status_rate_multiplier, 0.0);
+            let n = n0 * rate;
             if n <= 0.0 || (d == FREEZE && self.frozen_until > t) || (self.blocks_radiation && d == RADIATION) {
                 continue;
             }
-            let prev = *self.proc_counts.get(&d).unwrap_or(&0.0);
-            self.proc_counts.insert(d, prev + n);
-            let name = self.proc_signal(d);
-            self.signal(&name, t, n);
-            self.signal("on-proc", t, n);
+            if !self.compact_score || self.cryogenic.is_some() {
+                *self.proc_counts.entry(d).or_insert(0.0) += n;
+            }
+            if !self.sources.is_empty() {
+                let name = self.proc_signal(d);
+                self.signal(&name, t, n);
+                self.signal("on-proc", t, n);
+            }
             if scale <= 0.0 {
                 if self.empowered_hit(st, d, n, t, weapon)? {
                     return Ok(());
@@ -2686,7 +2706,8 @@ impl Replay<'_> {
                 continue;
             }
             let _ns = crate::counters::Timer::start(crate::counters::NOSTATUS);
-            let mut absence = pow(self.no_status_probability(status_view, d, aim)?, pmax(self.status_rate_multiplier, 0.0));
+            let probability = self.no_status_probability(status_view, d, aim)?;
+            let mut absence = if rate == 1.0 { probability } else { pow(probability, rate) };
             drop(_ns);
             if absence >= 1.0 && n > 0.0 {
                 absence = 1.0 - pmin(n, 1.0);
@@ -3594,7 +3615,7 @@ impl Replay<'_> {
                 Kind::SourceField(token,slot,part,initial)=> {
                     if token!=self.source_field_token {self.stale+=1;continue;}
                     self.source_field_packets[slot]+=1;
-                    self.snapshot_victim_procs(t);
+                    self.snapshot_victim_procs_required(t);
                     let stacks = self.source_stacks();
                     let live = psum(self.victim_before.iter().map(|(_, p)| *p));
                     let hook = self.provider.refresh_hook(self.stats[part].obj, true)?
@@ -4772,7 +4793,7 @@ impl From<EnervateInput> for Enervate {
     }
 }
 
-fn prepare_replay(input: TrajectoryInput, provider: &dyn ReplayProvider) -> ReplayResult<Replay<'_>> {
+fn prepare_replay(input: TrajectoryInput, provider: &dyn ReplayProvider, compact_score: bool) -> ReplayResult<Replay<'_>> {
     let setup_timer = Timer::start(counters::SETUP);
     let mut types = input.types;
     let window = input.window;
@@ -4799,6 +4820,9 @@ fn prepare_replay(input: TrajectoryInput, provider: &dyn ReplayProvider) -> Repl
     let mut replay = Replay {
         provider,
         score_only: input.score_only,
+        compact_score,
+        track_victim_snapshot: !compact_score || input.sources.iter().any(|s| s.victim_proc_type.is_some())
+            || input.restore.as_ref().is_some_and(|r| r.victim_proc_type.is_some()),
         timeline: None,
         window,
         head: input.head,
@@ -4990,6 +5014,7 @@ fn prepare_replay(input: TrajectoryInput, provider: &dyn ReplayProvider) -> Repl
         stats: Vec::new(),
         views: FxHashMap::default(),
         co_specs: FxHashMap::default(),
+        fixed_model: [None; 6],
         model_cache: FxHashMap::default(),
         model_key: Vec::new(),
         tick_chains: FxHashMap::default(),
@@ -5060,7 +5085,7 @@ pub fn trajectory_health_batch(input: TrajectoryInput, provider: &dyn ReplayProv
     -> ReplayResult<Vec<HealthBatchOutput>> {
     let _timer = Timer::start(counters::TOTAL);
     validate_health_targets(&targets)?;
-    let prepared = prepare_replay(input, provider)?;
+    let prepared = prepare_replay(input, provider, false)?;
     if prepared.weak_draw.is_some() || prepared.life_curve.is_some() {
         return Err(unsupported("health batch needs an ordinary score replay"));
     }
@@ -5087,7 +5112,7 @@ pub fn trajectory_health_batch(input: TrajectoryInput, provider: &dyn ReplayProv
 /// 收集固定目标状态下的独立直伤序列。
 pub fn direct_bake_stream(input: DirectBakeStreamInput, provider: &dyn ReplayProvider)
     -> ReplayResult<(Vec<f64>, f64, f64)> {
-    let mut replay = prepare_replay(input.trajectory, provider)?;
+    let mut replay = prepare_replay(input.trajectory, provider, false)?;
     if replay.head != 0.0 || replay.full[0] != 0.0 || replay.full[1] != 0.0
         || !replay.sources.is_empty() || replay.melee.is_some() || replay.cycle.is_some()
         || replay.shot_combo.is_some() || replay.restore.is_some() || replay.syndicate.is_some()
@@ -5195,17 +5220,24 @@ pub struct TrajectoryDetails {
 }
 
 pub fn trajectory(input: TrajectoryInput, provider: &dyn ReplayProvider) -> ReplayResult<TrajectoryOutput> {
-    run_trajectory(input, provider, None)
+    run_trajectory(input, provider, None, false)
 }
 
 /// 在完整事件回放中按 0.25 秒采样，末点与窗口结束对齐。
 pub fn trajectory_sampled(input: TrajectoryInput, provider: &dyn ReplayProvider) -> ReplayResult<TrajectoryOutput> {
-    run_trajectory(input, provider, Some(0.25))
+    run_trajectory(input, provider, Some(0.25), false)
 }
 
-fn run_trajectory(input: TrajectoryInput, provider: &dyn ReplayProvider, step: Option<f64>) -> ReplayResult<TrajectoryOutput> {
+/// 专用于评分，省去响应所需的异常类型统计和末次命中快照。
+pub fn trajectory_score(mut input: TrajectoryInput, provider: &dyn ReplayProvider) -> ReplayResult<TrajectoryOutput> {
+    input.score_only = true;
+    run_trajectory(input, provider, None, true)
+}
+
+fn run_trajectory(input: TrajectoryInput, provider: &dyn ReplayProvider, step: Option<f64>, compact_score: bool)
+    -> ReplayResult<TrajectoryOutput> {
     let _timer = Timer::start(counters::TOTAL);
-    let mut replay = prepare_replay(input, provider)?;
+    let mut replay = prepare_replay(input, provider, compact_score)?;
     if let Some(step) = step {
         replay.timeline = Some(Timeline::default());
         for index in 1..=ceil_i(replay.window / step) {
@@ -5274,7 +5306,9 @@ fn run_trajectory(input: TrajectoryInput, provider: &dyn ReplayProvider, step: O
         weak_index: replay.weak_index,
         mine_overflows: replay.mine_overflows,
         last_round: replay.last_round,
-        victim_before: replay.victim_before.iter().map(|&(key, value)| (replay.types.name(key).to_owned(), value)).collect(),
+        victim_before: if compact_score { Vec::new() } else {
+            replay.victim_before.iter().map(|&(key, value)| (replay.types.name(key).to_owned(), value)).collect()
+        },
         actor_signal_used: replay.actor_signal_used,
         source_stacks: replay.sources.iter().map(|q| q.stacks).collect(),
         details,

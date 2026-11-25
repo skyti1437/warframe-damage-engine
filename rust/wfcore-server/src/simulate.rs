@@ -30,7 +30,13 @@ type SimResult<T> = Result<T, String>;
 const ST_STACK_NAMES: [&str; 6] = ["heat", "viral", "corrosive", "magnetic", "cold", "puncture"];
 
 pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, Value>) -> SimResult<Value> {
-    let req = Request::parse(data, catalog, fields)?;
+    let path = text(fields.get("weapon").unwrap_or(&Value::Null)).trim();
+    let meta = catalog.weapons.get(path).ok_or("weapon 必须是已导出的武器路径")?;
+    let raw_weapon = data.weapon(path).ok_or("weapon 缺少战斗数据")?;
+    if meta["available"] == false {
+        return Err(meta["issue"].as_str().unwrap_or("weapon 不可用").into());
+    }
+    let req = Request::parse_weapon(data, catalog, fields, &raw_weapon)?;
     let weapon = Weapon::new(data, &req);
     let evolution = Evolution::resolve(data, &req)?;
     let stance = melee::stance(data, &catalog.stances, &req)?;
@@ -77,18 +83,20 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
         result = mix(&body, &head, req.aim);
         result["headshotMix"] = json!({"chance": req.aim, "body": body["targetDamage"], "head": head["targetDamage"]});
     }
+    let benchmark_target;
     let (replay_target, replay_level, replay_steel, replay_enhancements) = if truth(&req.target["health"]) {
         (&req.target, req.level, req.steel, req.enhancements.clone())
     } else {
-        (data.enemies.get(BENCHMARK_TARGET).ok_or("缺少回放基准目标")?, 170, true,
+        benchmark_target = data.enemy(BENCHMARK_TARGET).ok_or("缺少回放基准目标")?;
+        (&benchmark_target, 170, true,
             json!({"eximus": false, "noOverguard": true}))
     };
     let replay_target = Target::new(replay_target, data);
     let replay_effects = events::Effects::prepare(&req, &loadout.cards, &arcanes, effects.clone(), &evolution,
         schedule.as_ref().map(|s| s.route.as_str()), &data.mechanics["infinite-conditions"]["sources"],
-        rows(&weapon.mechanics("weapon-passives")["innate"]));
+        weapon.innate);
     let timeline = timeline::calculate(&weapon, &evolution, &fields, &req, &replay_target,
-        replay_level, replay_steel, &replay_enhancements, &replay_effects, schedule.as_ref(), &arcanes, stance_status, stance_damage, false)?;
+        replay_level, replay_steel, &replay_enhancements, &replay_effects, schedule.as_ref(), &arcanes, stance_status, stance_damage)?;
     let mut unsupported: BTreeSet<String> = fields.unsupported.iter().chain(&evolution.notes)
         .chain(&req.enhancement_notes).chain(&loadout.notes).chain(&arcane.notes).cloned().collect();
     for list in [&result["targetDamage"]["unsupported"], &result["killMetrics"]["unsupported"],

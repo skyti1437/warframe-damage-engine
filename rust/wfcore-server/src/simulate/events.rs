@@ -81,7 +81,7 @@ pub(super) fn source(record: &Value, condition: &Value, index: usize, kind: &str
     }
     if kind == "on-glaive-throw" {
         for effect in &mut effects {
-            if effect.upgrade == "WEAPON_DAMAGE_AMOUNT" { effect.upgrade = "RUNTIME_THROW_DAMAGE".into(); }
+            if effect.upgrade == "WEAPON_DAMAGE_AMOUNT" { effect.set_upgrade("RUNTIME_THROW_DAMAGE"); }
         }
     }
     let no_refresh = truth(&condition["noRefresh"]) && !fixed;

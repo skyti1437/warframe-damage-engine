@@ -81,7 +81,7 @@ pub(super) fn candidates<'a>(data: &'a EngineData, catalog: &SimCatalog, req: &R
             });
         if !active { rejected += 1; }
         card.reserved = reserve_reach && raw["nameEn"] == "Primed Reach";
-        if (active || card.reserved) && (analysis || catalog.mods.contains_key(path) && !catalog.utility.contains_key(path))
+        if (active || card.reserved) && (analysis || catalog.mod_at(path).is_some() && !catalog.utility.contains_key(path))
             && fixed_exilus.is_none_or(|exilus| exilus.family != card.family) {
             pool.push(card);
         }

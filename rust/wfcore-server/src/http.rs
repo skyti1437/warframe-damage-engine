@@ -20,11 +20,12 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn new(data: EngineData) -> Result<Self> {
+    pub fn new(mut data: EngineData) -> Result<Self> {
         let health_json = Arc::new(serde_json::to_vec(&data.health())?);
-        let catalog = catalog::build(&data)?;
-        let sim_catalog = SimCatalog::new(&catalog);
+        let catalog = catalog::build_for_service(&mut data)?;
+        data.retain_runtime();
         let catalog_json = Arc::new(serde_json::to_vec(&catalog)?);
+        let sim_catalog = SimCatalog::from_catalog(catalog);
         Ok(Self { data, sim_catalog, health_json, catalog_json, trait_matrix: Default::default(), analyze: Default::default() })
     }
 
@@ -59,21 +60,24 @@ impl Service {
     }
 
     /// 批处理和 HTTP 共用 JSON 解析、长度限制及路由。
-    pub fn simulate_batch(&self, payload: Value) -> Result<Value> {
+    pub fn simulate_batch(&self, payload: Value) -> Result<Vec<u8>> {
         self.batch(Some("/api/simulate"), payload)
     }
 
-    pub fn build_batch(&self, payload: Value) -> Result<Value> {
+    pub fn build_batch(&self, payload: Value) -> Result<Vec<u8>> {
         self.batch(Some("/api/build"), payload)
     }
 
-    pub fn request_batch(&self, payload: Value) -> Result<Value> {
+    pub fn request_batch(&self, payload: Value) -> Result<Vec<u8>> {
         self.batch(None, payload)
     }
 
-    fn batch(&self, fixed_path: Option<&str>, payload: Value) -> Result<Value> {
+    fn batch(&self, fixed_path: Option<&str>, payload: Value) -> Result<Vec<u8>> {
         let cases = payload.as_array().ok_or("请求批处理输入必须为 JSON 数组")?;
-        let results = cases.iter().map(|case| -> Result<Value> {
+        // Reply bodies already contain complete JSON. Reuse those bytes
+        // without building a second tree for the catalog or replay timelines.
+        let mut results = vec![b'['];
+        for (index, case) in cases.iter().enumerate() {
             let id = case.get("id").ok_or("请求批处理条目缺少 id")?;
             let path = fixed_path.or_else(|| case["path"].as_str()).ok_or("请求批处理条目缺少 path")?;
             let method = if fixed_path.is_some() { Method::Post } else {
@@ -88,10 +92,17 @@ impl Service {
             } else { Vec::new() };
             let length = body.len().to_string();
             let reply = self.dispatch(&method, path, Some(&length), body.as_slice());
-            let response: Value = serde_json::from_slice(&reply.body)?;
-            Ok(json!({"id": id, "status": reply.status, "response": response}))
-        }).collect::<Result<Vec<_>>>()?;
-        Ok(Value::Array(results))
+            if index != 0 { results.push(b','); }
+            results.extend_from_slice(b"{\"id\":");
+            serde_json::to_writer(&mut results, id)?;
+            results.extend_from_slice(b",\"status\":");
+            serde_json::to_writer(&mut results, &reply.status)?;
+            results.extend_from_slice(b",\"response\":");
+            results.extend_from_slice(&reply.body);
+            results.push(b'}');
+        }
+        results.push(b']');
+        Ok(results)
     }
 
     fn handle_request(&self, request: &mut Request) -> Reply {
@@ -242,8 +253,9 @@ mod tests {
         assert!(catalog["utilityMods"].as_array().is_some_and(|rows| !rows.is_empty()));
         assert!(catalog["statsByType"]["rifle"].as_array().is_some_and(|rows| !rows.is_empty()));
         let duviri = "/Lotus/Types/Enemies/Duviri/Avatars/DuviriMeleeAvatar";
-        assert_eq!(state.data.enemies[duviri]["defenseSources"]["baseLevel"], "agent");
-        assert!(state.data.weapons.values().any(|weapon| weapon["nameEn"] == "Burston Prime"));
+        assert_eq!(state.data.enemy(duviri).unwrap()["defenseSources"]["baseLevel"], "agent");
+        let burston = "/Lotus/Weapons/Tenno/LongGuns/PrimeBurston/PrimeBurston";
+        assert_eq!(state.data.weapon(burston).unwrap()["nameEn"], "Burston Prime");
         assert!(state.data.riven_templates["templates"].is_array());
         assert!(state.data.incarnon_defaults["strategies"].is_object());
     }

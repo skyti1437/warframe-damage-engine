@@ -1,10 +1,13 @@
 use super::{num, rows, text, SimResult};
-use crate::data::{EngineData, Records};
+use crate::data::{retain_fields, EngineData, Records};
+use std::collections::HashMap;
 use serde_json::{json, Map, Value};
 
 pub(crate) struct SimCatalog {
     pub weapons: Records,
-    pub mods: Records,
+    mods: Records,
+    variants: Records,
+    aliases: HashMap<String, usize>,
     pub arcanes: Records,
     pub utility: Records,
     pub stances: Vec<Value>,
@@ -13,21 +16,46 @@ pub(crate) struct SimCatalog {
 }
 
 impl SimCatalog {
-    pub fn new(catalog: &Value) -> Self {
-        let index = |key: &str| -> Records { rows(&catalog[key]).iter()
-            .map(|row| (text(&row["path"]).to_owned(), row.clone())).collect() };
-        let utility = index("utilityMods");
-        let mut mods: Records = index("manualMods");
-        for (alias, path) in catalog["manualModAliases"].as_object().into_iter().flatten() {
-            if let Some(row) = mods.get(text(path)).cloned() { mods.entry(alias.clone()).or_insert(row); }
+    pub fn from_catalog(mut catalog: Value) -> Self {
+        let mut take = |key: &str| catalog[key].take();
+        let utility = Self::index(take("utilityMods"), &[]);
+        let mods = Self::index(take("manualMods"), &[]);
+        let mut aliases = HashMap::new();
+        if let Value::Object(paths) = take("manualModAliases") {
+            for (alias, path) in paths {
+                if !mods.contains_key(&alias) {
+                    if let Some(index) = mods.get_index_of(text(&path)).or_else(|| aliases.get(text(&path)).copied()) {
+                        aliases.insert(alias, index);
+                    }
+                }
+            }
         }
-        mods.extend(rows(&catalog["manualModVariants"]).iter().filter_map(|row| {
-            let path = text(&row["path"]);
-            (!utility.contains_key(path)).then(|| (path.to_owned(), row.clone()))
-        }));
-        Self { weapons: index("weapons"), enemies: index("enemies"), mods,
-            build_options: catalog["buildOptions"].clone(),
-            arcanes: index("arcanes"), utility, stances: rows(&catalog["stances"]).to_vec() }
+        let mut variants = Self::index(take("manualModVariants"), &[]);
+        variants.retain(|path, _| !utility.contains_key(path));
+        Self {
+            weapons: Self::index(take("weapons"), &["path", "nameEn", "nameZh", "weaponType", "rivenType", "available", "issue",
+                "buildAvailable", "buildIssue", "analysisAvailable", "analysisIssue", "exalted", "disposition", "fireModes", "innateElementCandidates"]),
+            enemies: Self::index(take("enemies"), &["path", "nameInternal", "nameEn", "nameZh", "complete", "unsupported", "defenseSources", "hasHeadProxy"]),
+            mods, variants, aliases, utility,
+            build_options: take("buildOptions"),
+            arcanes: Self::index(take("arcanes"), &["path", "nameEn", "nameZh", "nameInternal", "slotKind", "maxRank", "trigger", "scoreExcluded"]),
+            stances: match take("stances") { Value::Array(rows) => rows, _ => Vec::new() },
+        }
+    }
+
+    fn index(value: Value, fields: &[&str]) -> Records {
+        let Value::Array(rows) = value else { return Records::new(); };
+        rows.into_iter().map(|mut row| {
+            let path = text(&row["path"]).to_owned();
+            if !fields.is_empty() { retain_fields(&mut row, fields); }
+            (path, row)
+        }).collect()
+    }
+
+    pub fn mod_at(&self, path: &str) -> Option<&Value> {
+        self.variants.get(path).or_else(|| self.mods.get(path)).or_else(|| {
+            self.aliases.get(path).and_then(|&index| self.mods.get_index(index)).map(|(_, row)| row)
+        })
     }
 }
 
@@ -116,20 +144,9 @@ pub(super) fn polarity(value: &Value) -> Value {
 }
 
 impl<'a> Request<'a> {
-    pub fn parse(data: &'a EngineData, catalog: &'a SimCatalog, body: &'a Map<String, Value>) -> SimResult<Self> {
-        Self::parse_weapon(data, catalog, body, None)
-    }
-
     pub fn parse_weapon(data: &'a EngineData, catalog: &'a SimCatalog, body: &'a Map<String, Value>,
-        resolved_weapon: Option<&'a Value>) -> SimResult<Self> {
+        weapon: &'a Value) -> SimResult<Self> {
         let get = |key: &str| body.get(key).unwrap_or(&Value::Null);
-        let weapon_path = text(get("weapon")).trim();
-        let weapon_meta = catalog.weapons.get(weapon_path)
-            .ok_or("weapon 必须是已导出的武器路径")?;
-        let weapon = resolved_weapon.or_else(|| data.weapons.get(weapon_path)).ok_or("weapon 缺少战斗数据")?;
-        if resolved_weapon.is_none() && weapon_meta["available"] == false {
-            return Err(weapon_meta["issue"].as_str().unwrap_or("weapon 不可用").into());
-        }
         let mode = integer(body.get("fireMode").unwrap_or(&json!(0)), "fireMode", 0, u64::MAX)? as usize;
         if mode >= rows(&weapon["fireModes"]).len() {
             return Err("fireMode 超出射击模式范围".into());
@@ -158,7 +175,7 @@ impl<'a> Request<'a> {
             if damage_model == "target" && enemy["defenseSources"]["baseLevel"] == "default-1" {
                 enhancement_notes.push("enemy-base-level-unverified".to_owned());
             }
-            data.enemies[text(&enemy["path"])].clone()
+            data.enemy(text(&enemy["path"])).ok_or("enemy 缺少战斗数据")?
         };
         let nested = if get("scenario").is_null() { None } else { Some(object(get("scenario"), "scenario")?) };
         if body.contains_key("conditionalStacks") || nested.is_some_and(|s| s.contains_key("conditionalStacks")) {

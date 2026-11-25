@@ -1,12 +1,13 @@
 use super::{arcane, cards, damage, events, loadout, melee, num, rows, text, timeline, weapon};
 use super::{json, EngineData, Map, Request, SimResult, Target, Value};
 use super::cards::{Card, Riven};
+use super::super::target::Defenses;
 use super::weapon::{Effect, Evolution, Weapon};
 use indexmap::IndexMap;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use wfcore_lib::{mods::ModdedFields, replay::Types, tables};
+use wfcore_lib::{fx::FxHashMap, mods::ModdedFields, replay::Types, tables};
 use wfcore_lib::sustained::{sustained_status, SustainedInput};
 
 #[derive(Clone, Copy)]
@@ -70,14 +71,22 @@ pub(super) struct Panel {
     pub count: usize,
 }
 
-#[derive(Clone)]
+type LayoutKey = ([usize; 8], Option<usize>);
 
+#[derive(Default)]
+pub(super) struct EventScores(RefCell<FxHashMap<LayoutKey, f64>>);
+
+#[derive(Clone)]
 pub(super) struct Evaluator<'a> {
     pub data: &'a EngineData,
     pub req: &'a Request<'a>,
     pub stance: &'a Value,
     pub schedule: Option<&'a melee::Schedule>,
-    pub target: Target<'a>,
+    pub target: &'a Target<'a>,
+    pub replay_defenses: &'a Defenses,
+    pub proxy_defenses: &'a Defenses,
+    pub weapon: &'a Weapon<'a>,
+    pub infinite_conditions: &'a Value,
     pub cards: &'a [Card<'a>],
     pub riven: Option<&'a Riven>,
     pub fixed_exilus: Option<&'a Card<'a>>,
@@ -86,15 +95,16 @@ pub(super) struct Evaluator<'a> {
     pub evolution: &'a Evolution,
     pub external: &'a [Effect],
     pub capacity_limit: i64,
-    pub shells: HashMap<String, &'a Value>,
+    pub shells: &'a HashMap<String, &'a Value>,
     pub replay_options: ReplayOptions<'a>,
+    pub event_scores: Option<&'a EventScores>,
 }
 
 impl Evaluator<'_> {
     pub fn window(&self, selected: &[usize], riven_slot: Option<usize>, special: Option<&Card<'_>>) -> SimResult<Value> {
         let (effects, skipped) = self.terms(selected, riven_slot, special, true);
         let (fields, _, _) = self.panel_fields(self.req, &effects, &skipped, None)?;
-        self.replay(selected, special, effects, &fields, timeline::Output::Timeline)
+        self.replay(selected, special, effects, &fields, timeline::Output::Timeline).map(timeline::ReplayOutput::details)
     }
 
     pub fn life_curve(&self, best: &Evaluation, seconds: f64) -> SimResult<Value> {
@@ -105,27 +115,20 @@ impl Evaluator<'_> {
         }, ..self.clone() };
         let (effects, skipped) = eval.terms(&best.cards, best.riven_slot, eval.fixed_exilus, true);
         let (fields, _, _) = eval.panel_fields(&req, &effects, &skipped, None)?;
-        eval.replay(&best.cards, eval.fixed_exilus, effects, &fields, timeline::Output::LifeCurve)
+        eval.replay(&best.cards, eval.fixed_exilus, effects, &fields, timeline::Output::LifeCurve).map(timeline::ReplayOutput::details)
     }
 
     fn replay(&self, selected: &[usize], special: Option<&Card<'_>>, terms: Vec<Effect>,
-        fields: &ModdedFields, output: timeline::Output) -> SimResult<Value> {
+        fields: &ModdedFields, output: timeline::Output) -> SimResult<timeline::ReplayOutput> {
         let req = self.req;
-        let weapon = Weapon::new(self.data, req);
+        let weapon = self.weapon.with_request(req);
         let installed: Vec<_> = selected.iter().map(|i| &self.cards[*i]).chain(special)
             .map(|card| loadout::Card::installed(card.raw, card.rank)).collect();
         let effects = events::Effects::prepare(req, &installed, self.arcanes, terms, self.evolution,
-            self.schedule.map(|s| s.route.as_str()), &self.data.mechanics["infinite-conditions"]["sources"],
-            rows(&weapon.mechanics("weapon-passives")["innate"]));
+            self.schedule.map(|s| s.route.as_str()), self.infinite_conditions, weapon.innate);
         let replay = |scale| {
-            let mut scaled;
-            let enhancements = if let Some(scale) = scale {
-                scaled = req.enhancements.clone();
-                scaled["healthScale"] = json!(scale);
-                &scaled
-            } else { &req.enhancements };
-            timeline::replay_window(&weapon, self.evolution, fields, req, &self.target, req.level,
-                req.steel, enhancements, &effects, self.schedule, self.arcanes,
+            timeline::replay_window(&weapon, self.evolution, fields, req, self.target, req.level,
+                req.steel, &req.enhancements, self.replay_defenses, scale, &effects, self.schedule, self.arcanes,
                 self.stance["statusRateMultiplier"].as_f64().unwrap_or(1.0),
                 self.stance["dpsMultiplier"].as_f64().unwrap_or(1.0), output, self.replay_options.branches)
         };
@@ -134,15 +137,15 @@ impl Evaluator<'_> {
         let mut total = 0.0;
         let mut any = false;
         for node in self.replay_options.nodes {
-            let low = num(&replay(Some(node.scale * (1.0 - node.spread)))?);
+            let low = replay(Some(node.scale * (1.0 - node.spread)))?.score();
             let value = if node.spread > 0.0 {
-                (low + num(&replay(Some(node.scale * (1.0 + node.spread)))?)) / 2.0
+                (low + replay(Some(node.scale * (1.0 + node.spread)))?.score()) / 2.0
             } else { low };
             any |= value > 0.0;
             total += node.weight * value.max(1e-12).ln();
             weights += node.weight;
         }
-        Ok(json!(if any { (total / weights).exp() } else { 0.0 }))
+        Ok(timeline::ReplayOutput::from_score(if any { (total / weights).exp() } else { 0.0 }))
     }
 
     pub fn capacity(&self, cards: &[usize]) -> i64 {
@@ -213,14 +216,21 @@ impl Evaluator<'_> {
 
     fn panel_fields(&self, req: &Request<'_>, effects: &[Effect], skipped: &[String],
         count: Option<usize>) -> SimResult<(ModdedFields, Value, usize)> {
-        let weapon = Weapon::new(self.data, req);
-        let (fields, heavy) = weapon.panel_fields(effects, count.unwrap_or(0) as f64, skipped)?;
+        let weapon = if req.exported_mode_panel { Weapon::new(self.data, req) } else { self.weapon.with_request(req) };
+        self.reduce_panel(&weapon, effects, skipped, count, true)
+    }
+
+    fn reduce_panel(&self, weapon: &Weapon<'_>, effects: &[Effect], skipped: &[String],
+        count: Option<usize>, metadata: bool) -> SimResult<(ModdedFields, Value, usize)> {
+        let reduce = |count| weapon.panel_for_score(effects, count, skipped, metadata);
+        let (fields, heavy) = reduce(count.unwrap_or(0) as f64)?;
         if let Some(count) = count { return Ok((fields, heavy, count)); }
+        if !metadata && !weapon.uses_status_count(effects) { return Ok((fields, heavy, 0)); }
         let mut types = Types::new();
         let core = weapon::core(&fields, &mut types, self.target.faction, self.target.bracket);
         let count = tables::expected_status_procs(&core, &Vec::new(), false).iter().filter(|(_, v)| *v > 0.0).count();
         if count == 0 { return Ok((fields, heavy, count)); }
-        let (fields, heavy) = weapon.panel_fields(effects, count as f64, skipped)?;
+        let (fields, heavy) = reduce(count as f64)?;
         Ok((fields, heavy, count))
     }
 
@@ -232,39 +242,69 @@ impl Evaluator<'_> {
         Ok(Panel { fields, heavy, wire, count })
     }
 
+    pub fn has_element(&self, selected: &[usize], riven_slot: Option<usize>, element: &str) -> SimResult<bool> {
+        let (effects, skipped) = self.terms(selected, riven_slot, self.fixed_exilus, true);
+        let (fields, _, _) = self.reduce_panel(self.weapon, &effects, &skipped, None, false)?;
+        let amount = damage_amount(&fields, element);
+        Ok(amount.is_finite() && amount > 0.0)
+    }
+
     pub fn alternate_panel(&self, req: &Request<'_>, effects: &[Effect], skipped: &[String]) -> SimResult<Panel> {
         self.panel(&Request { exported_mode_panel: true, ..req.clone() }, effects, skipped, Some(0))
     }
 
     pub fn score(&self, selected: &[usize], riven_slot: Option<usize>, special: Option<&Card<'_>>, metric: Metric<'_>,
         element: Option<&str>) -> SimResult<Option<f64>> {
+        // A matrix search installs this cache only for a fixed request, Riven
+        // and exilus. The ordered layout still controls elemental fusion.
+        if let Some(cache) = self.event_scores.filter(|_| {
+            matches!(metric, Metric::Events) && element.is_none()
+                && special.map(std::ptr::from_ref) == self.fixed_exilus.map(std::ptr::from_ref)
+        }) {
+            let mut layout = [usize::MAX; 8];
+            layout[..selected.len()].copy_from_slice(selected);
+            let key = (layout, riven_slot);
+            if let Some(&score) = cache.0.borrow().get(&key) { return Ok(Some(score)); }
+            let score = self.score_uncached(selected, riven_slot, special, metric, element)?;
+            if let Some(score) = score {
+                let mut scores = cache.0.borrow_mut();
+                if scores.len() < 8192 { scores.insert(key, score); }
+            }
+            return Ok(score);
+        }
+        self.score_uncached(selected, riven_slot, special, metric, element)
+    }
+
+    fn score_uncached(&self, selected: &[usize], riven_slot: Option<usize>, special: Option<&Card<'_>>,
+        metric: Metric<'_>, element: Option<&str>) -> SimResult<Option<f64>> {
         let req = self.req;
-        let weapon = Weapon::new(self.data, req);
+        let weapon = self.weapon.with_request(req);
         let (effects, skipped) = self.terms(selected, riven_slot, special, true);
-        let (fields, heavy, count) = self.panel_fields(req, &effects, &skipped, None)?;
-        if element.is_some_and(|name| !fields.damage_types.0.iter().any(|(id, amount)| {
-            *amount > 0.0 && wfcore_lib::mods::name(*id) == name
-        })) { return Ok(None); }
+        let (fields, heavy, count) = self.reduce_panel(&weapon, &effects, &skipped, None, matches!(metric, Metric::Panel(_)))?;
+        if let Some(name) = element {
+            let amount = damage_amount(&fields, name);
+            if amount.is_nan() || amount <= 0.0 { return Ok(None); }
+        }
         let stance_damage = self.stance["dpsMultiplier"].as_f64().unwrap_or(1.0);
         let stance_status = self.stance["statusRateMultiplier"].as_f64().unwrap_or(1.0);
         let score = match metric {
-            Metric::Events | Metric::WindowDps => num(&self.replay(selected, special, effects, &fields,
-                if matches!(metric, Metric::Events) { timeline::Output::Kpm } else { timeline::Output::Dps })?),
+            Metric::Events | Metric::WindowDps => self.replay(selected, special, effects, &fields,
+                if matches!(metric, Metric::Events) { timeline::Output::Kpm } else { timeline::Output::Dps })?.score(),
             Metric::Proxy => {
                 let mut types = Types::new();
                 let core = weapon::core(&fields, &mut types, self.target.faction, self.target.bracket);
-                let defenses = self.target.defenses(req.level, req.steel, req.strip, req.elemental_strip, &req.enhancements);
+                let defenses = self.proxy_defenses;
                 let hit = if req.body.get("hitLocation").is_some_and(|v| v == "head") { self.target.head }
                     else { super::super::target::HitLocation::BODY };
                 if self.replay_options.evaluations.is_some() {
-                    let mut target = self.target.sustained(&defenses, hit);
+                    let mut target = self.target.sustained(defenses, hit);
                     target.shielded = super::truth(&self.target.record["shield"]);
                     sustained_status(&target, SustainedInput { types: &types, core: &core,
                         attacks_per_second: weapon::attack_rate(&fields), status_rate_multiplier: stance_status,
                         damage_rate_multiplier: stance_damage, total: true,
                         magazine: fields.magazine, first_shot_bonus: fields.first_shot_damage_bonus })
                 } else {
-                    let (_, steady) = damage::status_and_steady(&fields, &core, &types, &self.target, &defenses, hit,
+                    let (_, steady) = damage::status_and_steady(&fields, &core, &types, self.target, defenses, hit,
                         &Vec::new(), stance_status, stance_damage);
                     num(&steady["totalDps"])
                 }
@@ -346,6 +386,12 @@ impl Evaluator<'_> {
             cards: selected.to_vec(), riven_slot: slot, score, capacity: self.capacity(selected)
         }))
     }
+}
+
+fn damage_amount(fields: &ModdedFields, name: &str) -> f64 {
+    fields.damage_types.0.iter().find_map(|(id, amount)| {
+        (wfcore_lib::mods::name(*id) == name).then_some(*amount)
+    }).unwrap_or(0.0)
 }
 
 fn append_elements(effects: &[Effect], elements: &mut Vec<u8>) {

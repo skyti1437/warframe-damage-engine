@@ -137,6 +137,7 @@ pub(super) fn calculate(eval: &Evaluator<'_>, best: &Evaluation, special: Option
             .map(|(i, _)| without(&cards, i)).collect()
     };
     let mut baselines = HashMap::new();
+    let baseline_scores = super::evaluate::EventScores::default();
     for (negative, sign) in [(false, "positive"), (true, "negative")] {
         let mut table = Vec::new();
         for line in traits.iter().filter(|line| if negative { line.negative } else { line.positive }) {
@@ -168,7 +169,7 @@ pub(super) fn calculate(eval: &Evaluator<'_>, best: &Evaluation, special: Option
                 row[format!("pct_{roll}")] = json!(gain);
             }
             if !negative && line.modeled {
-                element_baselines(&elements, &scope, &mut baselines, &rivens, &mut row)?;
+                element_baselines(&elements, &scope, &mut baselines, &baseline_scores, &rivens, &mut row)?;
             }
             table.push(row);
         }
@@ -228,7 +229,7 @@ fn reference(eval: &Evaluator<'_>, best: &Evaluation, special: Option<&Card<'_>>
     let mut unmodeled = Vec::new();
     for (i, (slot, slot_polarity, drain, index)) in layout.into_iter().enumerate() {
         let card = &eval.cards[index];
-        let meta = &catalog.mods[card.path];
+        let meta = catalog.mod_at(card.path).unwrap();
         mods.push(json!({"path":card.path, "nameEn": meta["nameEn"], "nameZh": meta["nameZh"],
             "slot": slot, "rank":card.rank, "polarity":card.raw["polarity"], "slotPolarity":slot_polarity, "drain":drain}));
         if matches!(text(&eval.data.weapon_mechanics_overrides["mods"][card.path]["status"]), "event-unmodeled" | "unsupported") {
@@ -275,6 +276,8 @@ fn element_pool(candidates: &[Card<'_>], reference: &[usize]) -> HashSet<usize> 
 }
 
 fn element_score(eval: &Evaluator<'_>, search: &Search<'_>, seeds: &[Vec<usize>]) -> SimResult<f64> {
+    let scores = super::evaluate::EventScores::default();
+    let eval = &Evaluator { event_scores: Some(&scores), ..eval.clone() };
     let mut seed: Option<Evaluation> = None;
     for cards in seeds {
         if let Some(trial) = eval.evaluate(cards, Metric::Events, None, eval.fixed_exilus)? {
@@ -298,7 +301,7 @@ const BLAST: Element = ("blast", "DT_EXPLOSION");
 const MAGNETIC: Element = ("magnetic", "DT_MAGNETIC");
 
 fn element_baselines(eval: &Evaluator<'_>, scope: &Scope, baselines: &mut HashMap<&'static str, Option<Evaluation>>,
-    rivens: &[Riven], row: &mut Value) -> SimResult<()> {
+    scores: &super::evaluate::EventScores, rivens: &[Riven], row: &mut Value) -> SimResult<()> {
     let (compound, choices): (bool, &[Element]) = match text(&row["code"]) {
         "4" => (false, &[HEAT, BLAST, GAS, RADIATION]),
         "5" => (false, &[VIRAL, BLAST, MAGNETIC, COLD]),
@@ -316,7 +319,7 @@ fn element_baselines(eval: &Evaluator<'_>, scope: &Scope, baselines: &mut HashMa
         if !baselines.contains_key(damage_type) {
             let element_scope = Scope { element: json!({"damageType": damage_type}), ..scope.clone() };
             let search = Search::new(eval, &element_scope)?;
-            let found = search.element_baseline(eval)?;
+            let found = search.element_baseline(&Evaluator { event_scores: Some(scores), ..eval.clone() })?;
             baselines.insert(damage_type, found.filter(|trial| trial.score > 0.0));
         }
         if let Some(trial) = &baselines[damage_type] { candidates.push((label, damage_type, trial.clone())); }

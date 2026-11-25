@@ -10,28 +10,49 @@ use serde_json::{json, Map, Value};
 
 pub fn build(data: &EngineData) -> Result<Value> {
     let stances = stance_rows(data);
-    let (weapons, hard_fails, counts) = weapons::rows(data, &stances)?;
-    let mods::ModCatalog { mods, utility, aliases, variants, replacements } = mods::rows(data);
+    let weapons = weapons::rows(data, &stances)?;
+    Ok(assemble(data, stances, weapons, enemies::rows(data)))
+}
+
+pub(crate) fn build_for_service(data: &mut EngineData) -> Result<Value> {
     let enemies = enemies::rows(data);
+    data.pack_enemies()?;
+    let stances = stance_rows(data);
+    let weapons = weapons::rows(data, &stances)?;
+    data.pack_weapons()?;
+    Ok(assemble(data, stances, weapons, enemies))
+}
+
+fn assemble(data: &EngineData, stances: Vec<Value>, (weapons, hard_fails, counts): (Vec<Value>, Vec<Value>, Value),
+    enemies: Vec<Value>) -> Value {
+    let mods::ModCatalog { mods, utility, aliases, variants, replacements } = mods::rows(data);
     let arcanes = arcanes::rows(data);
-    Ok(json!({
-        "buildLabel": BUILD_LABEL, "schemaVersion": SCHEMA_VERSION,
-        "manualCounts": {"mods": mods.len(), "enemies": enemies.len(), "arcanes": arcanes.len()},
-        "counts": counts, "weapons": weapons, "manualMods": mods, "enemies": enemies,
-        "arcanes": arcanes, "stances": stances, "utilityMods": utility,
-        "statsByType": riven::stats(data),
-        "exaltedWeapons": data.exalted_weapons,
-        "knownHardFails": hard_fails,
-        "enemyEnhancements": object(&data.enemy_overrides["wikiEnhancements"]),
-        "buildOptions": build_options(data),
-        "rivenDisposition": data.riven_disposition,
-        "manualModAliases": aliases, "manualModVariants": variants,
-        "modSets": data.rules.mods["sets"],
-        "kitgunParts": modular::kitguns(&data.kitguns),
-        "zawParts": modular::zaws(&data.zaws),
-        "legacyModReplacements": replacements,
-        "sentinel": data.rules.display["sentinel"],
-    }))
+    let manual_counts = json!({"mods": mods.len(), "enemies": enemies.len(), "arcanes": arcanes.len()});
+    Value::Object(Map::from_iter([
+        ("buildLabel".into(), BUILD_LABEL.into()),
+        ("schemaVersion".into(), SCHEMA_VERSION.into()),
+        ("manualCounts".into(), manual_counts),
+        ("counts".into(), counts),
+        ("weapons".into(), Value::Array(weapons)),
+        ("manualMods".into(), Value::Array(mods)),
+        ("enemies".into(), Value::Array(enemies)),
+        ("arcanes".into(), Value::Array(arcanes)),
+        ("stances".into(), Value::Array(stances)),
+        ("utilityMods".into(), Value::Array(utility)),
+        ("statsByType".into(), riven::stats(data)),
+        ("exaltedWeapons".into(), Value::Array(data.exalted_weapons.clone())),
+        ("knownHardFails".into(), json!(hard_fails)),
+        ("enemyEnhancements".into(), Value::Object(object(&data.enemy_overrides["wikiEnhancements"]))),
+        ("buildOptions".into(), build_options(data)),
+        ("rivenDisposition".into(), data.riven_disposition.clone()),
+        ("manualModAliases".into(), json!(aliases)),
+        ("manualModVariants".into(), Value::Array(variants)),
+        ("modSets".into(), data.rules.mods["sets"].clone()),
+        ("kitgunParts".into(), modular::kitguns(&data.kitguns)),
+        ("zawParts".into(), modular::zaws(&data.zaws)),
+        ("legacyModReplacements".into(), json!(replacements)),
+        ("sentinel".into(), data.rules.display["sentinel"].clone()),
+    ]))
 }
 
 const GUN_METRICS: &[(&str, &str)] = &[

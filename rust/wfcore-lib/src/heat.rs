@@ -486,17 +486,15 @@ impl HeatChains {
         }
         self.advance(t);
         let g = self.g;
-        let matured: Vec<u64> = self
-            .young
-            .keys()
-            .copied()
-            .filter(|k| t - fval(*k) >= 2.0 * self.scale - 1e-9)
-            .collect();
-        for k in matured {
-            let w = self.young.shift_remove(&k).unwrap();
-            self.mature += w;
-            self.young_index.shift_remove(&k);
-        }
+        self.young.retain(|k, weight| {
+            if t - fval(*k) >= 2.0 * self.scale - 1e-9 {
+                self.mature += *weight;
+                self.young_index.shift_remove(k);
+                false
+            } else {
+                true
+            }
+        });
         let tail: FMap = self
             .dead_levels
             .iter()

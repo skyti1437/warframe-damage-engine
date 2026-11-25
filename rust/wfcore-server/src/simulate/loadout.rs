@@ -127,7 +127,7 @@ impl<'a> Loadout<'a> {
         let mut families = HashMap::new();
         for (index, item) in rows(req.body.get("mods").unwrap_or(&Value::Null)).iter().enumerate() {
             let path = query(item);
-            let meta = catalog.mods.get(path).ok_or("mods 必须使用已导出的普通 MOD 路径")?;
+            let meta = catalog.mod_at(path).ok_or("mods 必须使用已导出的普通 MOD 路径")?;
             let raw = data.mods.get(path).ok_or("MOD 缺少导出记录")?;
             if truth(&raw["catalogExclusion"]) { return Err("MOD 阶级未发布".into()); }
             if !item["setPieces"].is_null() { return Err("套装件数由已装备 MOD 推导".into()); }

@@ -1,7 +1,7 @@
 pub(crate) mod corrections;
 
 use indexmap::IndexMap;
-use serde::Serialize;
+use serde::{de::{Deserializer, IgnoredAny, MapAccess, Visitor}, Serialize};
 use serde_json::Value;
 use std::error::Error;
 use std::fs;
@@ -12,6 +12,7 @@ pub const BUILD_LABEL: &str = "2026.08.13.13.24";
 pub const SCHEMA_VERSION: u64 = 3;
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 pub type Records = IndexMap<String, Value>;
+type PackedRecords = IndexMap<String, Box<[u8]>>;
 
 pub(crate) struct Rules {
     pub weapons: Value,
@@ -62,7 +63,8 @@ pub struct EngineData {
     pub mods: Records,
     pub arcanes: Records,
     pub enemies: Records,
-    pub warframes: Records,
+    runtime_weapons: PackedRecords,
+    runtime_enemies: PackedRecords,
     pub stances: Vec<Value>,
     pub utility_mods: Vec<Value>,
     pub exalted_weapons: Vec<Value>,
@@ -72,14 +74,9 @@ pub struct EngineData {
     pub incarnon_strings: Value,
     pub enemy_overrides: Value,
     pub weapon_mechanics_overrides: Value,
-    pub wiki_weapon_overrides: Value,
     pub mechanics: IndexMap<String, Value>,
     pub kitguns: Value,
     pub zaws: Value,
-    pub modular_winners: Value,
-    pub manifest: Value,
-    pub source_lock: Value,
-    pub ability_data: IndexMap<String, Value>,
     pub(crate) mod_art: Value,
     pub(crate) enemy_art: Value,
     pub(crate) root: PathBuf,
@@ -112,7 +109,7 @@ impl EngineData {
         };
         let dataset = dataset_root.strip_prefix(&root)?;
         let export = dataset.join("data/export").join(BUILD_LABEL);
-        let manifest = inputs.export(&export, "manifest", true)?;
+        inputs.export(&export, "manifest", true)?;
         let mut weapons = inputs.records(&export, "weapons")?;
         for (path, weapon) in inputs.records(&export, "exalted_weapons")? {
             weapons.entry(path).or_insert(weapon);
@@ -120,7 +117,7 @@ impl EngineData {
         let mods = inputs.records(&export, "mods")?;
         let arcanes = inputs.records(&export, "arcanes")?;
         let enemies = inputs.records(&export, "enemies")?;
-        let warframes = inputs.records(&export, "warframes")?;
+        inputs.records(&export, "warframes")?;
         let enemy_overrides = inputs.export(&export, "enemy_overrides", false)?;
         if !enemy_overrides["data"].is_object() {
             return Err(invalid("enemy_overrides.json 缺少 data 对象"));
@@ -128,7 +125,7 @@ impl EngineData {
         let riven_templates = inputs.export(&export, "riven_templates", false)?;
         let kitguns = inputs.export(&export, "kitguns", false)?;
         let zaws = inputs.export(&export, "zaws", false)?;
-        let modular_winners = inputs.export(&export, "modular_winners", false)?;
+        inputs.export(&export, "modular_winners", false)?;
         let incarnon_defaults = inputs.read(export.join("incarnon_defaults.json"))?;
         let incarnon_strings = inputs.read(export.join("incarnon_strings.json"))?;
         if !incarnon_defaults["sampledAt"].is_string()
@@ -144,23 +141,74 @@ impl EngineData {
         let weapon_mechanics_overrides = inputs.read("data/weapon_mechanics_overrides.json")?;
         let wiki_weapon_overrides = inputs.read("data/wiki_weapon_overrides.json")?;
         let mechanics = inputs.json_directory(Path::new("data/mechanics"))?;
-        let mut ability_data = IndexMap::new();
         for name in ["ability_runtime_diff", "ability_runtime_fields", "overframe_abilitystats"] {
-            ability_data.insert(name.to_owned(), inputs.read(format!("data/{name}.json"))?);
+            inputs.fingerprint_object(format!("data/{name}.json"))?;
         }
         let mod_art = inputs.optional(Path::new("frontend/assets/mods/index.json"))?;
         let enemy_art = inputs.optional(&dataset.join("frontend/assets/enemies/index.json"))?;
         let rules = Rules::load(&mut inputs.fingerprint)?;
         let fingerprint = format!("{:016x}", inputs.fingerprint.0);
         let mut engine = Self {
-            root, dataset_root, weapons, mods, arcanes, enemies, warframes, stances,
+            root, dataset_root, weapons, mods, arcanes, enemies, stances,
             utility_mods, exalted_weapons, riven_templates, riven_disposition: Value::Null,
             incarnon_defaults, incarnon_strings, enemy_overrides, weapon_mechanics_overrides,
-            wiki_weapon_overrides, mechanics, kitguns, zaws, modular_winners, manifest,
-            source_lock, ability_data, mod_art, enemy_art, rules, fingerprint,
+            mechanics, kitguns, zaws, mod_art, enemy_art, rules, fingerprint,
+            runtime_weapons: IndexMap::new(), runtime_enemies: IndexMap::new(),
         };
-        corrections::apply(&mut engine)?;
+        corrections::apply(&mut engine, &wiki_weapon_overrides)?;
         Ok(engine)
+    }
+
+    pub(crate) fn retain_runtime(&mut self) {
+        self.stances = Vec::new();
+        self.utility_mods = Vec::new();
+        self.exalted_weapons = Vec::new();
+        self.incarnon_strings = Value::Null;
+        self.riven_disposition = Value::Null;
+        self.mod_art = Value::Null;
+        self.enemy_art = Value::Null;
+        self.rules.weapons = Value::Null;
+        self.rules.metrics = Value::Null;
+        self.rules.incarnon = Value::Null;
+        self.rules.arcanes = Value::Null;
+        retain_fields(&mut self.rules.mods, &["supportedUpgrades"]);
+        retain_fields(&mut self.rules.display, &["externalBuffs"]);
+        retain_fields(&mut self.enemy_overrides, &["wikiEnhancements"]);
+        retain_fields(&mut self.weapon_mechanics_overrides, &["mods", "weapons"]);
+
+        self.mechanics.retain(|name, _| matches!(name.as_str(), "battery-profiles" | "burst-profiles"
+            | "charge-profiles" | "combat-reference" | "damage-event-producers" | "deferred-spread-profiles"
+            | "infinite-conditions" | "melee-mechanics" | "reload-after-shot" | "shell-reload-profiles"
+            | "weapon-passives"));
+        for card in self.mods.values_mut() {
+            remove_fields(card, &["icon", "modSetIcon", "officialLocalization", "baseDrainEnum"]);
+        }
+        for arcane in self.arcanes.values_mut() {
+            remove_fields(arcane, &["icon", "descriptionSource", "effectsEnByRank", "effectsZhByRank", "descTag"]);
+        }
+    }
+
+    // Release each expanded table as soon as its catalog section is built.
+    // Requests unpack only the selected weapon and targets.
+    pub(crate) fn pack_weapons(&mut self) -> Result<()> {
+        self.runtime_weapons = pack_records(std::mem::take(&mut self.weapons), &[
+            "descTag", "nameTag", "defaultModTemplate", "productCategory", "gripType",
+            "masteryReq", "innateElementSources",
+        ])?;
+        Ok(())
+    }
+
+    pub(crate) fn pack_enemies(&mut self) -> Result<()> {
+        self.runtime_enemies = pack_records(std::mem::take(&mut self.enemies), &["nameTag"])?;
+        Ok(())
+    }
+
+    pub(crate) fn weapon(&self, path: &str) -> Option<Value> {
+        record(&self.runtime_weapons, &self.weapons, path)
+    }
+
+    pub(crate) fn enemy(&self, path: &str) -> Option<Value> {
+        record(&self.runtime_enemies, &self.enemies, path)
     }
 
     pub fn health(&self) -> Health<'_> {
@@ -170,6 +218,30 @@ impl EngineData {
             engine_fingerprint: &self.fingerprint,
             schema_version: SCHEMA_VERSION,
         }
+    }
+}
+
+fn pack_records(records: Records, display_fields: &[&str]) -> Result<PackedRecords> {
+    records.into_iter().map(|(path, mut row)| {
+        remove_fields(&mut row, display_fields);
+        Ok((path, serde_json::to_vec(&row)?.into_boxed_slice()))
+    }).collect()
+}
+
+fn record(packed: &PackedRecords, loaded: &Records, path: &str) -> Option<Value> {
+    packed.get(path).map(|bytes| serde_json::from_slice(bytes).expect("record serialized during startup"))
+        .or_else(|| loaded.get(path).cloned())
+}
+
+pub(crate) fn retain_fields(value: &mut Value, keys: &[&str]) {
+    if let Some(fields) = value.as_object_mut() {
+        fields.retain(|key, _| keys.contains(&key.as_str()));
+    }
+}
+
+fn remove_fields(value: &mut Value, keys: &[&str]) {
+    if let Some(fields) = value.as_object_mut() {
+        fields.retain(|key, _| !keys.contains(&key.as_str()));
     }
 }
 
@@ -197,7 +269,7 @@ struct Inputs<'a> {
 }
 
 impl Inputs<'_> {
-    fn read(&mut self, name: impl AsRef<Path>) -> Result<Value> {
+    fn read_bytes(&mut self, name: impl AsRef<Path>) -> Result<(PathBuf, Vec<u8>)> {
         let name = name.as_ref();
         let path = self.root.join(name);
         let bytes = fs::read(&path).map_err(|error| {
@@ -207,6 +279,35 @@ impl Inputs<'_> {
             &name.to_string_lossy().replace('\\', "/"),
             &bytes,
         );
+        Ok((path, bytes))
+    }
+
+    fn fingerprint_object(&mut self, name: impl AsRef<Path>) -> Result<()> {
+        struct Object;
+        impl<'de> Visitor<'de> for Object {
+            type Value = ();
+
+            fn expecting(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                fmt.write_str("a JSON object")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> std::result::Result<(), M::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(())
+            }
+        }
+
+        let (path, bytes) = self.read_bytes(name)?;
+        let json = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+        let json = std::str::from_utf8(json)
+            .map_err(|error| invalid(format!("解析 {} 失败：{error}", path.display())))?;
+        let mut reader = serde_json::Deserializer::from_str(json);
+        reader.deserialize_map(Object).and_then(|()| reader.end())
+            .map_err(|error| invalid(format!("解析 {} 失败：{error}", path.display())))
+    }
+
+    fn read(&mut self, name: impl AsRef<Path>) -> Result<Value> {
+        let (path, bytes) = self.read_bytes(name)?;
         let json = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
         let document: Value = serde_json::from_slice(json)
             .map_err(|error| invalid(format!("解析 {} 失败：{error}", path.display())))?;

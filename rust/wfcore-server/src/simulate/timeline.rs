@@ -1,6 +1,6 @@
 use super::{
     active_pool, arcane, arcane_status::{self, StatusArcane}, named, num, rows, text, truth, ST_STACK_NAMES, SimResult,
-    events::Effects, melee::Schedule, request::Request, target::Target, weapon::{self, Effect, Evolution, Weapon},
+    events::Effects, melee::Schedule, request::Request, target::{Defenses, Target}, weapon::{self, Effect, Evolution, ReplayPart, Weapon},
 };
 use serde_json::{json, Map, Value};
 use std::cell::RefCell;
@@ -88,28 +88,28 @@ impl Provider<'_> {
         }
         let profile = self.weapon.profile(index);
         let mode = &self.weapon.modes[index];
-        let mut packet = Packet::new(self.weapon.reduce(index, mode, &profile, &effects, false, ceiling, false, heavy, &[])?);
+        let mut packet = Packet::new(self.weapon.reduce_mode(index, &effects, false, ceiling, heavy, &[])?);
         packet.charge_before_fire = truth(&profile["charge"]["beforeFire"]);
         packet.native_cooldown = num(&mode["nativeFireCooldownSeconds"]);
         let mut radials = Vec::new();
         if !truth(&profile["pureRadial"]) {
-            for part in rows(&profile["radials"]).iter().chain(profile.get("radial").filter(|p| p.is_object())) {
+            for (ordinal, part) in rows(&profile["radials"]).iter().chain(profile.get("radial").filter(|p| p.is_object())).enumerate() {
                 if num(&part["armingDistance"]) > self.weapon.req.scenario.distance.unwrap_or(f64::INFINITY) {
                     continue;
                 }
-                let part = self.part(index, mode, &profile, &effects, part, PartKind::Radial, ceiling)?;
+                let part = self.part(index, mode, &effects, part, ReplayPart::Radial(ordinal), ceiling)?;
                 radials.push(views.push(part));
             }
         }
         if let Some(part) = profile.get("lingering").filter(|v| v.is_object()) {
-            let field = self.part(index, mode, &profile, &effects, part, PartKind::Field, ceiling)?;
+            let field = self.part(index, mode, &effects, part, ReplayPart::Field, ceiling)?;
             packet.lingering = Some((views.push(field), num(&part["tick_rate"]), num(&part["duration_seconds"])));
         }
         // 档案中的末端爆炸与变形主弹各自结算，但使用同一份暴击和触发面板基值。
         let cycle = self.weapon.incarnon;
         if self.weapon.is_incarnon(index) && radials.is_empty()
             && matches!(text(&cycle["referenceId"]), "burston_incarnon" | "burston_prime_incarnon") {
-            radials.push(views.push(self.part(index, mode, &profile, &effects, &cycle["radial"], PartKind::Terminal, ceiling)?));
+            radials.push(views.push(self.part(index, mode, &effects, &cycle["radial"], ReplayPart::Terminal, ceiling)?));
         }
         let radial = radials.first().copied();
         if let Some(id) = radial { views.packets[id].additional.extend(radials.into_iter().skip(1)); }
@@ -118,38 +118,45 @@ impl Provider<'_> {
         Ok(result)
     }
 
-    fn part(&self, index: usize, source: &Value, profile: &Value, effects: &[Effect],
-            part: &Value, kind: PartKind, status_count: f64) -> SimResult<Packet> {
-        let mut mode = source.clone();
-        let damage = &mut mode["damage"];
-        damage["types"] = Value::Object(named(&part["damage"]).into_iter()
-            .map(|(name, amount)| (damage_type(&name).to_owned(), json!(amount))).collect());
-        damage["forcedProcs"] = part["forcedProcs"].as_array().map_or_else(|| json!([]), |v| json!(v));
-        if kind != PartKind::Terminal {
-            for (field, key) in [("critChance", "crit_chance"), ("critMultiplier", "crit_multiplier")] {
-                if !part[key].is_null() { damage[field] = part[key].clone(); }
+    fn part(&self, index: usize, source: &Value, effects: &[Effect],
+            part: &Value, kind: ReplayPart, status_count: f64) -> SimResult<Packet> {
+        let prep = self.weapon.prepare_replay_part(index, kind, || {
+            let mut mode = source.clone();
+            let damage = &mut mode["damage"];
+            damage["types"] = Value::Object(named(&part["damage"]).into_iter()
+                .map(|(name, amount)| (damage_type(&name).to_owned(), json!(amount))).collect());
+            damage["forcedProcs"] = part["forcedProcs"].as_array().map_or_else(|| json!([]), |v| json!(v));
+            if kind != ReplayPart::Terminal {
+                for (field, key) in [("critChance", "crit_chance"), ("critMultiplier", "crit_multiplier")] {
+                    if !part[key].is_null() { damage[field] = part[key].clone(); }
+                }
+                if let Some(chance) = part["status_chance"].as_f64() {
+                    damage["procChance"] = json!(chance * source["multishot"].as_f64().unwrap_or(1.0));
+                }
+                if rows(&part["forced_procs"]).contains(&json!("electricity")) {
+                    damage["forcedProcs"].as_array_mut().unwrap().push(json!("PT_ELECTROCUTION"));
+                }
+                if rows(&part["forced_procs"]).contains(&json!("cold")) {
+                    damage["forcedProcs"].as_array_mut().unwrap().push(json!("PT_CHILLED"));
+                }
+                mode["falloffRange"] = json!([0, 0]);
+                mode["falloffMinDamage"] = json!(1);
             }
-            if let Some(chance) = part["status_chance"].as_f64() {
-                damage["procChance"] = json!(chance * source["multishot"].as_f64().unwrap_or(1.0));
-            }
-            if rows(&part["forced_procs"]).contains(&json!("electricity")) {
-                damage["forcedProcs"].as_array_mut().unwrap().push(json!("PT_ELECTROCUTION"));
-            }
-            if rows(&part["forced_procs"]).contains(&json!("cold")) {
-                damage["forcedProcs"].as_array_mut().unwrap().push(json!("PT_CHILLED"));
-            }
-            mode["falloffRange"] = json!([0, 0]);
-            mode["falloffMinDamage"] = json!(1);
-        }
-        let effects: Vec<_> = effects.iter().filter(|effect| {
-            !(kind == PartKind::Field && effect.upgrade == "WEAPON_DAMAGE_AMOUNT" && effect.operation == "ADD_BASE")
-        }).cloned().collect();
+            mode
+        })?;
+        let filtered;
+        let effects = if kind == ReplayPart::Field {
+            filtered = effects.iter().filter(|effect| {
+                !(effect.upgrade == "WEAPON_DAMAGE_AMOUNT" && effect.operation == "ADD_BASE")
+            }).cloned().collect::<Vec<_>>();
+            &filtered
+        } else { effects };
         // The fallback terminal burst uses its zero-status launch snapshot.
-        let status_count = if kind != PartKind::Terminal && part["takes_condition_overload"] == true {
+        let status_count = if kind != ReplayPart::Terminal && part["takes_condition_overload"] == true {
             status_count
         } else { 0.0 };
-        let mut fields = self.weapon.reduce(index, &mode, profile, &effects, false, status_count, true, false, &[])?;
-        if part["takes_multishot"] == false || kind == PartKind::Terminal { fields.multishot = 1.0; }
+        let mut fields = self.weapon.reduce_prepared(index, &prep, effects, status_count, false, &[]);
+        if part["takes_multishot"] == false || kind == ReplayPart::Terminal { fields.multishot = 1.0; }
         if let Some(count) = part["count"].as_f64().filter(|v| *v != 0.0) { fields.multishot *= count; }
         fields.weakpoint_damage_bonus = 0.0;
         fields.weakpoint_crit_chance_bonus = wfcore_lib::mods::Num::F(0.0);
@@ -180,9 +187,6 @@ impl Provider<'_> {
         })
     }
 }
-
-#[derive(Clone, Copy, PartialEq)]
-enum PartKind { Radial, Field, Terminal }
 
 fn damage_type(value: &str) -> &str {
     match value {
@@ -281,22 +285,41 @@ fn floor(profile: &Value, co: &Value) -> f64 {
 pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &ModdedFields,
                          req: &Request<'_>, target: &Target<'_>, level: u64, steel: bool, enhancements: &Value,
                          effects: &Effects, schedule: Option<&Schedule>, arcanes: &arcane::Equipped<'_>,
-                         status_rate: f64, damage_rate: f64, score_only: bool) -> SimResult<Value> {
-    replay_window(weapon, evolution, fields, req, target, level, steel, enhancements, effects, schedule, arcanes,
-        status_rate, damage_rate, if score_only { Output::Kpm } else { Output::Timeline }, 16)
+                         status_rate: f64, damage_rate: f64) -> SimResult<Value> {
+    let defenses = target.defenses(level, steel, req.strip, 0.0, enhancements);
+    replay_window(weapon, evolution, fields, req, target, level, steel, enhancements, &defenses, None,
+        effects, schedule, arcanes, status_rate, damage_rate, Output::Timeline, 16).map(ReplayOutput::details)
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum Output { Timeline, Kpm, Dps, LifeCurve }
 
+pub(super) enum ReplayOutput { Details(Value), Score(f64) }
+
+impl ReplayOutput {
+    pub fn details(self) -> Value {
+        match self { Self::Details(value) => value, Self::Score(_) => unreachable!("replay requested details") }
+    }
+
+    pub fn from_score(score: f64) -> Self { Self::Score(if score.is_finite() { score } else { 0.0 }) }
+
+    pub fn score(self) -> f64 {
+        match self { Self::Score(value) => value, Self::Details(_) => unreachable!("replay requested a score") }
+    }
+}
+
 pub(super) fn replay_window(weapon: &Weapon<'_>, evolution: &Evolution, fields: &ModdedFields,
     req: &Request<'_>, target: &Target<'_>, level: u64, steel: bool, enhancements: &Value,
-    effects: &Effects, schedule: Option<&Schedule>, arcanes: &arcane::Equipped<'_>,
-    status_rate: f64, damage_rate: f64, output: Output, kill_branches: usize) -> SimResult<Value> {
+    defenses: &Defenses, health_scale: Option<f64>, effects: &Effects, schedule: Option<&Schedule>,
+    arcanes: &arcane::Equipped<'_>, status_rate: f64, damage_rate: f64, output: Output,
+    kill_branches: usize) -> SimResult<ReplayOutput> {
     let score_only = matches!(output, Output::Kpm | Output::Dps);
-    let defenses = target.defenses(level, steel, req.strip, 0.0, enhancements);
     let mut full = defenses.full;
-    full[2] *= enhancements["healthScale"].as_f64().unwrap_or(1.0);
+    full[2] *= match health_scale {
+        Some(scale) if scale.is_finite() => scale,
+        Some(_) => 1.0,
+        None => enhancements["healthScale"].as_f64().unwrap_or(1.0),
+    };
     let ehp = psum(full);
     let profile = weapon.profile(req.mode);
     let base_profile = weapon.profile(0);
@@ -312,9 +335,9 @@ pub(super) fn replay_window(weapon: &Weapon<'_>, evolution: &Evolution, fields: 
             damage_scale: v["damageScale"].as_f64().unwrap_or(1.0), source_mode_charge: truth(&v["sourceModeKillChargeTrue"]),
         })
     } else { None };
-    let selected_burst = burst(weapon, req.mode, &profile);
+    let selected_burst = burst(weapon, req.mode, profile);
     let base_burst = burst(weapon, if cycle.is_some() { 0 } else { req.mode },
-        if cycle.is_some() { &base_profile } else { &profile });
+        if cycle.is_some() { base_profile } else { profile });
     let base_burst = base_burst.or_else(|| {
         let v = &weapon.incarnon["burst"];
         (cycle.is_some() && v.is_object()).then(|| (false, v["count"].as_i64().unwrap_or(0), num(&v["delay_seconds"]), false))
@@ -352,7 +375,7 @@ pub(super) fn replay_window(weapon: &Weapon<'_>, evolution: &Evolution, fields: 
     let live_types_enabled = effects.static_terms.iter().chain(effects.sources.iter().flat_map(|s| &s.effects)).any(has_co);
     let melee_rate = schedule.map(|_| provider.views.borrow().packets[initial].fields.fire_rate.f());
     let battery = &profile["battery"];
-    let shell = &profile;
+    let shell = profile;
     let rate_spool = (req.mode == 0 && !is_incarnon).then(|| profile.get("fireRateSpool")).flatten().map(|profile| {
         let start = profile["start"].as_f64().unwrap_or(1.0);
         let end = profile["end"].as_f64().unwrap_or(1.0);
@@ -383,8 +406,8 @@ pub(super) fn replay_window(weapon: &Weapon<'_>, evolution: &Evolution, fields: 
         let input = TrajectoryInput {
             window: req.window, rate: melee_rate.unwrap_or_else(|| weapon::attack_rate(fields)), forced_procs: forced_procs.clone(),
             faction_deltas: deltas.clone(), armour_bypass: armour_bypass.clone(), shield_bypass: shield_bypass.clone(), distance: req.scenario.distance,
-            beam_floor: Some(floor(&profile, &co[req.mode.to_string()])),
-            beam_floor_base: Some(floor(&base_profile, &co["0"])),
+            beam_floor: Some(floor(profile, &co[req.mode.to_string()])),
+            beam_floor_base: Some(floor(base_profile, &co["0"])),
             burst: selected_burst, burst_rate: Some(num(&weapon.modes[req.mode]["fireRate"])),
             burst_base: base_burst, burst_rate_base: Some(num(&weapon.modes[base_index]["fireRate"])),
             burst_incarnon: selected_burst, burst_rate_incarnon: Some(num(&weapon.modes[req.mode]["fireRate"])),
@@ -412,9 +435,11 @@ pub(super) fn replay_window(weapon: &Weapon<'_>, evolution: &Evolution, fields: 
             sources: sources.clone(), types: types.clone(), initial, score_only, life_curve: matches!(output, Output::LifeCurve),
             ..TrajectoryInput::default()
         };
-        let output = if !matches!(output, Output::Timeline) { replay::trajectory(input, &provider) }
-            else { replay::trajectory_sampled(input, &provider) }
-            .map_err(|error| error.to_string())?;
+        let output = match output {
+            Output::Timeline => replay::trajectory_sampled(input, &provider),
+            Output::LifeCurve => replay::trajectory(input, &provider),
+            Output::Kpm | Output::Dps => replay::trajectory_score(input, &provider),
+        }.map_err(|error| error.to_string())?;
         Ok::<_, String>(output)
     };
     let kills = |output: &replay::TrajectoryOutput| {
@@ -423,8 +448,8 @@ pub(super) fn replay_window(weapon: &Weapon<'_>, evolution: &Evolution, fields: 
     let golden = (5.0_f64.sqrt() - 1.0) / 2.0;
     let first = run(feedback.then_some((true, 0.0, golden, track_kills)))?;
     if matches!(output, Output::LifeCurve) {
-        return Ok(json!({"targetTotalEhp": ehp,
-            "curve": first.details.and_then(|details| details.life_curve)}));
+        return Ok(ReplayOutput::Details(json!({"targetTotalEhp": ehp,
+            "curve": first.details.and_then(|details| details.life_curve)})));
     }
     let branches = if feedback && first.weak_uncertainty >= 0.05 {
         Some((0..kill_branches).map(|i| run(Some((false, (i as f64 + 0.5) / kill_branches as f64, golden, true))))
@@ -437,8 +462,13 @@ pub(super) fn replay_window(weapon: &Weapon<'_>, evolution: &Evolution, fields: 
         let score = branches.as_ref().map_or_else(|| score(&first), |outputs| {
             psum(outputs.iter().map(score)) / outputs.len() as f64
         });
-        return Ok(json!(score));
+        return Ok(ReplayOutput::from_score(score));
     }
+    let scaled;
+    let enhancements = if let Some(scale) = health_scale {
+        scaled = super::merge(enhancements.clone(), json!({"healthScale": scale}));
+        &scaled
+    } else { enhancements };
     let serialize = |output: replay::TrajectoryOutput| {
         let score = kills(&output);
         let details = output.details.expect("展示回放必须有事件统计");
@@ -544,9 +574,9 @@ pub(super) fn replay_window(weapon: &Weapon<'_>, evolution: &Evolution, fields: 
     };
     if let Some(outputs) = branches {
         let branches: Vec<_> = outputs.into_iter().map(serialize).collect();
-        Ok(merge_branches(&branches))
+        Ok(ReplayOutput::Details(merge_branches(&branches)))
     } else {
-        Ok(serialize(first))
+        Ok(ReplayOutput::Details(serialize(first)))
     }
 }
 

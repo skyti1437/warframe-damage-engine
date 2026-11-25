@@ -247,6 +247,22 @@ impl From<EffectInput> for Row {
     }
 }
 
+impl Row {
+    pub fn is_supported(&self) -> bool { self.bucket != OTHER }
+}
+
+#[derive(Clone, Copy)]
+struct AppliedRow<'a> {
+    row: &'a Row,
+    value: f64,
+}
+
+impl std::ops::Deref for AppliedRow<'_> {
+    type Target = Row;
+
+    fn deref(&self) -> &Row { self.row }
+}
+
 /// 分类结果及原始效果在输入序列中的位置。
 pub struct ClassifiedEffect {
     pub index: usize,
@@ -317,26 +333,27 @@ const RELOAD_NEVER_SECONDS: f64 = 1e9;
 const AMMO_EFFICIENCY_CAP: f64 = 0.75;
 
 struct Applied<'a> {
-    rows: Vec<&'a Row>,
+    rows: Vec<AppliedRow<'a>>,
     indexes: Vec<usize>,
-    buckets: Vec<Vec<usize>>,
+    bucket_offsets: [usize; OTHER + 2],
+    bucket_rows: Vec<usize>,
 }
 
 impl<'a> Applied<'a> {
     fn idx(&self, b: usize) -> &[usize] {
-        &self.buckets[b]
+        &self.bucket_rows[self.bucket_offsets[b]..self.bucket_offsets[b + 1]]
     }
     fn ops(&self, b: usize) -> Vec<(u8, f64)> {
-        self.buckets[b].iter().map(|&i| (self.rows[i].op, self.rows[i].value)).collect()
+        self.idx(b).iter().map(|&i| (self.rows[i].op, self.rows[i].value)).collect()
     }
     fn ops_where(&self, b: usize, keep: impl Fn(&Row) -> bool) -> Vec<(u8, f64)> {
-        self.buckets[b].iter().filter(|&&i| keep(self.rows[i])).map(|&i| (self.rows[i].op, self.rows[i].value)).collect()
+        self.idx(b).iter().filter(|&&i| keep(self.rows[i].row)).map(|&i| (self.rows[i].op, self.rows[i].value)).collect()
     }
     fn values(&self, b: usize) -> Vec<f64> {
-        self.buckets[b].iter().map(|&i| self.rows[i].value).collect()
+        self.idx(b).iter().map(|&i| self.rows[i].value).collect()
     }
     fn empty(&self, b: usize) -> bool {
-        self.buckets[b].is_empty()
+        self.idx(b).is_empty()
     }
 }
 
@@ -345,7 +362,7 @@ pub enum Scale {
     Synthetic(&'static str, &'static str, f64, Option<&'static str>),
 }
 
-fn element_of(row: &Row) -> Element {
+fn element_of(row: AppliedRow<'_>) -> Element {
     match nonempty(&row.damage_type) {
         None | Some("DT_ANY") => (None, row.value),
         Some(_) => (row.dtype, row.value),
@@ -473,21 +490,34 @@ pub fn apply_mods<E>(
     zoom: impl IntoIterator<Item = Result<ClassifiedEffect, E>>,
 ) -> Result<ModsOutput, E> {
     let ModsInput { effects: mut entries, skipped, victim_status_count: vsc, need_spec } = input;
-    let el = elements();
     if !entries.iter().any(|e| e.row.zoom) {
         for effect in zoom {
             entries.push(effect?);
         }
     }
-    let mut skipped = skipped;
+    Ok(reduce_mods(prep, entries.iter().map(|entry| (entry, entry.row.value)), skipped, vsc, need_spec))
+}
+
+/// 已编译效果可复用属性行，并单独传入此轮的数值倍率结果。
+pub fn apply_prepared_mods(prep: &ModsPrep, entries: &[(ClassifiedEffect, f64)], skipped: Vec<String>,
+    victim_status_count: f64) -> ModdedFields {
+    reduce_mods(prep, entries.iter().map(|(entry, value)| (entry, *value)), skipped, victim_status_count, false).fields
+}
+
+fn reduce_mods<'a>(prep: &ModsPrep, entries: impl Iterator<Item = (&'a ClassifiedEffect, f64)>,
+    mut skipped: Vec<String>, vsc: f64, need_spec: bool) -> ModsOutput {
+    let el = elements();
     let mut unsupported: BTreeSet<String> = BTreeSet::new();
-    let mut ap = Applied { rows: Vec::new(), indexes: Vec::new(), buckets: vec![Vec::new(); OTHER + 1] };
-    for entry in entries.iter() {
+    let capacity = entries.size_hint().0;
+    let mut rows = Vec::with_capacity(capacity);
+    let mut indexes = Vec::with_capacity(capacity);
+    let mut bucket_offsets = [0; OTHER + 2];
+    for (entry, value) in entries {
         match entry.status {
             0 => {
-                ap.buckets[entry.row.bucket].push(ap.rows.len());
-                ap.rows.push(&entry.row);
-                ap.indexes.push(entry.index);
+                bucket_offsets[entry.row.bucket + 1] += 1;
+                rows.push(AppliedRow { row: &entry.row, value });
+                indexes.push(entry.index);
             }
             1 => {
                 if let Some(u) = &entry.unsupported {
@@ -499,6 +529,17 @@ pub fn apply_mods<E>(
             _ => {}
         }
     }
+    for bucket in 1..bucket_offsets.len() {
+        bucket_offsets[bucket] += bucket_offsets[bucket - 1];
+    }
+    let mut cursor = bucket_offsets;
+    let mut bucket_rows = vec![0; rows.len()];
+    for (index, row) in rows.iter().enumerate() {
+        let slot = &mut cursor[row.bucket];
+        bucket_rows[*slot] = index;
+        *slot += 1;
+    }
+    let ap = Applied { rows, indexes, bucket_offsets, bucket_rows };
     let rows = &ap.rows;
 
     // 处理运行时异常转换。
@@ -1076,7 +1117,7 @@ pub fn apply_mods<E>(
         final_damage: final_spec.map(|(factor, _)| (factor, typed_final.into_iter().map(|(_, name, v)| (name, v)).collect())),
         frozen_factor,
     });
-    Ok(ModsOutput {
+    ModsOutput {
         fields: ModdedFields {
             damage_types,
             crit_chance,
@@ -1154,5 +1195,5 @@ pub fn apply_mods<E>(
             throw_damage_bonus,
         },
         spec,
-    })
+    }
 }

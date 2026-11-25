@@ -207,7 +207,7 @@ fn notes(eval: &Evaluator<'_>, search: &Search<'_>, capacity: i64, rejected: usi
         format!("optimizer-profile: {label}档（{detail}）；元素小生境 beam + 开放/病毒/腐蚀面板代理种子"),
         format!("optimizer-search: profile {}, {} candidate mods, {rejected} unsupported mods rejected", scope.profile, eval.cards.len()),
     ];
-    let names = |paths: &[String]| paths.iter().map(|path| catalog.mods[path]["nameZh"].as_str().unwrap_or(path))
+    let names = |paths: &[String]| paths.iter().map(|path| catalog.mod_at(path).and_then(|row| row["nameZh"].as_str()).unwrap_or(path))
         .collect::<Vec<_>>().join("、");
     let mut details = Vec::new();
     if search.faction_excluded != 0 { details.push(format!("屏蔽派系歧视卡 {} 张", search.faction_excluded)); }

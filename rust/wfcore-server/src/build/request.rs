@@ -44,7 +44,7 @@ impl Scope {
             if raw.is_null() { return Ok(Vec::new()); }
             raw.as_array().ok_or_else(|| format!("{key} must be an array of MOD paths"))?.iter().map(|value| {
                 let path = text(value).trim();
-                if !catalog.mods.contains_key(path) {
+                if catalog.mod_at(path).is_none() {
                     return Err(format!("{key} contains unsupported MOD path: {path}"));
                 }
                 Ok(path.to_owned())

@@ -87,12 +87,11 @@ fn run() -> Result<()> {
         Mode::Dump => service.catalog_json(),
         Mode::SimulateBatch(ref path) | Mode::BuildBatch(ref path) | Mode::RequestBatch(ref path) => {
             let input = serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(path)?))?;
-            let result = match options.mode {
+            batch = match options.mode {
                 Mode::BuildBatch(_) => service.build_batch(input)?,
                 Mode::RequestBatch(_) => service.request_batch(input)?,
                 _ => service.simulate_batch(input)?,
             };
-            batch = serde_json::to_vec(&result)?;
             &batch
         }
     };
