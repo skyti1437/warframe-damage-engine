@@ -1,12 +1,12 @@
 # SDJKBOT 完整伤害模拟引擎
 
-AstrBot 插件的本机完整伤害模拟服务，提供固定配装复算、紫卡评级和配卡搜索。当前程序版本为 `portable-535ed49f5a51149d`，数据标记为 `2026.08.13.13.24`。
+AstrBot 插件的本机完整伤害模拟服务，提供固定配装复算、紫卡评级和配卡搜索。当前纯 Rust 独立版标签为 `portable-rust-535ed49f5a51149d`（兼容旧版 Python 评分指纹 `535ed49f5a51149d`），数据标记为 `2026.08.13.13.24`。
 
 ## 安装
 
-在插件运维面板的「伤害引擎」页选择「完整模拟」，填写空闲的本机端口（例如 8765）并保存，再点「下载并部署」。安装器按宿主平台选择包，校验程序包及 45 个数据文件，启动后核对引擎指纹。支持 CPython 3.12 的 Linux x86_64 和 macOS arm64。
+在插件运维面板的「伤害引擎」页选择「完整模拟」，填写空闲的本机端口（例如 8765）并保存，再点「下载并部署」。安装器按宿主平台选择独立二进制运行包，校验程序包及 42 个冻结上游数据文件，启动后核对引擎指纹。纯 Rust 独立版支持 **Linux x86_64、Linux arm64 与 macOS arm64，无需特定 Python 版本**。
 
-程序包与 SHA-256 见 [release.json](release.json)。维护者可以用 [BUILD.md](BUILD.md) 从此版本的 Python 和 Rust 源码构建。插件的内置估算模式使用插件本地资料。
+纯 Rust 三端程序包与 SHA-256 见 [release-rust.json](release-rust.json)（兼容旧版 Python 3.12 清单见 [release.json](release.json)）。维护者可以用 [rust/wfcore-server/README.md](rust/wfcore-server/README.md) 与 [BUILD.md](BUILD.md) 从源码构建。插件的内置估算模式使用插件本地资料。
 
 ## 数据与许可证
 

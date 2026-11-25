@@ -1,0 +1,47 @@
+{
+  "assets": {
+    "darwin-arm64": {
+      "binary": "wfcore-server",
+      "dataVersion": "2026.08.13.13.24",
+      "fingerprint": "535ed49f5a51149d",
+      "name": "portable-rust-darwin-arm64.zip",
+      "platform": "darwin-arm64",
+      "runtime": "rust-standalone",
+      "runtimeDigest": "3ea749df5c3de728",
+      "sha256": "0ddcd607e9d1b61b38816b45bf41dca61dca44511c4083f5047ff8ef8bcfadef",
+      "size": 1663594,
+      "upstream": "d62e4ae56387e241d512dcf9176f3bfd3d426de7"
+    },
+    "linux-arm64": {
+      "binary": "wfcore-server",
+      "dataVersion": "2026.08.13.13.24",
+      "fingerprint": "535ed49f5a51149d",
+      "name": "portable-rust-linux-arm64.zip",
+      "platform": "linux-arm64",
+      "runtime": "rust-standalone",
+      "runtimeDigest": "3ea749df5c3de728",
+      "sha256": "325309cffa72c72253020e3ef9007c93548121b24f259080b9a8e6f3e1a62542",
+      "size": 1840401,
+      "upstream": "d62e4ae56387e241d512dcf9176f3bfd3d426de7"
+    },
+    "linux-x86_64": {
+      "binary": "wfcore-server",
+      "dataVersion": "2026.08.13.13.24",
+      "fingerprint": "535ed49f5a51149d",
+      "name": "portable-rust-linux-x86_64.zip",
+      "platform": "linux-x86_64",
+      "runtime": "rust-standalone",
+      "runtimeDigest": "3ea749df5c3de728",
+      "sha256": "e27607239109c3ae9847e89a93b374460082d7056cf8835c7600790e2d3a4fbc",
+      "size": 2008316,
+      "upstream": "d62e4ae56387e241d512dcf9176f3bfd3d426de7"
+    }
+  },
+  "binary": "wfcore-server",
+  "dataVersion": "2026.08.13.13.24",
+  "engineFingerprint": "535ed49f5a51149d",
+  "runtime": "rust-standalone",
+  "runtimeDigest": "3ea749df5c3de728",
+  "tag": "portable-rust-535ed49f5a51149d",
+  "upstream": "d62e4ae56387e241d512dcf9176f3bfd3d426de7"
+}
