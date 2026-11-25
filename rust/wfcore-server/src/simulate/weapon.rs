@@ -12,20 +12,39 @@ pub(super) struct Effect {
     pub upgrade: String,
     pub operation: String,
     pub value: f64,
-    dtype: Option<String>,
-    symbol: Option<String>,
+    pub dtype: Option<String>,
+    pub symbol: Option<String>,
     valid_type: Option<String>,
-    source: String,
+    pub source: String,
+    pub required: Vec<String>,
+    excluded: Vec<String>,
+    postures: Vec<String>,
+    proc_types: Vec<String>,
+    pub runtime_chance: Option<f64>,
+    pub condition: Option<String>,
+    runtime_kind: Option<String>,
+    runtime_damage_type: Option<String>,
+    runtime_threshold: Option<f64>,
+    runtime_multiplier: f64,
+    auto_type: Value,
+    check_type: Value,
 }
 
 impl Effect {
-    fn export(raw: &Value, source: &str) -> Self {
+    pub fn export(raw: &Value, source: &str) -> Self {
         let string = |key: &str| raw[key].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
         Self {
             upgrade: string("upgradeType").unwrap_or_else(|| "NONE".into()),
             operation: string("operation").unwrap_or_else(|| "ADD".into()),
-            value: num(&raw["valuePerRank"]), dtype: string("damageType"), symbol: string("symbolFilter"),
+            value: num(&raw["valuePerRank"]), dtype: raw["damageType"].as_str().map(str::to_owned), symbol: string("symbolFilter"),
             valid_type: string("validType"), source: source.into(),
+            required: strings(&raw["validModifiers"]), excluded: strings(&raw["invalidModifiers"]),
+            postures: strings(&raw["validPostures"]), proc_types: strings(&raw["validProcTypes"]),
+            runtime_chance: raw["runtimeChance"].as_f64(), runtime_kind: string("runtimeKind"),
+            runtime_damage_type: string("runtimeDamageType"), runtime_threshold: raw["runtimeThreshold"].as_f64(),
+            runtime_multiplier: raw["runtimeMultiplier"].as_f64().unwrap_or(1.0),
+            condition: string("conditionTag"), auto_type: raw["autoType"].clone(),
+            check_type: raw["checkTypeOnInstall"].clone(),
         }
     }
 
@@ -34,21 +53,101 @@ impl Effect {
             "incarnon:last-round-multishot")
     }
 
-    fn classify(&self, index: usize, weapon: &Value) -> ClassifiedEffect {
+    pub fn display(&self) -> Value {
+        json!({"upgradeType": self.upgrade, "damageType": self.dtype, "operation": self.operation, "value": self.value})
+    }
+
+    pub fn with_condition(mut self, condition: &Value) -> Self {
+        self.condition = condition["conditionTag"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+        self
+    }
+
+    fn payload(&self) -> Value {
+        json!({"upgrade_type": self.upgrade, "operation": self.operation, "value": self.value,
+            "damage_type": self.dtype, "symbol_filter": self.symbol, "supported": true, "valid_type": self.valid_type,
+            "valid_modifiers": self.required, "invalid_modifiers": self.excluded, "valid_proc_types": self.proc_types,
+            "valid_postures": self.postures, "auto_type": self.auto_type, "check_type_on_install": self.check_type,
+            "source_path": self.source, "condition_tag": self.condition, "runtime_kind": self.runtime_kind,
+            "runtime_damage_type": self.runtime_damage_type, "runtime_chance": self.runtime_chance, "runtime_threshold": self.runtime_threshold,
+            "runtime_multiplier": self.runtime_multiplier})
+    }
+
+    fn classify(&self, index: usize, req: &Request<'_>, heavy: bool) -> ClassifiedEffect {
+        let weapon = req.weapon;
         let fits = self.valid_type.as_ref().is_none_or(|name| {
             let name = name.trim_end_matches('/');
             text(&weapon["path"]).trim_end_matches('/') == name
                 || rows(&weapon["ancestry"]).iter().any(|v| text(v).trim_end_matches('/') == name)
         });
+        let (status, message, unsupported) = if !is_weapon_effect(&self.upgrade) {
+            let reason = match self.upgrade.as_str() {
+                "WEAPON_DAMAGE_CONVERSION" => "damage-conversion-phase-unverified",
+                "WEAPON_DAMAGE_TYPE_BIAS" => "damage-type-bias-phase-unverified",
+                "WEAPON_MULTISHOT" => "no-observed-raw-sample",
+                _ => "no-handler",
+            };
+            (1, Some(format!("{}: unsupported[{reason}]", self.source)), Some(self.upgrade.clone()))
+        } else if !fits && !(weapon["slot"] == "arch_gun" && super::arcane::archgun_scope(&self.source, self.valid_type.as_deref().unwrap_or(""))) {
+            (2, None, None)
+        } else if let Some(reason) = self.rejection(req, heavy) {
+            (3, Some(format!("{}: {reason}", self.source)), None)
+        } else {
+            (0, None, None)
+        };
         ClassifiedEffect {
-            index, status: if fits { 0 } else { 2 }, message: None, unsupported: None,
+            index, status, message, unsupported,
             row: Arc::new(EffectInput {
                 upgrade: self.upgrade.clone(), operation: self.operation.clone(), value: self.value,
                 damage_type: self.dtype.clone(), symbol: self.symbol.clone(), source: Some(self.source.clone()),
-                runtime_kind: None, runtime_damage_type: None, runtime_chance: None,
-                runtime_threshold: None, runtime_multiplier: 1.0,
+                runtime_kind: self.runtime_kind.clone(), runtime_damage_type: self.runtime_damage_type.clone(),
+                runtime_chance: self.runtime_chance, runtime_threshold: self.runtime_threshold, runtime_multiplier: self.runtime_multiplier,
             }.into()),
         }
+    }
+
+    fn rejection(&self, req: &Request<'_>, heavy: bool) -> Option<String> {
+        if !matches!(self.operation.as_str(), "ADD" | "ADD_BASE" | "SET" | "SET_BASE" | "MULTIPLY" | "STACKING_MULTIPLY") {
+            return Some(format!("cannot evaluate operation {}", self.operation));
+        }
+        if let Some(symbol) = &self.symbol {
+            let valid = match self.upgrade.as_str() {
+                "GAMEPLAY_FACTION_DAMAGE" => true,
+                "WEAPON_VICTIM_CRIT_CHANCE" | "WEAPON_VICTIM_CRIT_DAMAGE" => symbol == "VictimFullHealthShield",
+                "WEAPON_VICTIM_DAMAGE_AMOUNT" => symbol == "VictimLessThanHalfHealth",
+                "WEAPON_CRIT_CHANCE_BODY_PART" => matches!(symbol.as_str(), "TORSO" | "HEAD" | "ARM_LEFT" | "ARM_RIGHT" | "LEG_LEFT" | "LEG_RIGHT"),
+                _ => false,
+            };
+            if !valid { return Some(format!("cannot evaluate symbol filter {symbol}")); }
+        }
+        if !req.melee {
+            if self.upgrade == "WEAPON_MELEE_DAMAGE" { return Some("requires a melee or arch-melee weapon".into()); }
+            if self.upgrade.starts_with("WEAPON_MELEE_COMBO_")
+                || matches!(self.upgrade.as_str(), "WEAPON_MELEE_HEAVY_CHARGE_SPEED" | "WEAPON_MELEE_SLAM_DAMAGE_BONUS") {
+                return Some("requires a melee weapon".into());
+            }
+        }
+        for (modifiers, excluding) in [(&self.required, false), (&self.excluded, true)] {
+            for modifier in modifiers {
+                let active = match modifier.as_str() {
+                    "PM_AIM" => req.scenario.aiming,
+                    "PM_HEAVY_MELEE" => heavy,
+                    _ => return Some(format!("cannot evaluate {} modifier {modifier}", if excluding { "invalid" } else { "valid" })),
+                };
+                if active == excluding { return Some(format!("{} modifier {modifier}", if excluding { "excludes" } else { "requires" })); }
+            }
+        }
+        if !self.proc_types.is_empty() && self.upgrade != "WEAPON_CRIT_CHANCE_IF_VICTIM_PROC_ACTIVE" {
+            return Some(format!("cannot evaluate proc type {}", self.proc_types.join(",")));
+        }
+        if !self.postures.is_empty() { return Some(format!("cannot evaluate posture {}", self.postures.join(","))); }
+        None
+    }
+}
+
+fn strings(value: &Value) -> Vec<String> {
+    match value.as_str() {
+        Some(s) if !s.is_empty() => vec![s.to_owned()],
+        _ => rows(value).iter().filter_map(Value::as_str).map(str::to_owned).collect(),
     }
 }
 
@@ -81,15 +180,20 @@ pub(super) struct Evolution {
     pub policy: Value,
     pub effects: Vec<Effect>,
     pub notes: Vec<String>,
+    pub replay_notes: Vec<String>,
     pub last_multishot: f64,
     pub last_burst: bool,
     pub sources: Vec<Trigger>,
 }
 
+#[derive(Clone)]
 pub(super) struct Trigger {
     pub id: String,
     pub label: String,
-    pub kind: &'static str,
+    pub kind: String,
+    pub replay: wfcore_lib::replay::SourceInput,
+    pub condition_text: String,
+    pub victim_proc_type: Option<String>,
     pub effects: Vec<Effect>,
     pub cap: f64,
     pub duration: f64,
@@ -98,7 +202,8 @@ pub(super) struct Trigger {
     pub hold: bool,
 }
 
-fn condition_kind(value: &Value) -> Option<&'static str> {
+pub(super) fn condition_kind(value: &Value) -> Option<&str> {
+    if let Some(kind) = value["nativeEvent"]["kind"].as_str().or_else(|| value["eventKind"].as_str()) { return Some(kind); }
     let keys = rows(&value["conditions"]);
     let tag = &value["conditionTag"];
     let candidates = if keys.is_empty() { std::slice::from_ref(tag) } else { keys };
@@ -109,15 +214,41 @@ fn condition_kind(value: &Value) -> Option<&'static str> {
             "onreloadarchgunfromemptyclipcondition" => Some("on-reload-empty-complete"),
             "onreloadshotguncondition" | "onreloadriflecondition" | "onreloadpistolcondition" => Some("on-reload-complete"),
             "onreloadcondition" => Some("on-reload"),
+            "burstononbursthit" => Some("on-burst-hit"),
+            "onweakpointhitcondition" | "onheadshotcondition" | "onheadshotriflecondition" | "onheadshotpistolcondition"
+            | "onheadshotpistolnoabilityweaponscondition" | "evopistolonheadshotcondition" | "evopistolonheadshotconditionb" => Some("on-headshot"),
+            "onpistolheadshotkillcondition" | "onpistolheadshotkillnojetpistolcondition" | "onheadshotkillanysourcecondition"
+            | "onheadshotkillcondition" | "onkillheadshotriflecondition" => Some("on-headshot-kill"),
+            "onkillcondition" | "onkillriflecondition" | "onpistolkillcondition" | "onshotgunkillcondition" => Some("on-kill"),
+            "onprimarykillcondition" => Some("on-primary-kill"),
+            "onmeleekillanysourcecondition" | "onmeleekillcondition" => Some("on-melee-kill"),
+            "oncritcondition" | "oncriticalhitcondition" => Some("on-crit"),
+            "onhitcondition" => Some("on-hit"),
+            "onheatproccondition" => Some("proc-DT_FIRE"),
+            "oncoldproccondition" => Some("proc-DT_FREEZE"),
+            "ontoxinproccondition" => Some("proc-DT_POISON"),
+            "onelectricityproccondition" => Some("proc-DT_ELECTRICITY"),
+            "onproccondition" | "onstatusprocallcondition" => Some("on-proc"),
+            "evopistolonnocritorproccondition" => Some("on-noncrit-no-proc"),
+            "onshotgunclosekillcondition" => Some("on-close-kill"),
+            "evoonshieldbreakcondition" => Some("on-self-shield-broken"),
+            "onoverguardbrokencondition" => Some("on-self-overguard-broken"),
+            "onglaiveconsecutivethrow" => Some("on-glaive-throw"),
             _ => None,
         }
     })
 }
 
+fn passive_condition(condition: &Value) -> bool {
+    condition["applyUpgradesByDefault"] == 1 || condition["applyUpgradesByDefault"] == true ||
+        (rows(&condition["conditions"]) == [json!("/Lotus/Upgrades/CosmeticEnhancers/Defensive/OnShieldDamageCondition")]
+            && !truth(&condition["conditionTag"]) && !truth(&condition["runtimeScripts"]))
+}
+
 impl Evolution {
     pub fn resolve(data: &EngineData, req: &Request<'_>) -> SimResult<Self> {
         let mut result = Self {
-            choices: json!({}), policy: json!({}), effects: Vec::new(), notes: Vec::new(),
+            choices: json!({}), policy: json!({}), effects: Vec::new(), notes: Vec::new(), replay_notes: Vec::new(),
             last_multishot: 0.0, last_burst: false, sources: Vec::new(),
         };
         let incarnon = &req.weapon["incarnon"];
@@ -198,7 +329,7 @@ impl Evolution {
             let id = text(&branch["id"]);
             if requested.is_none() && policy_id == Some(id) { applied.push(tier_key.clone()); }
             result.choices[&tier_key] = json!(id);
-            result.add_branch(branch, req.scenario.policy == "assumed_max", req.scenario.state,
+            result.add_branch(branch, req,
                 &data.mechanics["infinite-conditions"]["sources"]);
         }
         result.policy["appliedTiers"] = json!(applied);
@@ -218,8 +349,8 @@ impl Evolution {
         }
     }
 
-    fn add_branch(&mut self, branch: &Value, assumed: bool, state: Option<&serde_json::Map<String, Value>>,
-                  infinite_sources: &Value) {
+    fn add_branch(&mut self, branch: &Value, req: &Request<'_>, infinite_sources: &Value) {
+        let state = req.scenario.state;
         let path = text(&branch["path"]);
         let id = text(&branch["id"]);
         let conditions = rows(&branch["conditionalEffects"]);
@@ -227,7 +358,7 @@ impl Evolution {
         for (index, condition) in conditions.iter().enumerate() {
             let source = condition["sourcePath"].as_str().unwrap_or(path);
             let effects = rows(&condition["effects"]);
-            if actor_gate(condition, state).is_some() || effects.iter().any(|row| row["upgradeType"] == "WEAPON_LAST_MULTISHOT") {
+            if passive_condition(condition) || actor_gate(condition, state).is_some() || effects.iter().any(|row| row["upgradeType"] == "WEAPON_LAST_MULTISHOT") {
                 continue;
             }
             if text(&condition["runtimeScripts"]["apply"]["Script"]).ends_with("/OnLastBurstCondition.lua") {
@@ -237,18 +368,13 @@ impl Evolution {
                 !truth(&condition["runtimeScripts"]) && !effects.is_empty() &&
                     effects.iter().all(|v| is_weapon_effect(text(&v["upgradeType"])))
             }) {
-                let hold = truth(&condition["isInfinite"]) || infinite_sources.get(source).is_some();
-                self.sources.push(Trigger {
-                    id: format!("{source}:{index}:0"),
-                    label: branch["nameZh"].as_str().or_else(|| branch["nameEn"].as_str())
-                        .filter(|s| !s.is_empty()).map_or_else(|| format!("灵化 {id}"), str::to_owned),
-                    kind, effects: effects.iter().map(|v| Effect::export(v, source)).collect(),
-                    cap: condition["maxStacks"].as_f64().filter(|v| *v > 0.0).unwrap_or(1.0),
-                    duration: if hold { 0.0 } else { num(&condition["duration"]) },
-                    chance: condition["chance"].as_f64().unwrap_or(1.0), fixed: assumed, hold,
-                });
+                self.sources.push(super::events::source(branch, condition, index, kind,
+                    super::loadout::terms(&condition["effects"], source, 0, 1.0), None, req, None, infinite_sources));
             } else if !effects.is_empty() {
                 unknown_conditions = true;
+                if !truth(&condition["runtimeScripts"]) && (truth(&condition["conditions"]) || truth(&condition["conditionTag"])) {
+                    self.replay_notes.push(format!("{source}:event-condition-unmodeled"));
+                }
             }
         }
         for raw in rows(&branch["effects"]) {
@@ -261,7 +387,7 @@ impl Evolution {
                 c["sourcePath"].as_str().unwrap_or(path) == raw["sourcePath"].as_str().unwrap_or(path));
             if let Some(condition) = conditional {
                 if actor_gate(condition, state).is_some() { continue; }
-                if !truth(&condition["conditions"]) && !truth(&condition["runtimeScripts"]) {
+                if passive_condition(condition) || (!truth(&condition["conditions"]) && !truth(&condition["runtimeScripts"])) {
                     if is_weapon_effect(&effect.upgrade) { self.effects.push(effect); }
                 } else if condition_kind(condition).is_none() || truth(&condition["runtimeScripts"]) {
                     self.notes.push(format!("incarnon-{id}-conditional-source-excluded"));
@@ -281,7 +407,7 @@ impl Evolution {
     }
 }
 
-fn is_weapon_effect(upgrade: &str) -> bool {
+pub(super) fn is_weapon_effect(upgrade: &str) -> bool {
     mods::supports_effect(upgrade)
 }
 
@@ -367,8 +493,90 @@ impl<'a> Weapon<'a> {
         } else { &Value::Null }
     }
 
+    fn installed_effects(&self, index: usize, effects: &[Effect]) -> Vec<Effect> {
+        let mut installed = effects.to_vec();
+        for source in rows(&self.mechanics("weapon-passives")["innate"]) {
+            if truth(&source["fireModes"]) && !rows(&source["fireModes"]).iter().any(|v| v == index) { continue; }
+            installed.extend(rows(&source["effects"]).iter()
+                .filter(|effect| is_weapon_effect(text(&effect["upgradeType"])))
+                .map(|effect| Effect::export(effect, text(&source["path"]))));
+        }
+        installed
+    }
+
+    fn co_payload(&self, index: usize, effects: &[Effect], fields: &ModdedFields) -> Value {
+        let installed = self.installed_effects(index, effects);
+        json!(fields.co_bucket.iter().map(|&pos| installed[pos].payload()).collect::<Vec<_>>())
+    }
+
+    pub fn panel_fields(&self, effects: &[Effect], status_count: f64, skipped: &[String]) -> SimResult<(ModdedFields, Value)> {
+        let components = rows(&self.req.weapon["heavyAttack"]["components"]);
+        if !self.req.scenario.heavy || components.is_empty() {
+            return self.reduce(self.req.mode, &self.modes[self.req.mode], &self.profile(self.req.mode), effects,
+                self.req.scenario.cycle, status_count, false, self.req.scenario.heavy, skipped).map(|fields| {
+                    let co = self.co_payload(self.req.mode, effects, &fields);
+                    (fields, json!({"co_bucket": co}))
+                });
+        }
+        let mut first = None;
+        let mut types = indexmap::IndexMap::new();
+        let mut payload = Vec::new();
+        let mut total = 0.0;
+        let mut unsupported = std::collections::BTreeSet::new();
+        let mut all_skipped = Vec::new();
+        for component in components {
+            let mut damage = component["damage"].clone();
+            if !truth(&damage["types"]) { continue; }
+            let count = component.get("count").map_or(Some(1.0), Value::as_f64);
+            let Some(count) = count.filter(|n| *n > 0.0) else { continue; };
+            damage.as_object_mut().unwrap().remove("components");
+            damage.as_object_mut().unwrap().remove("radial");
+            let mode = json!({"damage": damage, "multishot": count, "fireRate": 0.0, "reloadTime": 0.0});
+            let fields = self.reduce(0, &mode, &Value::Null, effects, false, status_count, false, true, skipped)?;
+            let count = fields.multishot;
+            let vector: serde_json::Map<_, _> = fields.damage_types.0.iter().map(|&(id, value)| {
+                let amount = value * count;
+                *types.entry(id).or_insert(0.0) += amount;
+                (mods::name(id), json!(amount))
+            }).collect();
+            let sum = psum(vector.values().map(num));
+            let average = psum(fields.damage_types.0.iter().map(|v| v.1)) * tables::effective_hit_multiplier(
+                fields.crit_chance.f(), fields.crit_multiplier, fields.noncrit_damage_multiplier, 1.0, fields.double_crit_chance)
+                * fields.falloff_multiplier;
+            let expected = average * count;
+            total += expected;
+            let shares: serde_json::Map<_, _> = vector.iter().filter(|_| sum != 0.0)
+                .map(|(name, v)| (name.clone(), json!(num(v) / sum))).collect();
+            let mut part = json!({"id": component["id"], "kind": component["kind"], "source": component["source"],
+                "count": count, "damage": {"total": sum, "types": vector, "shares": shares,
+                    "critChance": fields.crit_chance.f(), "critMultiplier": fields.crit_multiplier,
+                    "doubleCritChance": fields.double_crit_chance, "procChance": fields.status_chance},
+                "expectedDamage": expected});
+            for key in ["forcedProcs", "radius", "falloff", "recallMultiplier"] {
+                if !component[key].is_null() { part[key] = component[key].clone(); }
+            }
+            payload.push(part);
+            unsupported.extend(fields.unsupported.iter().cloned());
+            for note in &fields.skipped {
+                if !all_skipped.contains(note) { all_skipped.push(note.clone()); }
+            }
+            if first.is_none() { first = Some(fields); }
+        }
+        let mut fields = first.ok_or("重击缺少伤害数据")?;
+        fields.damage_types.0 = types.into_iter().collect();
+        fields.multishot = 1.0;
+        fields.fire_rate = Num::F(0.0);
+        fields.magazine = 0.0;
+        fields.reload_time = Num::F(0.0);
+        fields.falloff_multiplier = 1.0;
+        fields.unsupported = unsupported.into_iter().collect();
+        fields.skipped = all_skipped;
+        let co = self.co_payload(0, effects, &fields);
+        Ok((fields, json!({"heavy_damage": total, "heavy_components": payload, "co_bucket": co})))
+    }
+
     pub fn reduce(&self, index: usize, mode: &Value, profile: &Value, effects: &[Effect],
-                  cycle: bool, status_count: usize, part: bool) -> SimResult<ModdedFields> {
+                  cycle: bool, status_count: f64, part: bool, heavy: bool, skipped: &[String]) -> SimResult<ModdedFields> {
         if let Some(reason) = mode["unavailableReason"].as_str().filter(|_| mode["behaviorKind"] == "ability-action") {
             return Err(reason.to_owned());
         }
@@ -400,15 +608,15 @@ impl<'a> Weapon<'a> {
         let co = if (num(&co["directTotal"]) - psum(base.iter().map(|(_, v)| *v))).abs() <= 0.02
             && co["projectile"] == damage["projectile"] { co } else { &Value::Null };
         let passive = self.mechanics("weapon-passives");
-        let mut installed = effects.to_vec();
-        for source in rows(&passive["innate"]) {
-            if truth(&source["fireModes"]) && !rows(&source["fireModes"]).iter().any(|v| v == index) { continue; }
-            installed.extend(rows(&source["effects"]).iter()
-                .filter(|effect| is_weapon_effect(text(&effect["upgradeType"])))
-                .map(|effect| Effect::export(effect, text(&source["path"]))));
-        }
+        let installed = self.installed_effects(index, effects);
         let copy = &mode["multishotCopy"][if part { "radial" } else { "direct" }];
         let prep = ModsPrep {
+            melee: self.req.melee,
+            compression: profile["compression"]["radius"].as_f64().map(|radius| {
+                let c = &profile["compression"];
+                (radius, c["takesRadiusMods"].as_bool().unwrap_or(true), c["reads_radius_m"].as_f64(),
+                    c["effectiveness"].as_f64().unwrap_or(1.0), c["stacking"] == "adds")
+            }),
             base: base.into_iter().map(|(name, value)| (mods::intern(&name), value * scaling)).collect(),
             aiming: self.req.scenario.aiming,
             co_base_fraction: co["baseFraction"].as_f64().unwrap_or(1.0),
@@ -424,7 +632,7 @@ impl<'a> Weapon<'a> {
             incarnon_cycle_seconds: pool.filter(|_| cycle && is_incarnon)
                 .map(|_| num(&self.incarnon["enterSeconds"]) + num(&self.incarnon["exitSeconds"])),
             incarnon_cycle: cycle,
-            base_magazine: nonzero(&self.req.weapon["magazineSize"], nonzero(&profile["magazine"], if self.req.weapon["slot"] == "arch_gun" { 0.0 } else { 6.0 })),
+            base_magazine: nonzero(&self.req.weapon["magazineSize"], nonzero(&profile["magazine"], if matches!(text(&self.req.weapon["slot"]), "primary" | "secondary") { 6.0 } else { 0.0 })),
             reload_every_shot: reload_each && !is_incarnon,
             reload_base: if num(&mode["reloadTime"]) == 0.0 { Num::F(0.0) } else { numeric(&mode["reloadTime"], Num::F(0.0)) },
             shell: profile["reloadPerShell"].as_f64().map(|per| (num(&profile["reloadStart"]), per, num(&profile["reloadEnd"]))),
@@ -447,19 +655,26 @@ impl<'a> Weapon<'a> {
             orb_stacks: 1, forced: force, ammo_cost: nonzero(&mode["ammoCost"], 1.0), ..ModsPrep::default()
         };
         let result = mods::apply_mods(&prep, ModsInput {
-            effects: installed.iter().enumerate().map(|(index, e)| e.classify(index, self.req.weapon)).collect(),
-            skipped: Vec::new(), victim_status_count: status_count as f64, need_spec: false,
+            effects: installed.iter().enumerate().map(|(index, e)| e.classify(index, self.req, heavy)).collect(),
+            skipped: skipped.to_vec(), victim_status_count: status_count, need_spec: false,
         }, std::iter::empty::<Result<_, std::convert::Infallible>>()).unwrap();
         Ok(result.fields)
     }
 }
 
-fn forced(raw: &Value) -> Vec<(String, f64)> {
+const PROC_TYPES: [(&str, &str); 13] =
     [("PT_KNOCKBACK", "DT_IMPACT"), ("PT_FRAILTY", "DT_PUNCTURE"), ("PT_BLEEDING", "DT_SLASH"),
      ("PT_IMMOLATION", "DT_FIRE"), ("PT_CHILLED", "DT_FREEZE"), ("PT_ELECTROCUTION", "DT_ELECTRICITY"),
      ("PT_POISONED", "DT_POISON"), ("PT_FLASHBANG", "DT_EXPLOSION"), ("PT_RAD_TOX", "DT_RADIATION"),
      ("PT_ASPHYXIATION", "DT_GAS"), ("PT_MAGNETIZED", "DT_MAGNETIC"), ("PT_INFECTED", "DT_VIRAL"),
-     ("PT_CAUSTIC_BURN", "DT_CORROSIVE")].into_iter().filter_map(|(proc, dtype)| {
+     ("PT_CAUSTIC_BURN", "DT_CORROSIVE")];
+
+pub(super) fn proc_type(proc: &str) -> Option<&'static str> {
+    PROC_TYPES.iter().find(|(name, _)| *name == proc).map(|(_, dtype)| *dtype)
+}
+
+fn forced(raw: &Value) -> Vec<(String, f64)> {
+    PROC_TYPES.into_iter().filter_map(|(proc, dtype)| {
         let count = rows(raw).iter().filter(|value| *value == proc).count();
         (count > 0).then(|| (dtype.to_owned(), count as f64))
     }).collect()

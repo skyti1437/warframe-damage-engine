@@ -60,14 +60,7 @@ pub(super) fn panel(fields: &ModdedFields, core: &Core, types: &Types) -> Value 
     let interval = super::weapon::interval(fields);
     let burst_rate = if interval > 0.0 { 1.0 / interval } else { core.fire_rate };
     let burst = damage * core.multishot * burst_rate * core.falloff_multiplier;
-    let cost = if fields.ammo_cost == 0.0 && fields.bow_draw_seconds.is_some() { 1.0 } else { fields.ammo_cost };
-    let sustained = if fields.magazine == 0.0 || core.fire_rate == 0.0 || cost == 0.0 {
-        burst
-    } else {
-        let shots = fields.magazine / cost;
-        let cycle = shots * interval + fields.reload_time.f();
-        damage * core.multishot * (shots + fields.first_shot_damage_bonus) * core.falloff_multiplier / cycle
-    };
+    let sustained = raw_sustained_dps(fields, core);
     out.extend(json!({
         "ignore_headshot_bonus": core.ignore_headshot_bonus, "radial_victim_crit": false,
         "delayed_radial_hit_event": false, "heavy_damage": null, "heavy_components": [],
@@ -86,6 +79,21 @@ pub(super) fn panel(fields: &ModdedFields, core: &Core, types: &Types) -> Value 
         "coAssumedCount": fields.co_assumed_count, "stanceMultiplier": 1.0,
     }).as_object().unwrap().clone());
     Value::Object(out)
+}
+
+pub(super) fn raw_sustained_dps(fields: &ModdedFields, core: &Core) -> f64 {
+    let damage = core.total_damage();
+    let interval = super::weapon::interval(fields);
+    let burst_rate = if interval > 0.0 { 1.0 / interval } else { core.fire_rate };
+    let burst = damage * core.multishot * burst_rate * core.falloff_multiplier;
+    let cost = if fields.ammo_cost == 0.0 && fields.bow_draw_seconds.is_some() { 1.0 } else { fields.ammo_cost };
+    if fields.magazine == 0.0 || core.fire_rate == 0.0 || cost == 0.0 {
+        burst
+    } else {
+        let shots = fields.magazine / cost;
+        let cycle = shots * interval + fields.reload_time.f();
+        damage * core.multishot * (shots + fields.first_shot_damage_bonus) * core.falloff_multiplier / cycle
+    }
 }
 
 fn hit(core: &Core, loc: HitLocation) -> HitLocation {
@@ -299,12 +307,12 @@ fn status(core: &Core, types: &Types, target: &Target<'_>, defenses: &Defenses,
 }
 
 pub(super) fn status_and_steady(fields: &ModdedFields, core: &Core, types: &Types, target: &Target<'_>,
-                               defenses: &Defenses, loc: HitLocation, forced: &Vector) -> (Value, Value) {
+                               defenses: &Defenses, loc: HitLocation, forced: &Vector, status_rate_multiplier: f64, damage_rate_multiplier: f64) -> (Value, Value) {
     let loc = hit(core, loc);
     let original = status(core, types, target, defenses, loc, forced);
     let rate = super::weapon::attack_rate(fields);
     let snapshot = sustained_snapshot(&target.sustained(defenses, loc), SustainedInput {
-        types, core, attacks_per_second: rate, status_rate_multiplier: 1.0, damage_rate_multiplier: 1.0,
+        types, core, attacks_per_second: rate, status_rate_multiplier, damage_rate_multiplier,
         total: false, magazine: fields.magazine, first_shot_bonus: fields.first_shot_damage_bonus,
     }, forced);
     let scaled = Defenses {
@@ -323,9 +331,9 @@ pub(super) fn status_and_steady(fields: &ModdedFields, core: &Core, types: &Type
     let mut dot_dps = 0.0;
     for row in adjusted.dots {
         let value = if matches!(row.dtype, GAS | ELECTRICITY) {
-            let active = row.count * rate * row.duration;
+            let active = row.count * rate * status_rate_multiplier * row.duration;
             let active = if row.dtype == GAS { active.min(10.0) } else { active };
-            (row.seed * active + if active > 0.0 { row.coefficient } else { 0.0 }) * row.landing
+            (row.seed * active + if active > 0.0 { row.coefficient } else { 0.0 }) * row.landing * (damage_rate_multiplier / status_rate_multiplier)
         } else { row.expected * snapshot.damage_rate };
         let value = value * pool_multiplier(if row.dtype == SLASH { CINEMATIC } else { row.dtype });
         dot_by_type.insert(types.name(row.dtype).to_owned(), json!(value));
@@ -343,8 +351,8 @@ pub(super) fn status_and_steady(fields: &ModdedFields, core: &Core, types: &Type
             .map(|d| core.duration_scale(d)).fold(core.proc_duration_multiplier.max(0.0), f64::max));
     }
     if adjusted.blast != 0.0 { ramp = ramp.max(1.5); }
-    let steady = json!({"model": "steady-status-rate", "attacksPerSecond": rate, "statusEventsPerSecond": rate,
-        "damageRateMultiplier": 1.0, "statusRateMultiplier": 1.0,
+    let steady = json!({"model": "steady-status-rate", "attacksPerSecond": rate, "statusEventsPerSecond": rate * status_rate_multiplier,
+        "damageRateMultiplier": damage_rate_multiplier, "statusRateMultiplier": status_rate_multiplier,
         "steadyStateSeconds": ramp, "stacks": ST_STACK_NAMES.into_iter().zip(snapshot.stacks).collect::<MapFromStacks>(),
         "activePool": pool, "vulnerabilityMultiplier": if pool == "health" { snapshot.viral_multiplier } else { snapshot.magnetic_multiplier },
         "viralDamageMultiplier": snapshot.viral_multiplier, "magneticDamageMultiplier": snapshot.magnetic_multiplier,
@@ -363,7 +371,7 @@ pub(super) fn status_and_steady(fields: &ModdedFields, core: &Core, types: &Type
 
 type MapFromStacks = std::collections::BTreeMap<&'static str, f64>;
 
-pub(super) fn kill_timeline(result: &Value) -> Option<Value> {
+pub(super) fn kill_timeline(result: &Value, stance: &Value) -> Option<Value> {
     let damage = &result["targetDamage"];
     let stats = &result["moddedStats"];
     let steady = &result["statusSustained"];
@@ -373,9 +381,14 @@ pub(super) fn kill_timeline(result: &Value) -> Option<Value> {
     let hp = health + shield + overguard;
     let (magazine, reload) = (num(&stats["magazine"]), num(&stats["reloadTime"]));
     let has_cycle = magazine > 0.0 && reload > 0.0;
-    let interval = 1.0 / fire_rate;
+    let combo = &stance["bestCombo"];
+    let duration = num(&combo["duration"]);
+    let combo_multiplier = num(&combo["totalMultiplier"]);
+    let (interval, event_damage, label) = if duration > 0.0 && combo_multiplier > 0.0 {
+        (duration / fire_rate, per_shot * combo_multiplier, "combo")
+    } else { (1.0 / fire_rate, per_shot, "attack") };
     let rate = if has_cycle { magazine / (magazine * interval + reload) } else { 1.0 / interval };
-    let multiplier = (num(&steady["directDps"]) / (per_shot * rate)).max(0.0);
+    let multiplier = (num(&steady["directDps"]) / (event_damage * rate)).max(0.0);
     let (dot, blast, ramp) = (num(&steady["dotDps"]), num(&steady["procNonDotDps"]), num(&steady["steadyStateSeconds"]).max(0.0));
     let magnetic = num(&steady["magneticBreakPotential"]).max(0.0);
     let threshold = if steady["activePool"] == "overguard" { health + shield } else { health };
@@ -402,7 +415,7 @@ pub(super) fn kill_timeline(result: &Value) -> Option<Value> {
         let mut dealt = (dot * progress + blast * blast_progress) * step;
         let weighted = 1.0 + (multiplier - 1.0) * progress;
         while killed.is_none() && schedule.get(shots).is_some_and(|v| *v <= elapsed) {
-            dealt += per_shot * weighted;
+            dealt += event_damage * weighted;
             shots += 1;
         }
         if killed.is_none() {
@@ -418,7 +431,7 @@ pub(super) fn kill_timeline(result: &Value) -> Option<Value> {
         if killed.is_some_and(|t| elapsed - t >= interval.max(step * 4.0)) { break; }
     }
     Some(json!({"model": "attack-or-combo-with-reload-and-status-ramp",
-        "perShot": round(per_shot, 3), "eventDamage": round(per_shot, 3), "eventLabel": "attack",
+        "perShot": round(per_shot, 3), "eventDamage": round(event_damage, 3), "eventLabel": label,
         "fireRate": round(fire_rate, 3), "statusDps": round(dot + blast, 3),
         "steadyDirectMultiplier": round(multiplier, 6), "statusRampSeconds": round(ramp, 4),
         "magneticBreakDamage": round(magnetic, 3), "magneticBreakApplied": magnetic_applied,

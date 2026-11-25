@@ -1,6 +1,12 @@
 //! 手动模拟请求的编排，以及 HTTP 与离线批处理共用的响应契约。
 
+mod arcane;
+mod arcane_status;
 mod damage;
+mod events;
+mod loadout;
+mod melee;
+mod mod_runtime;
 mod request;
 mod target;
 mod timeline;
@@ -9,12 +15,12 @@ mod weapon;
 pub(crate) use request::SimCatalog;
 use request::Request;
 use target::{HitLocation, Target, BENCHMARK_TARGET};
-use weapon::{Evolution, Weapon};
+use weapon::{Effect, Evolution, Weapon};
 
 use crate::data::{EngineData, BUILD_LABEL, SCHEMA_VERSION};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
-use wfcore_lib::{pymath::psum, replay::Types, tables};
+use wfcore_lib::{mods::ModdedFields, pymath::psum, replay::Types, tables};
 
 type SimResult<T> = Result<T, String>;
 const ST_STACK_NAMES: [&str; 6] = ["heat", "viral", "corrosive", "magnetic", "cold", "puncture"];
@@ -23,22 +29,40 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
     let req = Request::parse(data, catalog, fields)?;
     let weapon = Weapon::new(data, &req);
     let evolution = Evolution::resolve(data, &req)?;
+    let stance = melee::stance(data, &catalog.stances, &req)?;
+    let schedule = melee::Schedule::resolve(data, &req, &stance)?;
+    let loadout = loadout::Loadout::resolve(data, catalog, &req, &stance)?;
+    let arcanes = arcane::Equipped::resolve(data, catalog, &req)?;
+    let stance_damage = stance["dpsMultiplier"].as_f64().unwrap_or(1.0);
+    let stance_status = stance["statusRateMultiplier"].as_f64().unwrap_or(1.0);
     let target = Target::new(&req.target, data);
     let defs = target.defenses(req.level, req.steel, req.strip, req.elemental_strip, &req.enhancements);
-    let profile = weapon.profile(req.mode);
-    let mode = &weapon.modes[req.mode];
     let mut types = Types::new();
-    let forced = req.forced.iter().map(|(name, v)| (types.id(name), *v)).collect();
-    let probe = weapon.reduce(req.mode, mode, &profile, &evolution.effects, req.scenario.cycle, 0, false)?;
-    let probe_core = weapon::core(&probe, &mut types, target.faction, target.bracket);
-    let count = tables::expected_status_procs(&probe_core, &forced, false).iter().filter(|(_, v)| *v > 0.0).count();
-    let fields = if count > 0 { weapon.reduce(req.mode, mode, &profile, &evolution.effects, req.scenario.cycle, count, false)? }
-        else { probe };
+    let forced: tables::Vector = req.forced.iter().map(|(name, v)| (types.id(name), *v)).collect();
+    let snapshot = |effects: &[Effect], skipped: &[String], types: &mut Types|
+        -> SimResult<(ModdedFields, Value, usize)> {
+        let (probe, metadata) = weapon.panel_fields(effects, 0.0, skipped)?;
+        let core = weapon::core(&probe, types, target.faction, target.bracket);
+        let count = tables::expected_status_procs(&core, &forced, false).iter().filter(|(_, v)| *v > 0.0).count();
+        let (fields, metadata) = if count == 0 { (probe, metadata) } else {
+            weapon.panel_fields(effects, count as f64, skipped)?
+        };
+        Ok((fields, metadata, count))
+    };
+    let event_fields = if arcanes.needs_stats() {
+        Some(snapshot(&loadout.terms, &loadout.skipped, &mut types)?.0)
+    } else { None };
+    let arcane = arcanes.snapshot(&req, event_fields.as_ref(), None)?;
+    let effects = loadout.effects(&evolution.effects, &arcane.effects, true);
+    let mut skipped = loadout.skipped.clone();
+    skipped.extend(arcane.skipped.iter().chain(&loadout.riven_skipped).cloned());
+    let (fields, heavy, count) = snapshot(&effects, &skipped, &mut types)?;
     let core = weapon::core(&fields, &mut types, target.faction, target.bracket);
     let at_location = |hit| {
-        let direct = damage::direct(&fields, &core, &types, &target, &defs, hit);
+        let mut direct = damage::direct(&fields, &core, &types, &target, &defs, hit);
+        direct["dps"] = json!(num(&direct["dps"]) * stance_damage);
         let kill = damage::kill_metrics(&fields, &core, &types, &target, &defs, hit);
-        let (status, steady) = damage::status_and_steady(&fields, &core, &types, &target, &defs, hit, &forced);
+        let (status, steady) = damage::status_and_steady(&fields, &core, &types, &target, &defs, hit, &forced, stance_status, stance_damage);
         json!({"targetDamage": direct, "killMetrics": kill, "statusProcs": status["expectedProcs"],
             "dot": status["dot"], "statusDamage": status, "statusSustained": steady})
     };
@@ -56,10 +80,13 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
             json!({"eximus": false, "noOverguard": true}))
     };
     let replay_target = Target::new(replay_target, data);
+    let replay_effects = events::Effects::prepare(&req, &loadout, &arcanes, effects.clone(), &evolution,
+        schedule.as_ref().map(|s| s.route.as_str()), &data.mechanics["infinite-conditions"]["sources"],
+        rows(&weapon.mechanics("weapon-passives")["innate"]));
     let timeline = timeline::calculate(&weapon, &evolution, &fields, &req, &replay_target,
-        replay_level, replay_steel, &replay_enhancements)?;
+        replay_level, replay_steel, &replay_enhancements, &replay_effects, schedule.as_ref(), &arcanes, stance_status, stance_damage)?;
     let mut unsupported: BTreeSet<String> = fields.unsupported.iter().chain(&evolution.notes)
-        .chain(&req.enhancement_notes).cloned().collect();
+        .chain(&req.enhancement_notes).chain(&loadout.notes).chain(&arcane.notes).cloned().collect();
     for list in [&result["targetDamage"]["unsupported"], &result["killMetrics"]["unsupported"],
         &result["statusDamage"]["unsupported"], &timeline["unsupported"]] {
         unsupported.extend(rows(list).iter().filter_map(Value::as_str).map(str::to_owned));
@@ -69,40 +96,44 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
         result["killMetrics"] = Value::Null;
     }
     let mut scenario = json!({"aiming": req.scenario.aiming, "heavyAttack": req.scenario.heavy,
-        "comboTier": req.scenario.combo, "victimStatusCount": count, "conditionalStacks": {},
+        "comboTier": req.scenario.combo, "victimStatusCount": count, "conditionalStacks": loadout.conditional_stacks,
         "distance": req.scenario.distance, "cloaked": req.scenario.cloaked, "nearestEnemyDistance": req.scenario.nearest,
         "headshot": false, "hitLocation": "body"});
     if req.scenario.spread { scenario["modelSpread"] = json!(true); }
     let selection = json!({"weapon": identity(req.weapon), "enemy": identity(&req.target), "kitgunParts": [],
-        "mods": [], "setPieces": {}, "fireMode": req.mode, "scenario": scenario, "targetLevel": req.level,
+        "mods": loadout.selection, "setPieces": loadout.set_pieces, "fireMode": req.mode, "scenario": scenario, "targetLevel": req.level,
         "armourStrip": req.strip, "elementalArmourStrip": req.elemental_strip, "steelPath": req.steel,
-        "enemyEnhancements": req.enhancements, "slotCount": req.slot_count, "arcanes": [], "stance": null, "exilus": null});
-    let modded = damage::panel(&fields, &core, &types);
-    let mut skipped = fields.skipped.clone();
+        "enemyEnhancements": req.enhancements, "slotCount": req.slot_count, "arcanes": arcane.states, "stance": stance, "exilus": loadout.exilus});
+    let mut modded = damage::panel(&fields, &core, &types);
+    if heavy.is_object() { modded = merge(modded, heavy); }
+    modded["stanceMultiplier"] = json!(stance_damage);
+    for key in ["sustainedDps", "burstDps"] { modded[key] = json!(num(&modded[key]) * stance_damage); }
+    let mut result_skipped = fields.skipped.clone();
+    result_skipped.extend(loadout.notes.iter().filter(|n| n.starts_with("exilus-mod-not-compatible-with-weapon:")).cloned());
+    let mut skipped = result_skipped.clone();
+    let mut special_slots = json!({"exilus": req.exilus_polarity});
+    if req.melee { special_slots["stance"] = req.stance_polarity.clone(); }
     if req.damage_model == "panel" { skipped.push("panel-model-target-defenses-not-applied".into()); }
     let wiki = &data.enemy_overrides["wikiEnhancements"];
     result.as_object_mut().unwrap().extend(json!({
         "buildLabel": BUILD_LABEL, "schemaVersion": SCHEMA_VERSION,
         "exportDir": data.dataset_root.join("data/export").join(BUILD_LABEL),
         "selection": selection,
-        "loadoutValidation": {"status": "checked", "valid": true, "capacity": 0, "capacityLimit": 60,
-            "remaining": 60, "slotCount": req.slot_count, "polaritySource": req.polarity_source,
-            "slotPolarities": req.slots, "assignments": [], "compatibility": "checked-from-export-ancestry",
-            "polarity": "checked", "polarityDetails": {"status": "checked", "source": req.polarity_source, "slots": req.slots}},
-        "moddedStats": modded, "unsupported": unsupported, "skipped": fields.skipped,
+        "loadoutValidation": loadout.validation,
+        "moddedStats": modded, "unsupported": unsupported, "skipped": result_skipped,
         "damageModel": req.damage_model, "exalted": null, "enemyEnhancements": req.enhancements,
-        "probability": probability(&modded), "arcanes": [], "stance": null, "exilus": null,
+        "probability": probability(&modded), "arcanes": arcane.states, "stance": stance, "exilus": loadout.exilus,
         "modelLayers": {"moddedStats": "panel", "targetDamage": "expected", "statusProcs": "expected",
             "statusSustained": "steady", "statusSustainedDps": "steady", "dotSustainedDps": "steady",
             "nonDotStatusSustainedDps": "steady", "steadyDirectDps": "steady", "totalSustainedDps": "steady",
             "killTimeline": "steady", "benchmarkTimeline": "windowed"},
-        "specialSlotPolarities": {"exilus": req.exilus_polarity}, "innateElement": null,
+        "specialSlotPolarities": special_slots, "innateElement": null,
         "innateElementCandidates": [], "incarnonChoices": evolution.choices, "incarnonPolicy": evolution.policy,
-        "diagnostics": {"unsupported": unsupported, "skipped": skipped, "capacity": 0, "polarity": "checked",
+        "diagnostics": {"unsupported": unsupported, "skipped": skipped, "capacity": loadout.base_capacity, "polarity": "checked",
             "enemyEnhancements": req.enhancements, "wikiEnhancements": {"schema": wiki["schema"],
             "status": wiki["overguard"]["status"].as_str().unwrap_or("manifest-only"),
             "unsupported": rows(&wiki["unsupported"])}},
-        "capacity": 0, "capacityLimit": 60, "benchmarkTimeline": timeline,
+        "capacity": loadout.validation["capacity"], "capacityLimit": loadout.validation["capacityLimit"], "benchmarkTimeline": timeline,
     }).as_object().unwrap().clone());
     for (key, source) in [
         ("steadyDirectDps", "directDps"), ("dotSustainedDps", "dotDps"),
@@ -112,8 +143,40 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
     ] {
         result[key] = json!(num(&result["statusSustained"][source]));
     }
-    if let Some(timeline) = damage::kill_timeline(&result) {
+    if let Some(timeline) = damage::kill_timeline(&result, &stance) {
         result["killTimeline"] = timeline;
+    }
+    if !arcanes.cards.is_empty() {
+        let duration = result["killTimeline"]["killTime"].as_f64().filter(|v| *v > 0.0).unwrap_or(30.0).min(30.0);
+        let dps = |arcane_effects: &[Effect]| -> SimResult<f64> {
+            let effects = loadout.effects(&evolution.effects, arcane_effects, false);
+            let mut types = Types::new();
+            for (name, _) in &req.forced { types.id(name); }
+            let (fields, _, _) = snapshot(&effects, &[], &mut types)?;
+            let core = weapon::core(&fields, &mut types, target.faction, target.bracket);
+            let (_, steady) = damage::status_and_steady(&fields, &core, &types, &target, &defs, HitLocation::BODY,
+                &forced, stance_status, stance_damage);
+            let total = num(&steady["totalDps"]);
+            Ok(if total != 0.0 { total } else { damage::raw_sustained_dps(&fields, &core) })
+        };
+        let baseline = dps(&[])?;
+        let mut points = Vec::new();
+        for index in 0..=40 {
+            let elapsed = duration * index as f64 / 40.0;
+            let arcane = arcanes.snapshot(&req, event_fields.as_ref().or(Some(&fields)), Some(elapsed))?;
+            let value = dps(&arcane.effects)?;
+            points.push(json!({"time": elapsed, "expectedDps": value, "dps": value, "baselineDps": baseline,
+                "gainPercent": if baseline > 0.0 { (value / baseline - 1.0) * 100.0 } else { 0.0 },
+                "expectedStacks": arcane.states.iter().map(|v| num(&v["expectedStacks"])).collect::<Vec<_>>(),
+                "uptime": arcane.states.iter().map(|v| num(&v["expectedUptime"])).collect::<Vec<_>>(),
+                "arcanes": arcane.states.iter().map(|v| json!({"query": v["query"], "expectedStacks": v["expectedStacks"],
+                    "uptime": v["expectedUptime"]})).collect::<Vec<_>>(),
+                "unsupported": arcane.notes}));
+        }
+        result["timeline"] = json!({"model": "manual-expected-target-dps", "durationSeconds": duration, "points": points,
+            "assumptions": ["on-hit/on-crit/on-headshot rates use the selected modded stats",
+                "triggerRate uses the exported chance and duration Poisson approximation",
+                "target defenses and status ticks are held at each snapshot"]});
     }
     Ok(result)
 }

@@ -4,14 +4,28 @@ use serde_json::{json, Map, Value};
 
 pub(crate) struct SimCatalog {
     weapons: Records,
+    pub mods: Records,
+    pub arcanes: Records,
+    pub utility: Records,
+    pub stances: Vec<Value>,
     enemies: Records,
 }
 
 impl SimCatalog {
     pub fn new(catalog: &Value) -> Self {
-        let index = |key: &str| rows(&catalog[key]).iter()
-            .map(|row| (text(&row["path"]).to_owned(), row.clone())).collect();
-        Self { weapons: index("weapons"), enemies: index("enemies") }
+        let index = |key: &str| -> Records { rows(&catalog[key]).iter()
+            .map(|row| (text(&row["path"]).to_owned(), row.clone())).collect() };
+        let utility = index("utilityMods");
+        let mut mods: Records = index("manualMods");
+        for (alias, path) in catalog["manualModAliases"].as_object().into_iter().flatten() {
+            if let Some(row) = mods.get(text(path)).cloned() { mods.entry(alias.clone()).or_insert(row); }
+        }
+        mods.extend(rows(&catalog["manualModVariants"]).iter().filter_map(|row| {
+            let path = text(&row["path"]);
+            (!utility.contains_key(path)).then(|| (path.to_owned(), row.clone()))
+        }));
+        Self { weapons: index("weapons"), enemies: index("enemies"), mods,
+            arcanes: index("arcanes"), utility, stances: rows(&catalog["stances"]).to_vec() }
     }
 }
 
@@ -30,6 +44,9 @@ pub(super) struct Scenario<'a> {
 }
 
 pub(super) struct Request<'a> {
+    pub body: &'a Map<String, Value>,
+    pub melee: bool,
+    pub stance_polarity: Value,
     pub weapon: &'a Value,
     pub mode: usize,
     pub target: Value,
@@ -156,13 +173,28 @@ impl<'a> Request<'a> {
         let state = scenario_value("combatState").map(|v| object(v, "combatState")).transpose()?;
         if let Some(state) = state {
             check_keys(state, &["gaugeChargingHeadshots", "channeling", "overshields", "frameArmor", "sprintMultiplier",
-                "energyPool", "aimGliding", "sliding", "infiniteAmmo", "zymosChildOverlap"], "combatState")?;
-            for key in ["channeling", "overshields", "aimGliding", "sliding", "infiniteAmmo"] {
+                "energyPool", "frameShield", "aimGliding", "sliding", "infiniteAmmo", "zymosChildOverlap",
+                "meleeRoute", "meleeStance", "meleeCombo", "meleeTargetDistance", "selfShieldBreakForced",
+                "selfShieldBreakAt", "selfShieldBreakInterval", "selfOverguardBreakAt", "selfOverguardBreakInterval",
+                "selfShieldHitAt", "selfShieldHitInterval", "equipFromPrimaryAt", "equipFromPrimaryInterval",
+                "abilityUseAt", "abilityUseInterval", "energySpent", "energySpendPerSecond", "abilityUses"], "combatState")?;
+            for key in ["channeling", "overshields", "aimGliding", "sliding", "infiniteAmmo", "selfShieldBreakForced"] {
                 boolean(state.get(key), &format!("combatState.{key}"))?;
             }
-            for key in ["frameArmor", "sprintMultiplier", "energyPool"] {
+            for key in ["frameArmor", "frameShield", "sprintMultiplier", "energyPool", "energySpent", "energySpendPerSecond",
+                "selfShieldBreakAt", "selfShieldBreakInterval", "selfOverguardBreakAt", "selfOverguardBreakInterval",
+                "selfShieldHitAt", "selfShieldHitInterval", "equipFromPrimaryAt", "equipFromPrimaryInterval",
+                "abilityUseAt", "abilityUseInterval"] {
                 if let Some(v) = state.get(key) { number(v, &format!("combatState.{key}"), 0.0, f64::MAX)?; }
             }
+            if let Some(v) = state.get("abilityUses") { integer(v, "combatState.abilityUses", 0, 100000)?; }
+            if let Some(route) = state.get("meleeRoute") {
+                if !super::melee::ROUTES.contains(&text(route)) { return Err("meleeRoute 无效".into()); }
+            }
+            for key in ["meleeStance", "meleeCombo"] {
+                if state.get(key).is_some_and(|v| !v.is_string()) { return Err(format!("{key} 必须为字符串")); }
+            }
+            if let Some(v) = state.get("meleeTargetDistance") { number(v, "meleeTargetDistance", 0.0, f64::MAX)?; }
             if state.get("zymosChildOverlap").is_some_and(|v| v != "off") {
                 return Err("当前模拟支持邪莫斯的默认直接命中和寄生爆炸".into());
             }
@@ -205,27 +237,26 @@ impl<'a> Request<'a> {
             (slots.as_slice(), "payload")
         };
         if slots.len() < slot_count { return Err("武器栏位极性数据不完整".into()); }
-        let mut exilus_polarity = weapon["polarities"][8].clone();
+        let melee = matches!(text(&weapon["slot"]), "melee" | "arch_melee" | "space_melee" | "archmelee" | "spacemelee");
+        let mut stance_polarity = if melee { weapon["polarities"][8].clone() } else { Value::Null };
+        let mut exilus_polarity = weapon["polarities"][if melee { 9 } else { 8 }].clone();
         if !get("specialSlotPolarities").is_null() {
             let special = object(get("specialSlotPolarities"), "specialSlotPolarities")?;
-            check_keys(special, &["exilus"], "specialSlotPolarities")?;
-            if let Some(v) = special.get("exilus") {
+            check_keys(special, if melee { &["exilus", "stance"] } else { &["exilus"] }, "specialSlotPolarities")?;
+            for (key, polarity) in [("exilus", &mut exilus_polarity), ("stance", &mut stance_polarity)] {
+                let Some(v) = special.get(key) else { continue; };
                 let allowed = ["AP_ATTACK", "AP_DEFENSE", "AP_TACTIC", "AP_UMBRA", "AP_POWER",
                     "AP_WARD", "AP_PRECEPT", "AP_UNIVERSAL", "AP_ANY"];
-                if !v.is_null() && !allowed.contains(&text(v)) { return Err("exilus 极性无效".into()); }
-                exilus_polarity = v.clone();
+                if !v.is_null() && !allowed.contains(&text(v)) { return Err(format!("{key} 极性无效")); }
+                *polarity = v.clone();
             }
         }
-        // 复杂配装与近战路由由后续阶段接入，避免返回未应用请求的伤害。
-        if !mods.is_empty() || ["kitgunParts", "arcanes", "externalBuffs"].iter().any(|key| {
+        if ["kitgunParts", "externalBuffs"].iter().any(|key| {
             !get(key).is_null() && get(key).as_array().is_none_or(|v| !v.is_empty())
-        }) || ["riven", "exilus", "stancePath", "innateElement"].iter().any(|key| !get(key).is_null()) {
+        }) || !get("innateElement").is_null() {
             return Err("当前模拟范围未支持此配装".into());
         }
-        if !matches!(text(&weapon["slot"]), "primary" | "secondary" | "arch_gun") || scenario.heavy {
-            return Err("当前模拟范围仅支持远程射击".into());
-        }
-        Ok(Self { weapon, mode, target, damage_model, enhancements, enhancement_notes, level, steel,
+        Ok(Self { body, melee, stance_polarity, weapon, mode, target, damage_model, enhancements, enhancement_notes, level, steel,
             strip: strip_ratio(body, "armourStrip", "armorStrip")?,
             elemental_strip: strip_ratio(body, "elementalArmourStrip", "elementalArmorStrip")?,
             aim, window, forced, scenario, slot_count,

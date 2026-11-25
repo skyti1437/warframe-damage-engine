@@ -143,6 +143,9 @@ pub trait ReplayProvider {
                       _weights: Vec<(i64, f64)>) -> ReplayResult<Vec<(ObjectId, ObjectId, f64)>> {
         Err(missing_provider("zymos_children"))
     }
+    /// 调用方可直接从效果重算实时异况属性，省去整数档缓存。
+    fn supports_co_variants(&self) -> bool { true }
+    fn melee_starting_tier(&self) -> u64 { 0 }
     fn check_signals(&self) -> ReplayResult<()> {
         Ok(())
     }
@@ -540,7 +543,7 @@ struct Source {
 }
 
 /// 触发来源的初始值和规则。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SourceInput {
     pub id: ObjectId,
     pub kind: Option<String>,
@@ -719,6 +722,8 @@ struct Replay<'a> {
     melee_heavy_multiplier: f64,
     melee_last_hit: f64,
     melee_combo_at: f64,
+    melee_recovered: f64,
+    melee_events: Vec<MeleeEvent>,
     melee_recovery_token: u64,
     melee_recovery_initial: f64,
     melee_buff_boundary: f64,
@@ -1433,7 +1438,7 @@ impl Replay<'_> {
         // 非整数的活跃状态数仅缩放异况超量效果组，从向上取整后的属性视图派生。
         let ceil = live_types.ceil();
         // Onos 在 `apply_mods` 后缩放已结算伤害，禁用此处的异况超量变体。
-        if self.live_types_enabled && self.onos.is_none() && ceil >= 1.0 && live_types != ceil && ceil.is_finite() {
+        if self.live_types_enabled && self.provider.supports_co_variants() && self.onos.is_none() && ceil >= 1.0 && live_types != ceil && ceil.is_finite() {
             let template_extra = extra.clone();
             let (active, radial) = self.model_at(key.0.clone(), template_extra, ceil)?;
             if let Some(a) = self.vary(active, live_types, ceil) {
@@ -1807,6 +1812,7 @@ impl Replay<'_> {
             self.melee_count = pmin(initial,before+pmax(0.0,t-self.melee_combo_at)*spec.recovery_per_second);
             if let Some(target) = snap { self.melee_count=pmax(self.melee_count,pmin(initial,target)); }
         }
+        self.melee_recovered += self.melee_count - before;
         self.melee_combo_at = t;
         let tier_after = spec.tier(self.melee_count);
         if tier_after > tier_before {
@@ -3053,6 +3059,20 @@ fn indexed_add<K: Eq + std::hash::Hash + Copy>(list: &mut Vec<(K, f64)>, index: 
 }
 
 impl Enervate {
+    fn sample(&self) -> EnervateSample {
+        let damage = self.damage_marginal();
+        EnervateSample {
+            stacks: psum(damage.iter().map(|(n, p)| *n as f64 * p)),
+            big_crits: psum(self.states.iter().map(|((_, n), p)| *n as f64 * p)),
+            resets: self.resets,
+            hits: self.hits,
+            fractional_hits: self.timed_states.is_some(),
+            mass: psum(self.states.iter().map(|(_, p)| *p)),
+            states: self.states.len(),
+            uptime: 1.0 - damage.iter().find(|(n, _)| *n == 0).map_or(0.0, |(_, p)| *p),
+        }
+    }
+
     fn marginal(&self) -> Vec<(i64, f64)> {
         let mut out = Vec::new();
         for &((s, _), p) in &self.states {
@@ -3213,9 +3233,23 @@ fn armour_reduction(armour: f64) -> f64 {
     0.9 * (effective / 2700.0).sqrt()
 }
 
+/// 次要侵蚀在采样时刻的联合概率状态摘要。
+#[derive(Clone)]
+pub struct EnervateSample {
+    pub stacks: f64,
+    pub big_crits: f64,
+    pub resets: f64,
+    pub hits: f64,
+    pub fractional_hits: bool,
+    pub mass: f64,
+    pub states: usize,
+    pub uptime: f64,
+}
+
 /// 供展示使用的离散采样点，按事件队列的入队顺序处理同一时刻的事件。
 #[derive(Clone)]
 pub struct Sample {
+    pub enervate: Option<EnervateSample>,
     pub time: f64,
     pub pools: [f64; 3],
     pub stacks: [f64; 6],
@@ -3270,6 +3304,7 @@ impl Replay<'_> {
             *total += stack * dt;
         }
         timeline.points.push(Sample {
+            enervate: self.enervate.as_ref().map(Enervate::sample),
             time: round_decimal(time, 6), pools: self.pools, stacks, armour, heat_strip,
             puncture_strip: self.puncture_strip, heat_seed: self.heat_chains.seed(),
             puncture_crit, cold_crit, frozen: self.frozen_until > time,
@@ -3730,13 +3765,22 @@ impl Replay<'_> {
                     if self.melee.is_some() {
                         let pending = match self.melee_pending {
                             None => {
-                                self.melee_count = pmin((pmax(0.0,self.stats[active].initial_combo) as f32).trunc() as f64, self.melee.as_ref().unwrap().cap);
+                                let spec = self.melee.as_ref().unwrap();
+                                let initial = pmin((pmax(0.0, self.stats[active].initial_combo) as f32).trunc() as f64, spec.cap);
+                                self.melee_count = initial;
+                                let starting_tier = self.provider.melee_starting_tier();
+                                let (active, speed) = if starting_tier > 0 {
+                                    let points = spec.base_hits + (starting_tier - 1) as f64 * spec.tier_step;
+                                    self.melee_count = pmax(initial, pmin(spec.cap, points));
+                                    let (active, _) = self.model(t)?;
+                                    (active, self.stats[active].fire_rate)
+                                } else { (active, speed) };
                                 self.melee_combo_at = t;
                                 let (charge, projectile) =
                                     (self.stats[active].heavy_charge_speed, self.stats[active].projectile_speed_multiplier);
                                 let (hit, wait) = self.melee_next(speed, charge, projectile)?;
                                 self.melee_pending = Some(hit);
-                                self.melee_recovery_initial=self.melee_count;
+                                self.melee_recovery_initial = initial;
                                 self.sync_melee_recovery(t)?;
                                 self.push(t + wait, Kind::Fire, None);
                                 continue;
@@ -4504,7 +4548,8 @@ impl Replay<'_> {
                         delay = if s.reload_time != 0.0 { s.reload_time } else { 1.0 / speed };
                     }
                     if let Some(hit) = melee_hit {
-                        let tier_before = self.melee.as_ref().unwrap().tier(self.melee_count);
+                        let before = self.melee_count;
+                        let tier_before = self.melee.as_ref().unwrap().tier(before);
                         let s = &self.stats[active];
                         let gained = hit.combo_hits * (1.0 + pmax(s.combo_extra_chance, 0.0));
                         self.melee_count += gained * pmin(pmax(1.0 - s.combo_miss_chance, 0.0), 1.0);
@@ -4537,7 +4582,14 @@ impl Replay<'_> {
                         if hit.phase & 2 != 0 {
                             self.signal("on-melee-slam", t, 1.0);
                         }
-                        if self.hit_spec(hit.id)?.throw {
+                        let hit_spec = self.hit_spec(hit.id)?;
+                        if self.timeline.is_some() && self.melee_events.len() < 400 {
+                            self.melee_events.push(MeleeEvent { id: hit.id, time: t, combo: self.melee_count,
+                                before, regenerated: self.melee_recovered,
+                                multiplier: if hit_spec.combo_multiplier { self.melee_heavy_multiplier } else { 1.0 } });
+                        }
+                        self.melee_recovered = 0.0;
+                        if hit_spec.throw {
                             // 奋力一掷在循环中缓存每次投掷事件。
                             self.signal("on-glaive-throw", t, 1.0);
                         }
@@ -4683,6 +4735,7 @@ pub struct DirectBakeStreamInput {
     pub trajectory: TrajectoryInput,
 }
 
+#[derive(Clone)]
 pub struct EnervateInput {
     pub reset_after: i64,
     pub min_interval: f64,
@@ -4802,6 +4855,8 @@ fn prepare_replay(input: TrajectoryInput, provider: &dyn ReplayProvider) -> Repl
         melee_heavy_multiplier: 1.0,
         melee_last_hit: f64::NEG_INFINITY,
         melee_combo_at: 0.0,
+        melee_recovered: 0.0,
+        melee_events: Vec::new(),
         melee_recovery_token: 0,
         melee_recovery_initial: 0.0,
         melee_buff_boundary: f64::INFINITY,
@@ -5095,7 +5150,19 @@ pub struct TrajectoryOutput {
     pub averaged_stacks: [f64; 6],
 }
 
+#[derive(Clone)]
+
+pub struct MeleeEvent {
+    pub id: i64,
+    pub time: f64,
+    pub combo: f64,
+    pub before: f64,
+    pub regenerated: f64,
+    pub multiplier: f64,
+}
+
 pub struct TrajectoryDetails {
+    pub melee_events: Vec<MeleeEvent>,
     pub fortifier: (f64, f64, f64),
     pub empowered: (f64, NamedDamage),
     pub cryogenic_expected: f64,
@@ -5106,6 +5173,7 @@ pub struct TrajectoryDetails {
     pub mines: (i64, f64, f64, i64),
     pub field_duration: (i64, bool),
     pub enervate: Option<(Vec<(i64, i64, f64)>, f64, f64, f64)>,
+    pub enervate_sample: Option<EnervateSample>,
     pub gen: i64,
     pub weak_kill_events: f64,
     pub finite_field_packets: Vec<u64>,
@@ -5155,6 +5223,7 @@ fn run_trajectory(input: TrajectoryInput, provider: &dyn ReplayProvider, step: O
     let details = (!replay.score_only).then(|| {
         let pending = psum(replay.pending_mines.iter().map(|m| replay.stats[m.0].multishot));
         TrajectoryDetails {
+            melee_events: std::mem::take(&mut replay.melee_events),
             fortifier: (replay.fortifier_damage, replay.fortifier_stolen, replay.self_overguard),
             empowered: (replay.empowered_count, names(&replay.empowered_by_type)),
             cryogenic_expected: replay.cryogenic_expected,
@@ -5164,6 +5233,7 @@ fn run_trajectory(input: TrajectoryInput, provider: &dyn ReplayProvider, step: O
             projectiles: replay.projectiles.map(|p| (p.deployed, p.merged, p.explosions, p.singularities, p.child_projectiles)),
             mines: (replay.detonations, pending, replay.waiting_mines, replay.mine_overflows),
             field_duration: (replay.field_duration_used, replay.field_duration_ready),
+            enervate_sample: replay.enervate.as_ref().map(Enervate::sample),
             enervate: replay.enervate.map(|en| {
                 let states = en.states.into_iter().map(|((s, b), p)| (s, b, p)).collect();
                 (states, en.hits, en.resets, en.last)
