@@ -14,6 +14,8 @@ pub(super) struct Arcane<'a> {
     pub rank: u64,
     pub stacks: Option<u64>,
     pub uptime: Option<f64>,
+    trigger_rate: Option<f64>,
+    analysis_query: Option<String>,
 }
 
 pub(super) struct Equipped<'a> {
@@ -60,14 +62,26 @@ pub(super) fn applies(arcane: &Value, req: &Request<'_>, frame: bool) -> bool {
 
 impl<'a> Equipped<'a> {
     pub fn resolve(data: &'a EngineData, catalog: &SimCatalog, req: &Request<'_>) -> SimResult<Self> {
+        Self::resolve_mode(data, catalog, req, false)
+    }
+
+    pub fn resolve_analysis(data: &'a EngineData, catalog: &SimCatalog, req: &Request<'_>) -> SimResult<Self> {
+        Self::resolve_mode(data, catalog, req, true)
+    }
+
+    fn resolve_mode(data: &'a EngineData, catalog: &SimCatalog, req: &Request<'_>, analysis: bool) -> SimResult<Self> {
         let raw = req.body.get("arcanes").map_or(Some(&[][..]), |v| v.as_array().map(Vec::as_slice))
             .filter(|v| v.len() <= 4).ok_or("arcanes 必须为至多 4 项的数组")?;
         let mut result = Self { cards: Vec::new(), ignored: Vec::new() };
         let mut seen = HashSet::new();
         let mut counts = [0, 0];
         for item in raw {
-            let path = query(item);
-            let meta = catalog.arcanes.get(path).ok_or("arcanes 必须使用已支持的赋能路径")?;
+            let original = if analysis { item["query"].as_str().filter(|text| !text.trim().is_empty())
+                .unwrap_or_else(|| query(item)).trim() } else { query(item) };
+            let meta = catalog.arcanes.get(original).or_else(|| analysis.then(|| catalog.arcanes.values().find(|row|
+                ["path", "nameEn", "nameInternal", "nameZh"].iter().any(|key| text(&row[*key]).eq_ignore_ascii_case(original))
+            )).flatten()).ok_or("arcanes 必须使用已支持的赋能路径")?;
+            let path = text(&meta["path"]);
             if !seen.insert(path) { return Err("不能重复装备同一赋能".into()); }
             let frame = meta["slotKind"] == "warframe";
             counts[frame as usize] += 1;
@@ -80,19 +94,27 @@ impl<'a> Equipped<'a> {
                 result.ignored.push(format!("arcane-not-for-this-weapon:{path}"));
                 continue;
             }
-            if item.get("rank") == Some(&Value::Null) { return Err("赋能等级必须为整数".into()); }
+            if !analysis && item.get("rank") == Some(&Value::Null) { return Err("赋能等级必须为整数".into()); }
             let rank = ranked(&item["rank"], meta["maxRank"].as_u64().unwrap_or(0), "赋能等级")?;
-            if item.get("triggerRate").is_some() { return Err("赋能触发率由面板推导".into()); }
+            if !analysis && item.get("triggerRate").is_some() { return Err("赋能触发率由面板推导".into()); }
+            let trigger_rate = item.get("triggerRate").filter(|v| !v.is_null()).map(|v| {
+                if item.get("stacks").is_some() || item.get("uptime").is_some() {
+                    return Err("triggerRate cannot be combined with stacks or uptime");
+                }
+                v.as_f64().or_else(|| v.as_str().and_then(|v| v.parse().ok()))
+                    .filter(|v| v.is_finite() && *v >= 0.0).ok_or("triggerRate must be finite and non-negative")
+            }).transpose()?;
             let stacks = if item["stacks"].is_null() { None } else {
                 let stacks = item["stacks"].as_u64().ok_or("赋能 stacks 必须为非负整数")?;
                 let max = if arcane_status::enervate(record, rank) { u64::MAX }
                     else { runtime(record, rank).map_or_else(|| cap(&meta["trigger"]), |r| r.cap) };
-                Some(stacks.min(max))
+                Some(if analysis { stacks } else { stacks.min(max) })
             };
             let uptime = if item["uptime"].is_null() { None } else {
                 Some(item["uptime"].as_f64().filter(|v| (0.0..=1.0).contains(v)).ok_or("赋能 uptime 必须在 0 到 1 之间")?)
             };
-            result.cards.push(Arcane { record, rank, stacks, uptime });
+            result.cards.push(Arcane { record, rank, stacks, uptime, trigger_rate,
+                analysis_query: analysis.then(|| original.to_owned()) });
         }
         Ok(result)
     }
@@ -113,7 +135,14 @@ impl<'a> Equipped<'a> {
             let crux = arcane_status::crux(arcane);
             let compression = arcane_status::compression(arcane, card.rank);
             let implicit = card.stacks.is_none() && card.uptime.is_none();
-            let (stacks, uptime) = if implicit {
+            let analysis = card.analysis_query.is_some();
+            let implicit_heavy = analysis && req.melee && req.weapon["heavyAttack"].is_object()
+                && card.trigger_rate.is_none() && implicit && !enervate;
+            let (stacks, uptime) = if implicit_heavy {
+                let max = trigger["maxStacks"].as_u64().or_else(|| rows(&arcane["conditionalEffects"]).iter()
+                    .map(super::loadout::cap).max()).unwrap_or(0);
+                (max, 1.0)
+            } else if implicit && !analysis {
                 runtime.as_ref().map_or((0, 1.0), |r| r.default(req))
             } else { (card.stacks.unwrap_or(0), card.uptime.unwrap_or(1.0)) };
             let duration = num(&trigger["duration"]);
@@ -122,13 +151,13 @@ impl<'a> Equipped<'a> {
             let cond = condition_text(trigger);
             let kinds = modeled_kinds(arcane);
             let kind = rate_kind(arcane, Some(req));
-            let inferred = if implicit && runtime.is_none() {
+            let inferred = if card.trigger_rate.is_some() { card.trigger_rate } else if implicit && runtime.is_none() && !analysis {
                 fields.zip(kind).map(|(f, kind)| {
                     let hits = f.fire_rate.f().max(0.0) * if f.multishot == 0.0 { 1.0 } else { f.multishot.max(0.0) };
                     hits * match kind { "crit" => f.crit_chance.f().clamp(0.0, 1.0), "headshot" => req.aim, _ => 1.0 }
                 })
             } else { None };
-            if implicit && runtime.is_none() && kind.is_none() && !truth(&arcane["effects"]) && kinds.is_empty() && crux.is_none() && compression.is_none() {
+            if !analysis && implicit && runtime.is_none() && kind.is_none() && !truth(&arcane["effects"]) && kinds.is_empty() && crux.is_none() && compression.is_none() {
                 out.notes.push(format!("arcane-state-{index}-trigger-rate-required"));
             }
             let (stacks, effect_share, expected_stacks, expected_uptime) = if let Some(rate) = inferred.filter(|_| !enervate) {
@@ -147,16 +176,16 @@ impl<'a> Equipped<'a> {
                 let stacks = expected.ceil() as u64;
                 (stacks, if stacks > 0 { expected / stacks as f64 } else { 0.0 }, expected, 1.0 - p0)
             } else { (stacks, uptime, stacks as f64 * uptime, if stacks > 0 { uptime } else { 0.0 }) };
-            let mut state = merge(identity(arcane), json!({"query": path, "rank": card.rank, "stacks": stacks,
+            let mut state = merge(identity(arcane), json!({"query": card.analysis_query.as_deref().unwrap_or(path), "rank": card.rank, "stacks": stacks,
                 "uptime": if inferred.is_some() && !enervate { expected_uptime } else { uptime },
-                "mode": if inferred.is_some() { "expected" } else { "manual" },
+                "mode": if inferred.is_some() { "expected" } else if implicit_heavy { "manual-default-max" } else { "manual" },
                 "triggerRate": inferred.unwrap_or(0.0), "expectedStacks": expected_stacks, "expectedUptime": expected_uptime,
                 "active": false, "effectCount": 0, "applied": false}));
             if trigger.is_object() {
                 state = merge(state, json!({"triggerChance": chance, "durationSeconds": duration, "maxStacks": cap,
                     "stackMode": text(&trigger["stackMode"]), "triggerCondition": cond}));
             }
-            if inferred.is_some() { state["triggerSource"] = json!("derived-from-manual-stats"); }
+            if inferred.is_some() && !analysis { state["triggerSource"] = json!("derived-from-manual-stats"); }
             if truth(&arcane["unresolvedReferences"]) {
                 out.notes.push(format!("arcane-state-{index}-has-unresolved-references"));
                 out.states.push(state);

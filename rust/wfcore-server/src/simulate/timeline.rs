@@ -97,19 +97,19 @@ impl Provider<'_> {
                 if num(&part["armingDistance"]) > self.weapon.req.scenario.distance.unwrap_or(f64::INFINITY) {
                     continue;
                 }
-                let part = self.part(index, mode, &profile, &effects, part, PartKind::Radial)?;
+                let part = self.part(index, mode, &profile, &effects, part, PartKind::Radial, ceiling)?;
                 radials.push(views.push(part));
             }
         }
         if let Some(part) = profile.get("lingering").filter(|v| v.is_object()) {
-            let field = self.part(index, mode, &profile, &effects, part, PartKind::Field)?;
+            let field = self.part(index, mode, &profile, &effects, part, PartKind::Field, ceiling)?;
             packet.lingering = Some((views.push(field), num(&part["tick_rate"]), num(&part["duration_seconds"])));
         }
         // 档案中的末端爆炸与变形主弹各自结算，但使用同一份暴击和触发面板基值。
         let cycle = self.weapon.incarnon;
         if self.weapon.is_incarnon(index) && radials.is_empty()
             && matches!(text(&cycle["referenceId"]), "burston_incarnon" | "burston_prime_incarnon") {
-            radials.push(views.push(self.part(index, mode, &profile, &effects, &cycle["radial"], PartKind::Terminal)?));
+            radials.push(views.push(self.part(index, mode, &profile, &effects, &cycle["radial"], PartKind::Terminal, ceiling)?));
         }
         let radial = radials.first().copied();
         if let Some(id) = radial { views.packets[id].additional.extend(radials.into_iter().skip(1)); }
@@ -119,7 +119,7 @@ impl Provider<'_> {
     }
 
     fn part(&self, index: usize, source: &Value, profile: &Value, effects: &[Effect],
-            part: &Value, kind: PartKind) -> SimResult<Packet> {
+            part: &Value, kind: PartKind, status_count: f64) -> SimResult<Packet> {
         let mut mode = source.clone();
         let damage = &mut mode["damage"];
         damage["types"] = Value::Object(named(&part["damage"]).into_iter()
@@ -144,7 +144,11 @@ impl Provider<'_> {
         let effects: Vec<_> = effects.iter().filter(|effect| {
             !(kind == PartKind::Field && effect.upgrade == "WEAPON_DAMAGE_AMOUNT" && effect.operation == "ADD_BASE")
         }).cloned().collect();
-        let mut fields = self.weapon.reduce(index, &mode, profile, &effects, false, 0.0, true, false, &[])?;
+        // The fallback terminal burst uses its zero-status launch snapshot.
+        let status_count = if kind != PartKind::Terminal && part["takes_condition_overload"] == true {
+            status_count
+        } else { 0.0 };
+        let mut fields = self.weapon.reduce(index, &mode, profile, &effects, false, status_count, true, false, &[])?;
         if part["takes_multishot"] == false || kind == PartKind::Terminal { fields.multishot = 1.0; }
         if let Some(count) = part["count"].as_f64().filter(|v| *v != 0.0) { fields.multishot *= count; }
         fields.weakpoint_damage_bonus = 0.0;
@@ -278,8 +282,21 @@ pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &Mod
                          req: &Request<'_>, target: &Target<'_>, level: u64, steel: bool, enhancements: &Value,
                          effects: &Effects, schedule: Option<&Schedule>, arcanes: &arcane::Equipped<'_>,
                          status_rate: f64, damage_rate: f64, score_only: bool) -> SimResult<Value> {
+    replay_window(weapon, evolution, fields, req, target, level, steel, enhancements, effects, schedule, arcanes,
+        status_rate, damage_rate, if score_only { Output::Kpm } else { Output::Timeline }, 16)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Output { Timeline, Kpm, Dps, LifeCurve }
+
+pub(super) fn replay_window(weapon: &Weapon<'_>, evolution: &Evolution, fields: &ModdedFields,
+    req: &Request<'_>, target: &Target<'_>, level: u64, steel: bool, enhancements: &Value,
+    effects: &Effects, schedule: Option<&Schedule>, arcanes: &arcane::Equipped<'_>,
+    status_rate: f64, damage_rate: f64, output: Output, kill_branches: usize) -> SimResult<Value> {
+    let score_only = matches!(output, Output::Kpm | Output::Dps);
     let defenses = target.defenses(level, steel, req.strip, 0.0, enhancements);
-    let full = defenses.full;
+    let mut full = defenses.full;
+    full[2] *= enhancements["healthScale"].as_f64().unwrap_or(1.0);
     let ehp = psum(full);
     let profile = weapon.profile(req.mode);
     let base_profile = weapon.profile(0);
@@ -336,6 +353,16 @@ pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &Mod
     let melee_rate = schedule.map(|_| provider.views.borrow().packets[initial].fields.fire_rate.f());
     let battery = &profile["battery"];
     let shell = &profile;
+    let rate_spool = (req.mode == 0 && !is_incarnon).then(|| profile.get("fireRateSpool")).flatten().map(|profile| {
+        let start = profile["start"].as_f64().unwrap_or(1.0);
+        let end = profile["end"].as_f64().unwrap_or(1.0);
+        if let Some(maximum) = profile["nativeMaxShots"].as_u64().filter(|&n| n > 0) {
+            replay::RateSpoolSpec::Native { start:start as f32, end:end as f32, maximum:maximum as u32,
+                source_rpm:num(&profile["sourceRpm"]), source_rate:profile["sourceRate"].as_f64().unwrap_or(1.0) }
+        } else {
+            replay::RateSpoolSpec::Reference { start, end, over:profile["overShots"].as_f64().unwrap_or(1.0) }
+        }
+    });
     let co = &weapon.reference["coProfiles"][weapon.path];
     let status_pool: Vec<_> = if encumber.is_some() || empowered.is_some() {
         arcane_status::STATUS_POOL.into_iter().map(|name| types.id(name)).collect()
@@ -364,6 +391,7 @@ pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &Mod
             target_faction: target.faction.to_owned(), faction_bracket: target.bracket,
             tables: target.tables(&types, None, Vec::new()),
             battery: battery["regenPerSecond"].as_f64().map(|regen| (num(&battery["delayEmptySeconds"]), regen, num(&battery["delayPartialSeconds"]))),
+            rate_spool,
             shell: shell["reloadPerShell"].as_f64().map(|v| (num(&shell["reloadStart"]), v, num(&shell["reloadEnd"]))),
             shell_mode_switch: truth(&shell["modeSwitchLoadsShell"]), cycle,
             head: req.aim, status_rate_multiplier: if schedule.is_some() { 1.0 } else { status_rate },
@@ -381,10 +409,10 @@ pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &Mod
             blocks_radiation: target.record["path"] == "/Lotus/Types/Enemies/Grineer/Disruption/Avatars/DemoDevourerAvatar",
             encumber, cryogenic: cryogenic.map(|(stacks, uptime, _)| (stacks, uptime)), empowered, fortifier, enervate: enervate.clone(),
             status_pool: status_pool.clone(), actor_events: actor_events.clone(), energy_rate: num(state("energySpendPerSecond")),
-            sources: sources.clone(), types: types.clone(), initial, score_only,
+            sources: sources.clone(), types: types.clone(), initial, score_only, life_curve: matches!(output, Output::LifeCurve),
             ..TrajectoryInput::default()
         };
-        let output = if score_only { replay::trajectory(input, &provider) }
+        let output = if !matches!(output, Output::Timeline) { replay::trajectory(input, &provider) }
             else { replay::trajectory_sampled(input, &provider) }
             .map_err(|error| error.to_string())?;
         Ok::<_, String>(output)
@@ -394,14 +422,20 @@ pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &Mod
     };
     let golden = (5.0_f64.sqrt() - 1.0) / 2.0;
     let first = run(feedback.then_some((true, 0.0, golden, track_kills)))?;
+    if matches!(output, Output::LifeCurve) {
+        return Ok(json!({"targetTotalEhp": ehp,
+            "curve": first.details.and_then(|details| details.life_curve)}));
+    }
     let branches = if feedback && first.weak_uncertainty >= 0.05 {
-        Some((0..16).map(|i| run(Some((false, (i as f64 + 0.5) / 16.0, golden, true))))
+        Some((0..kill_branches).map(|i| run(Some((false, (i as f64 + 0.5) / kill_branches as f64, golden, true))))
             .collect::<SimResult<Vec<_>>>()?)
     } else { None };
     if score_only {
-        let kpm = |output| kills(output) * 60.0 / req.window;
-        let score = branches.as_ref().map_or_else(|| kpm(&first), |outputs| {
-            psum(outputs.iter().map(kpm)) / outputs.len() as f64
+        let score = |result: &replay::TrajectoryOutput| if matches!(output, Output::Dps) {
+            psum(result.totals) / req.window
+        } else { kills(result) * 60.0 / req.window };
+        let score = branches.as_ref().map_or_else(|| score(&first), |outputs| {
+            psum(outputs.iter().map(score)) / outputs.len() as f64
         });
         return Ok(json!(score));
     }
@@ -469,6 +503,12 @@ pub(super) fn calculate(weapon: &Weapon<'_>, evolution: &Evolution, fields: &Mod
             "magnetic-break-ordinary-electric-source-context", "electric-gas-adjacent-count-arrival",
             "gas-mixed-duration-cumulative-newer-rank", "spread-hit-loss-not-modeled",
         ];
+        if let Some(spool) = rate_spool {
+            if matches!(spool, replay::RateSpoolSpec::Reference { .. }) {
+                limitations.push("fire-rate-spool-reference-transcribed");
+            }
+            limitations.push("fire-rate-spool-resets-on-any-pause");
+        }
         if enervate_card.is_some() { limitations.extend(arcane_status::ENERVATE_ASSUMPTIONS); }
         if encumber.is_some() { limitations.extend(["encumber-poisson-status-presence", "encumber-single-target-expected-procs"]); }
         if cryogenic.is_some() { limitations.push("cryogenic-single-target-expected-procs-no-neighbor-burst"); }

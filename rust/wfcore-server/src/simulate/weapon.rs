@@ -372,7 +372,9 @@ impl Evolution {
         for (index, condition) in conditions.iter().enumerate() {
             let source = condition["sourcePath"].as_str().unwrap_or(path);
             let effects = rows(&condition["effects"]);
-            if passive_condition(condition) || actor_gate(condition, state).is_some() || effects.iter().any(|row| row["upgradeType"] == "WEAPON_LAST_MULTISHOT") {
+            if passive_condition(condition) || actor_gate(condition, state).is_some()
+                || (!truth(&condition["conditions"]) && !truth(&condition["runtimeScripts"]) && !truth(&condition["conditionTag"]))
+                || effects.iter().any(|row| row["upgradeType"] == "WEAPON_LAST_MULTISHOT") {
                 continue;
             }
             if text(&condition["runtimeScripts"]["apply"]["Script"]).ends_with("/OnLastBurstCondition.lua") {
@@ -464,6 +466,11 @@ impl<'a> Weapon<'a> {
         let mut profile = if self.is_incarnon(index) && !truth(&selected["allowIncarnon"]) {
             json!({})
         } else { selected.as_object().map_or_else(|| json!({}), |m| Value::Object(m.clone())) };
+        if index == 0 {
+            if let Some(spool) = self.data.rules.fire_rate_spool[self.path].as_object() {
+                profile.as_object_mut().unwrap().extend(spool.clone());
+            }
+        }
         let cadence = &self.reference["cadenceProfiles"][self.path];
         if cadence["fireMode"] == index {
             profile.as_object_mut().unwrap().extend(cadence.as_object().unwrap().clone());

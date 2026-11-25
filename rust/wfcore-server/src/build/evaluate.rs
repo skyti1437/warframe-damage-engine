@@ -3,14 +3,56 @@ use super::{json, EngineData, Map, Request, SimResult, Target, Value};
 use super::cards::{Card, Riven};
 use super::weapon::{Effect, Evolution, Weapon};
 use indexmap::IndexMap;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use wfcore_lib::{mods::ModdedFields, replay::Types, tables};
+use wfcore_lib::sustained::{sustained_status, SustainedInput};
 
 #[derive(Clone, Copy)]
 pub(super) enum Metric<'a> {
     Events,
+    WindowDps,
     Proxy,
     Panel(&'a str),
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct HardnessNode {
+    pub seconds: f64,
+    pub scale: f64,
+    pub spread: f64,
+    pub weight: f64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ReplayOptions<'a> {
+    pub scale: Option<f64>,
+    pub nodes: &'a [HardnessNode],
+    pub branches: usize,
+    pub evaluations: Option<&'a Cell<usize>>,
+    pub deadline: Option<Instant>,
+    pub limited: Option<&'a Cell<usize>>,
+    pub memo: Option<&'a super::search::BeamMemo>,
+}
+
+impl Default for ReplayOptions<'_> {
+    fn default() -> Self {
+        Self { scale: None, nodes: &[], branches: 16, evaluations: None, deadline: None, limited: None, memo: None }
+    }
+}
+
+impl ReplayOptions<'_> {
+    pub fn phase_deadline(self, profile: &str) -> Option<Instant> {
+        let seconds = match profile { "ultra" => 5, "fast" => 8, "deep" => 45, _ => 15 };
+        self.deadline.map(|deadline| deadline.min(Instant::now() + Duration::from_secs(seconds)))
+    }
+
+    pub fn expired(self, deadline: Option<Instant>) -> bool {
+        if !deadline.is_some_and(|deadline| Instant::now() >= deadline) { return false; }
+        if let Some(limited) = self.limited { limited.set(limited.get() + 1); }
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -45,20 +87,78 @@ pub(super) struct Evaluator<'a> {
     pub external: &'a [Effect],
     pub capacity_limit: i64,
     pub shells: HashMap<String, &'a Value>,
+    pub replay_options: ReplayOptions<'a>,
 }
 
 impl Evaluator<'_> {
+    pub fn window(&self, selected: &[usize], riven_slot: Option<usize>, special: Option<&Card<'_>>) -> SimResult<Value> {
+        let (effects, skipped) = self.terms(selected, riven_slot, special, true);
+        let (fields, _, _) = self.panel_fields(self.req, &effects, &skipped, None)?;
+        self.replay(selected, special, effects, &fields, timeline::Output::Timeline)
+    }
+
+    pub fn life_curve(&self, best: &Evaluation, seconds: f64) -> SimResult<Value> {
+        let req = Request { aim: 0.0, window: seconds,
+            ..self.req.clone() };
+        let eval = Evaluator { req: &req, replay_options: ReplayOptions {
+            scale: Some(1e9), nodes: &[], ..self.replay_options
+        }, ..self.clone() };
+        let (effects, skipped) = eval.terms(&best.cards, best.riven_slot, eval.fixed_exilus, true);
+        let (fields, _, _) = eval.panel_fields(&req, &effects, &skipped, None)?;
+        eval.replay(&best.cards, eval.fixed_exilus, effects, &fields, timeline::Output::LifeCurve)
+    }
+
+    fn replay(&self, selected: &[usize], special: Option<&Card<'_>>, terms: Vec<Effect>,
+        fields: &ModdedFields, output: timeline::Output) -> SimResult<Value> {
+        let req = self.req;
+        let weapon = Weapon::new(self.data, req);
+        let installed: Vec<_> = selected.iter().map(|i| &self.cards[*i]).chain(special)
+            .map(|card| loadout::Card::installed(card.raw, card.rank)).collect();
+        let effects = events::Effects::prepare(req, &installed, self.arcanes, terms, self.evolution,
+            self.schedule.map(|s| s.route.as_str()), &self.data.mechanics["infinite-conditions"]["sources"],
+            rows(&weapon.mechanics("weapon-passives")["innate"]));
+        let replay = |scale| {
+            let mut scaled;
+            let enhancements = if let Some(scale) = scale {
+                scaled = req.enhancements.clone();
+                scaled["healthScale"] = json!(scale);
+                &scaled
+            } else { &req.enhancements };
+            timeline::replay_window(&weapon, self.evolution, fields, req, &self.target, req.level,
+                req.steel, enhancements, &effects, self.schedule, self.arcanes,
+                self.stance["statusRateMultiplier"].as_f64().unwrap_or(1.0),
+                self.stance["dpsMultiplier"].as_f64().unwrap_or(1.0), output, self.replay_options.branches)
+        };
+        if self.replay_options.nodes.is_empty() { return replay(self.replay_options.scale); }
+        let mut weights = 0.0;
+        let mut total = 0.0;
+        let mut any = false;
+        for node in self.replay_options.nodes {
+            let low = num(&replay(Some(node.scale * (1.0 - node.spread)))?);
+            let value = if node.spread > 0.0 {
+                (low + num(&replay(Some(node.scale * (1.0 + node.spread)))?)) / 2.0
+            } else { low };
+            any |= value > 0.0;
+            total += node.weight * value.max(1e-12).ln();
+            weights += node.weight;
+        }
+        Ok(json!(if any { (total / weights).exp() } else { 0.0 }))
+    }
+
     pub fn capacity(&self, cards: &[usize]) -> i64 {
         cards.iter().map(|i| self.cards[*i].cost()).sum::<i64>()
-            + self.riven.map_or(0, |r| cards::matching_drain(18, &r.polarity))
+            + self.riven.map_or(0, |r| cards::matching_drain(r.drain(), &r.polarity))
     }
 
     pub fn can_equip(&self, selected: &[usize]) -> bool {
-        selected.len() + usize::from(self.riven.is_some()) <= self.req.slot_count
-            && self.capacity(selected) <= self.capacity_limit
-            && selected.iter().enumerate().all(|(i, key)| {
+        self.fits(selected) && selected.iter().enumerate().all(|(i, key)| {
                 !selected[..i].iter().any(|other| self.cards[*key].family == self.cards[*other].family)
             })
+    }
+
+    fn fits(&self, selected: &[usize]) -> bool {
+        selected.len() + usize::from(self.riven.is_some()) <= self.req.slot_count
+            && self.capacity(selected) <= self.capacity_limit
     }
 
     pub fn set_counts<'a>(&'a self, selected: &[usize], special: Option<&'a Card<'_>>) -> IndexMap<&'a str, usize> {
@@ -148,24 +248,26 @@ impl Evaluator<'_> {
         let stance_damage = self.stance["dpsMultiplier"].as_f64().unwrap_or(1.0);
         let stance_status = self.stance["statusRateMultiplier"].as_f64().unwrap_or(1.0);
         let score = match metric {
-            Metric::Events => {
-                let installed: Vec<_> = selected.iter().map(|i| &self.cards[*i]).chain(special)
-                    .map(|card| loadout::Card::installed(card.raw, card.rank)).collect();
-                let effects = events::Effects::prepare(req, &installed, self.arcanes, effects, self.evolution,
-                    self.schedule.map(|s| s.route.as_str()), &self.data.mechanics["infinite-conditions"]["sources"],
-                    rows(&weapon.mechanics("weapon-passives")["innate"]));
-                num(&timeline::calculate(&weapon, self.evolution, &fields, req, &self.target, req.level,
-                    req.steel, &req.enhancements, &effects, self.schedule, self.arcanes, stance_status, stance_damage, true)?)
-            }
+            Metric::Events | Metric::WindowDps => num(&self.replay(selected, special, effects, &fields,
+                if matches!(metric, Metric::Events) { timeline::Output::Kpm } else { timeline::Output::Dps })?),
             Metric::Proxy => {
                 let mut types = Types::new();
                 let core = weapon::core(&fields, &mut types, self.target.faction, self.target.bracket);
                 let defenses = self.target.defenses(req.level, req.steel, req.strip, req.elemental_strip, &req.enhancements);
                 let hit = if req.body.get("hitLocation").is_some_and(|v| v == "head") { self.target.head }
                     else { super::super::target::HitLocation::BODY };
-                let (_, steady) = damage::status_and_steady(&fields, &core, &types, &self.target, &defenses, hit,
-                    &Vec::new(), stance_status, stance_damage);
-                num(&steady["totalDps"])
+                if self.replay_options.evaluations.is_some() {
+                    let mut target = self.target.sustained(&defenses, hit);
+                    target.shielded = super::truth(&self.target.record["shield"]);
+                    sustained_status(&target, SustainedInput { types: &types, core: &core,
+                        attacks_per_second: weapon::attack_rate(&fields), status_rate_multiplier: stance_status,
+                        damage_rate_multiplier: stance_damage, total: true,
+                        magazine: fields.magazine, first_shot_bonus: fields.first_shot_damage_bonus })
+                } else {
+                    let (_, steady) = damage::status_and_steady(&fields, &core, &types, &self.target, &defenses, hit,
+                        &Vec::new(), stance_status, stance_damage);
+                    num(&steady["totalDps"])
+                }
             }
             Metric::Panel(key) => {
                 let mut types = Types::new();
@@ -180,7 +282,17 @@ impl Evaluator<'_> {
 
     pub fn evaluate(&self, selected: &[usize], metric: Metric<'_>, element: Option<&str>,
         special: Option<&Card<'_>>) -> SimResult<Option<Evaluation>> {
-        if !self.can_equip(selected) { return Ok(None); }
+        self.evaluate_layouts(selected, metric, element, special, true)
+    }
+
+    pub fn rank(&self, selected: &[usize], metric: Metric<'_>) -> SimResult<Option<Evaluation>> {
+        self.evaluate_layouts(selected, metric, None, self.fixed_exilus, self.replay_options.evaluations.is_none())
+    }
+
+    fn evaluate_layouts(&self, selected: &[usize], metric: Metric<'_>, element: Option<&str>,
+        special: Option<&Card<'_>>, check_families: bool) -> SimResult<Option<Evaluation>> {
+        if let Some(count) = self.replay_options.evaluations { count.set(count.get() + 1); }
+        if !(if check_families { self.can_equip(selected) } else { self.fits(selected) }) { return Ok(None); }
         let mut best: Option<Evaluation> = None;
         let riven_element = self.riven.map_or(0, |r| cards::elemental(&r.effects));
         let slots: Vec<_> = selected.iter().enumerate().filter_map(|(i, card)|
@@ -224,6 +336,15 @@ impl Evaluator<'_> {
 
     pub fn screen(&self, selected: &[usize], metric: Metric<'_>) -> SimResult<Option<f64>> {
         self.evaluate(selected, metric, None, self.fixed_exilus).map(|value| value.map(|v| v.score))
+    }
+
+    pub fn fixed(&self, selected: &[usize], slot: Option<usize>, metric: Metric<'_>,
+        element: Option<&str>) -> SimResult<Option<Evaluation>> {
+        if let Some(count) = self.replay_options.evaluations { count.set(count.get() + 1); }
+        if !self.can_equip(selected) { return Ok(None); }
+        Ok(self.score(selected, slot, self.fixed_exilus, metric, element)?.map(|score| Evaluation {
+            cards: selected.to_vec(), riven_slot: slot, score, capacity: self.capacity(selected)
+        }))
     }
 }
 

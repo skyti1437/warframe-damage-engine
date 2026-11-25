@@ -10,6 +10,9 @@ mod projectiles;
 mod request;
 mod response;
 mod search;
+mod riven_traits;
+pub(crate) mod analyze;
+pub(crate) mod trait_matrix;
 
 use super::{arcane, damage, events, identity, loadout, melee, num, rows, text, timeline, truth, weapon,
     EngineData, Map, Request, SimCatalog, SimResult, Target, Value, BENCHMARK_TARGET, json};
@@ -19,7 +22,14 @@ use std::collections::HashMap;
 use weapon::Evolution;
 
 pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, Value>) -> SimResult<Value> {
+    solve(data, catalog, fields, SolveMode::Build)
+}
+
+enum SolveMode<'a> { Build, TraitMatrix, Analyze(&'a analyze::Input<'a>) }
+
+fn solve(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, Value>, mode: SolveMode<'_>) -> SimResult<Value> {
     let mut body = request::normalize(fields)?;
+    let analysis = if let SolveMode::Analyze(input) = mode { Some(input) } else { None };
     let raw_weapon = catalog.weapons.get(body.get("weapon").and_then(Value::as_str).unwrap_or("").trim())
         .ok_or("weapon must be an exported weapon path")?;
     let weapon_type = text(&raw_weapon["weaponType"]);
@@ -33,10 +43,10 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
     let base = data.weapons.get(text(&raw_weapon["path"])).ok_or("weapon has no exported combat record")?;
     let parts = body.remove("kitgunParts").unwrap_or(Value::Null);
     let assembled = modular::assemble(data, base, &parts)?;
-    if assembled.is_none() && raw_weapon["buildAvailable"] != true {
+    if analysis.is_none() && assembled.is_none() && raw_weapon["buildAvailable"] != true {
         return Err(raw_weapon["buildIssue"].as_str().unwrap_or("weapon build is unavailable").into());
     }
-    if assembled.is_some() { body.insert("fireMode".into(), json!(0)); }
+    if assembled.is_some() && analysis.is_none() { body.insert("fireMode".into(), json!(0)); }
     if scope.metric == "heavyDamage" {
         if let Some(value) = body["scenario"].get("heavyAttack").or_else(|| body.get("heavyAttack")) {
             if !value.is_boolean() { return Err("heavyAttack must be a boolean".into()); }
@@ -47,24 +57,44 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
         body.insert("damageModel".into(), json!("target"));
     }
     let mut resolved = assembled.unwrap_or_else(|| base.clone());
+    if analysis.is_some() && resolved["heavyAttack"]["kind"] == "projectileRecall" {
+        let components: Vec<_> = rows(&resolved["heavyAttack"]["components"]).iter()
+            .filter(|part| matches!(text(&part["kind"]), "projectileDirect" | "heavyRecall"))
+            .cloned().collect();
+        if ["projectileDirect", "heavyRecall"].iter().all(|kind| components.iter().any(|part| part["kind"] == *kind)) {
+            resolved["heavyAttack"]["components"] = json!(components);
+        }
+    }
     let innate = modular::innate(&body, &resolved)?;
     body.remove("innateElement");
     if !innate.is_null() { resolved["innateElements"] = json!([innate]); }
     let external = body.remove("externalBuffs").unwrap_or(Value::Null);
     let req = Request::parse_weapon(data, catalog, &body, Some(&resolved))?;
     let availability = &raw_weapon["fireModes"][req.mode]["metricAvailability"][&scope.metric];
-    if parts.is_null() && availability["available"] != true {
+    if analysis.is_none() && parts.is_null() && availability["available"] != true {
         return Err(availability["issue"].as_str().unwrap_or("fire mode metric is unavailable").into());
     }
-    let stance = melee::stance(data, &catalog.stances, &req)?;
+    let mut stance = melee::stance(data, &catalog.stances, &req)?;
+    if analysis.is_some() {
+        if stance["path"].is_string() && stance["builtIn"] != true {
+            stance["nativeCapacityGain"] = stance["capacityGain"].clone();
+            stance["capacityGain"] = stance["matchedCapacityGain"].clone();
+        } else if !stance["path"].is_string() {
+            stance = Value::Null;
+        }
+    }
     let schedule = melee::Schedule::resolve(data, &req, &stance)?;
+    if analysis.is_some() && schedule.is_some() && !stance.is_null() {
+        stance["dpsMultiplier"] = json!(1.0);
+        stance["statusRateMultiplier"] = json!(1.0);
+    }
     let selected_target = catalog.enemies.get(text(&req.target["path"]));
     let mut req = req;
     let buffs = buffs::Buffs::resolve(data, &external, req.weapon, req.melee)?;
     for (key, value) in [("auraArmourReduction", buffs.armour_reduction), ("auraShieldReduction", buffs.shield_reduction)] {
         if value > 0.0 { req.enhancements[key] = json!(value); }
     }
-    if !truth(&req.target["health"]) {
+    if analysis.is_none() && !truth(&req.target["health"]) {
         req.target = data.enemies.get(BENCHMARK_TARGET).ok_or("missing benchmark enemy")?.clone();
         req.level = 170;
         req.steel = true;
@@ -94,24 +124,28 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
     }
     let riven = cards::Riven::parse(data, body.get("riven").unwrap_or(&Value::Null))?;
     let (cards, rejected) = cards::candidates(data, catalog, &req, weapon_type,
-        schedule.as_ref().map(|s| s.route.as_str()), fixed_exilus.as_ref());
+        schedule.as_ref().map(|s| s.route.as_str()), fixed_exilus.as_ref(), analysis.is_some());
     let shells: HashMap<_, _> = data.mods.values().filter_map(|raw| {
         let key = loadout::set_key(&raw["modSet"]);
         (!key.is_empty() && !raw["setPieces"].is_null() && (raw["selectable"] == false
             || (!truth(&raw["selectable"]) && !truth(&raw["compatibility"])))).then_some((key, raw))
     }).collect();
     let evolution = Evolution::resolve(data, &req)?;
-    let auto_route = body.get("autoIncarnon").is_some_and(|v| v == true) && truth(&evolution.choices);
-    let auto_arcane = body.get("autoArcane").is_some_and(|v| v == true);
+    let auto_route = analysis.is_none() && body.get("autoIncarnon").is_some_and(|v| v == true) && truth(&evolution.choices);
+    let auto_arcane = analysis.is_none() && body.get("autoArcane").is_some_and(|v| v == true);
     let arcane_rows = auto::arcane_rows(data, catalog, &req, scope.include_arcanes, auto_arcane);
-    let arcanes = auto::resolve_arcanes(data, catalog, &req, &arcane_rows)?;
+    let arcanes = if analysis.is_some() { arcane::Equipped::resolve_analysis(data, catalog, &req)? }
+        else { auto::resolve_arcanes(data, catalog, &req, &arcane_rows)? };
     let arcane_panel = arcanes.snapshot(&req, None, None)?;
 
     let evaluator = Evaluator { data, req: &req, target, stance: &stance, schedule: schedule.as_ref(),
         cards: &cards, riven: riven.as_ref(), fixed_exilus: fixed_exilus.as_ref(), arcanes: &arcanes,
         arcane_panel: &arcane_panel, evolution: &evolution, external: &buffs.effects,
-        capacity_limit: capacity_limit - fixed["drain"].as_i64().unwrap_or(0), shells };
+        capacity_limit: capacity_limit - fixed["drain"].as_i64().unwrap_or(0), shells, replay_options: Default::default() };
     let search = Search::new(&evaluator, &scope)?;
+    if let Some(input) = analysis {
+        return analyze::calculate(&evaluator, &search, input, catalog, raw_weapon, fixed, rejected);
+    }
     let mut best = search.run(&evaluator, &[], auto_route)?;
     let mut report = Map::new();
     let auto_started = std::time::Instant::now();
@@ -179,6 +213,11 @@ pub(crate) fn run(data: &EngineData, catalog: &SimCatalog, fields: &Map<String, 
     for key in ["arcane", "coupled"] {
         if let Some(choice) = report.get_mut(key) { choice["score"] = json!(best.score); }
     }
-    response::payload(&evaluator, &search, &best, special, exilus, Value::Object(report),
-        capacity_limit, rejected, raw_weapon, selected_target, catalog)
+    let result = response::payload(&evaluator, &search, &best, special, exilus, Value::Object(report),
+        capacity_limit, rejected, raw_weapon, selected_target, catalog, false)?;
+    if matches!(mode, SolveMode::TraitMatrix) {
+        trait_matrix::calculate(&evaluator, &best, special, raw_weapon, catalog, result)
+    } else {
+        Ok(result)
+    }
 }

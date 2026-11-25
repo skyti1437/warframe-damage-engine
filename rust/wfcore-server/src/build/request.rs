@@ -1,6 +1,7 @@
 use super::{json, rows, text, truth, Map, SimCatalog, SimResult, Value, BENCHMARK_TARGET};
 use std::collections::HashSet;
 
+#[derive(Clone)]
 pub(super) struct Scope {
     pub profile: &'static str,
     pub metric: String,

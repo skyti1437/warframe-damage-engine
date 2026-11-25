@@ -306,7 +306,7 @@ fn enhancements(data: &EngineData, value: Option<&Value>, steel: bool, notes: &m
     Ok(selected)
 }
 
-fn custom_target(value: &Value) -> SimResult<Value> {
+pub(super) fn custom_target(value: &Value) -> SimResult<Value> {
     let raw = object(value, "defenseSnapshot")?;
     check_keys(raw, &["health", "armour", "armor", "shield", "healthType", "armourType", "armorType",
         "shieldType", "baseLevel", "factionResistance"], "defenseSnapshot")?;

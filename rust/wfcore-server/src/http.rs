@@ -15,6 +15,8 @@ pub struct Service {
     sim_catalog: SimCatalog,
     health_json: Arc<Vec<u8>>,
     catalog_json: Arc<Vec<u8>>,
+    trait_matrix: simulate::build::trait_matrix::Cache,
+    analyze: simulate::build::analyze::Cache,
 }
 
 impl Service {
@@ -23,7 +25,7 @@ impl Service {
         let catalog = catalog::build(&data)?;
         let sim_catalog = SimCatalog::new(&catalog);
         let catalog_json = Arc::new(serde_json::to_vec(&catalog)?);
-        Ok(Self { data, sim_catalog, health_json, catalog_json })
+        Ok(Self { data, sim_catalog, health_json, catalog_json, trait_matrix: Default::default(), analyze: Default::default() })
     }
 
     pub fn health_json(&self) -> &[u8] { &self.health_json }
@@ -35,22 +37,21 @@ impl Service {
         match (method, path) {
             (Method::Get, "/api/health") => Reply { status: 200, cache: "no-store", body: Arc::clone(&self.health_json) },
             (Method::Get, "/api/catalog") => Reply { status: 200, cache: "no-cache", body: Arc::clone(&self.catalog_json) },
-            (Method::Post, "/api/simulate" | "/api/build") => {
+            (Method::Post, "/api/simulate" | "/api/build" | "/api/trait-matrix" | "/api/analyze") => {
                 match parse_object(length, body) {
                     Err(reply) => reply,
                     Ok(fields) => {
-                        let run = if path == "/api/build" { simulate::build::run } else { simulate::run };
-                        match run(&self.data, &self.sim_catalog, &fields) {
+                        let result = match path {
+                            "/api/build" => simulate::build::run(&self.data, &self.sim_catalog, &fields),
+                            "/api/trait-matrix" => simulate::build::trait_matrix::run(&self.data, &self.sim_catalog, &fields, &self.trait_matrix),
+                            "/api/analyze" => simulate::build::analyze::run(&self.data, &self.sim_catalog, &fields, &self.analyze),
+                            _ => simulate::run(&self.data, &self.sim_catalog, &fields),
+                        };
+                        match result {
                             Ok(response) => Reply::json(200, &response),
                             Err(message) => Reply::error(422, "invalid_request", &message),
                         }
                     }
-                }
-            }
-            (Method::Post, "/api/analyze" | "/api/trait-matrix") => {
-                match parse_object(length, body) {
-                    Err(reply) => reply,
-                    Ok(_) => Reply::error(501, "not_implemented", "endpoint is not implemented in Phase 2a"),
                 }
             }
             _ => Reply::error(404, "not_found", "endpoint not found"),
@@ -59,20 +60,34 @@ impl Service {
 
     /// 批处理和 HTTP 共用 JSON 解析、长度限制及路由。
     pub fn simulate_batch(&self, payload: Value) -> Result<Value> {
-        self.request_batch("/api/simulate", payload)
+        self.batch(Some("/api/simulate"), payload)
     }
 
     pub fn build_batch(&self, payload: Value) -> Result<Value> {
-        self.request_batch("/api/build", payload)
+        self.batch(Some("/api/build"), payload)
     }
 
-    fn request_batch(&self, path: &str, payload: Value) -> Result<Value> {
+    pub fn request_batch(&self, payload: Value) -> Result<Value> {
+        self.batch(None, payload)
+    }
+
+    fn batch(&self, fixed_path: Option<&str>, payload: Value) -> Result<Value> {
         let cases = payload.as_array().ok_or("请求批处理输入必须为 JSON 数组")?;
         let results = cases.iter().map(|case| -> Result<Value> {
             let id = case.get("id").ok_or("请求批处理条目缺少 id")?;
-            let body = serde_json::to_vec(case.get("body").ok_or("请求批处理条目缺少 body")?)?;
+            let path = fixed_path.or_else(|| case["path"].as_str()).ok_or("请求批处理条目缺少 path")?;
+            let method = if fixed_path.is_some() { Method::Post } else {
+                match case["method"].as_str() {
+                    Some("GET") => Method::Get,
+                    Some("POST") => Method::Post,
+                    _ => return Err("请求批处理 method 必须为 GET 或 POST".into()),
+                }
+            };
+            let body = if method == Method::Post {
+                serde_json::to_vec(case.get("body").ok_or("请求批处理条目缺少 body")?)?
+            } else { Vec::new() };
             let length = body.len().to_string();
-            let reply = self.dispatch(&Method::Post, path, Some(&length), body.as_slice());
+            let reply = self.dispatch(&method, path, Some(&length), body.as_slice());
             let response: Value = serde_json::from_slice(&reply.body)?;
             Ok(json!({"id": id, "status": reply.status, "response": response}))
         }).collect::<Result<Vec<_>>>()?;
@@ -283,9 +298,8 @@ mod tests {
         ] {
             check(&Method::Post, "/api/simulate", length, body, status, code.to_owned());
         }
-        for path in ["/api/analyze", "/api/trait-matrix"] {
-            check(&Method::Post, path, Some("2"), b"{}".as_slice(), 501, "not_implemented".to_owned());
-        }
+        check(&Method::Post, "/api/analyze", Some("2"), b"{}".as_slice(), 422, "invalid_request".to_owned());
+        check(&Method::Post, "/api/trait-matrix", Some("2"), b"{}".as_slice(), 422, "invalid_request".to_owned());
         check(&Method::Post, "/api/build", Some("2"), b"{}".as_slice(), 422, "invalid_request".to_owned());
         check(&Method::Get, "/missing", None, b"".as_slice(), 404, "not_found".to_owned());
         check(&Method::Post, "/missing", None, b"".as_slice(), 404, "not_found".to_owned());

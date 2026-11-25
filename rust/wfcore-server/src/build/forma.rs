@@ -9,11 +9,17 @@ struct Item {
     elemental: bool,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Plan {
     drain: i64,
     formed: u8,
     placement: [usize; 8],
+}
+
+impl Default for Plan {
+    fn default() -> Self {
+        Self { drain: 0, formed: 0, placement: [usize::MAX; 8] }
+    }
 }
 
 fn insert(layer: &mut IndexMap<(usize, u8, usize, usize), Plan>,
@@ -23,12 +29,16 @@ fn insert(layer: &mut IndexMap<(usize, u8, usize, usize), Plan>,
 }
 
 pub(super) fn summary(eval: &Evaluator<'_>, best: &Evaluation, exilus: &Value) -> Value {
+    plan(eval, best, exilus, false, false)
+}
+
+pub(super) fn plan(eval: &Evaluator<'_>, best: &Evaluation, exilus: &Value, placement: bool, fixed_exilus: bool) -> Value {
     let mut items: Vec<_> = best.cards.iter().map(|i| {
         let card = &eval.cards[*i];
         Item { polarity: polarity(&card.raw["polarity"]), drain: card.drain, elemental: card.elemental != 0 }
     }).collect();
     if let Some((riven, slot)) = eval.riven.zip(best.riven_slot) {
-        items.insert(slot, Item { polarity: polarity(&riven.polarity), drain: 18, elemental: cards::elemental(&riven.effects) != 0 });
+        items.insert(slot, Item { polarity: polarity(&riven.polarity), drain: riven.drain(), elemental: cards::elemental(&riven.effects) != 0 });
     }
     let chain: Vec<_> = (0..items.len()).filter(|i| items[*i].elemental).collect();
     let free: Vec<_> = (0..items.len()).filter(|i| !items[*i].elemental).collect();
@@ -43,6 +53,9 @@ pub(super) fn summary(eval: &Evaluator<'_>, best: &Evaluation, exilus: &Value) -
             for (index, element, mask) in chain.get(element).into_iter().map(|i| (*i, element + 1, mask))
                 .chain(free.iter().enumerate().filter(|(bit, _)| mask & (1 << bit) == 0)
                     .map(|(bit, i)| (*i, element, mask | (1 << bit)))) {
+                if (placement || fixed_exilus) && chain.len() - element + (full ^ mask).count_ones() as usize > 7 - slot {
+                    continue;
+                }
                 let item = &items[index];
                 let used = loadout::adjust_drain(item.drain, &item.polarity, native).0;
                 let matched = loadout::adjust_drain(item.drain, &item.polarity, &item.polarity).0;
@@ -61,13 +74,16 @@ pub(super) fn summary(eval: &Evaluator<'_>, best: &Evaluation, exilus: &Value) -
         layer = next;
     }
     let stance = eval.stance;
-    let gain = stance["capacityGain"].as_i64().unwrap_or(0);
+    let reference = placement || fixed_exilus;
+    let gain = if reference && (stance["builtIn"] == true || stance["path"].is_null()) { 0 }
+        else if reference { stance["nativeCapacityGain"].as_i64().or_else(|| stance["capacityGain"].as_i64()).unwrap_or(0) }
+        else { stance["capacityGain"].as_i64().unwrap_or(0) };
     let matched_gain = stance["matchedCapacityGain"].as_i64().unwrap_or(gain);
     let stance_options = usize::from(stance["polarityRelation"] != "matched" && matched_gain > gain && stance["builtIn"] != true);
     let exilus_raw = exilus["rawDrain"].as_i64().unwrap_or(0);
     let exilus_current = loadout::adjust_drain(exilus_raw, &exilus["polarity"], &exilus["slotPolarity"]).0;
     let exilus_matched = loadout::adjust_drain(exilus_raw, &exilus["polarity"], &exilus["polarity"]).0;
-    let exilus_options = usize::from(exilus_matched < exilus_current);
+    let exilus_options = usize::from(!fixed_exilus && exilus_matched < exilus_current);
     let mut best: Option<(_, Plan, usize, usize, bool)> = None;
     for ((element, mask, formas, moves), plan) in layer {
         if element != chain.len() || mask != full { continue; }
@@ -83,7 +99,7 @@ pub(super) fn summary(eval: &Evaluator<'_>, best: &Evaluation, exilus: &Value) -
             }
         }
     }
-    let (_, plan, stance, exilus, fits) = best.expect("Forma plan always has a native placement");
+    let (rank, plan, stance, exilus, fits) = best.expect("Forma plan always has a native placement");
     let mut regular = 0;
     let mut umbra = 0;
     let mut slots = serde_json::Map::new();
@@ -93,6 +109,20 @@ pub(super) fn summary(eval: &Evaluator<'_>, best: &Evaluation, exilus: &Value) -
         if matches!(text(polarity), "AP_UMBRA" | "AP_ULTIMATE") { umbra += 1; } else { regular += 1; }
         slots.insert(slot.to_string(), polarity.clone());
     }
-    json!({"regular": regular, "umbra": umbra, "stance": stance, "exilus": exilus,
-        "total": regular + umbra + stance + exilus, "fits": fits, "slots": slots})
+    let mut summary = json!({"regular": regular, "umbra": umbra, "stance": stance, "exilus": exilus,
+        "total": regular + umbra + stance + exilus, "fits": fits, "slots": slots});
+    if placement {
+        let placements: Vec<_> = plan.placement.into_iter().enumerate().map(|(slot, origin)| {
+            let Some(item) = items.get(origin) else { return Value::Null; };
+            let native = rows(&eval.req.weapon["polarities"]).get(slot).map(polarity).unwrap_or(Value::Null);
+            let slot_polarity = if plan.formed & (1 << slot) != 0 { &item.polarity } else { &native };
+            json!({"origin": origin, "polarity": slot_polarity,
+                "drain": loadout::adjust_drain(item.drain, &item.polarity, slot_polarity).0})
+        }).collect();
+        let delta = if stance == 1 { matched_gain - gain } else { 0 };
+        summary["placement"] = json!(placements);
+        summary["drain"] = json!(rank.4 + delta);
+        summary["limit"] = json!(60 + gain + delta);
+    }
+    summary
 }

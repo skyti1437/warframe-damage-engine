@@ -2,7 +2,7 @@ mod arcanes;
 pub(crate) mod enemies;
 mod modular;
 mod mods;
-mod riven;
+pub(crate) mod riven;
 mod weapons;
 
 use crate::data::{EngineData, Result, BUILD_LABEL, SCHEMA_VERSION};

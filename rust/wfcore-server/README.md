@@ -1,6 +1,6 @@
 # wfcore-server
 
-Phase 3a 独立服务。工作区发行版构建命令为 `python tools/build_rust_workspace.py --offline --server-only`。运行 `rust/target/release/wfcore-server --probe` 检查数据和目录，运行 `rust/target/release/wfcore-server --port 8765` 启动 HTTP 服务。Windows 的二进制带 `.exe` 后缀。
+Phase 3b 纯 Rust 独立服务。工作区发行版构建命令为 `python tools/build_rust_workspace.py --offline --server-only`。运行 `rust/target/release/wfcore-server --probe` 检查数据和目录，运行 `rust/target/release/wfcore-server --port 8765` 启动 HTTP 服务。Windows 的二进制带 `.exe` 后缀。
 
 `--data-dir` 接受项目根或 `data` 目录。省略时从当前目录及可执行文件位置向上查找。默认监听 `127.0.0.1:8765`，`WF_SERVER_THREADS` 可覆盖两个 HTTP 工作线程的默认配置。健康指纹由加载的数据文件和内置兼容规则计算。
 
@@ -8,9 +8,12 @@ Rust 在启动时应用快照修正、合并条目、计算公开标记并序列
 
 ## 计算入口
 
-`POST /api/simulate` 计算已装备配装。`POST /api/build` 从导出的卡池搜索配装，复用模拟的面板和事件回放，并返回所选卡片、容量、Forma 和评分。服务也提供 `GET /api/health` 和 `GET /api/catalog`。`POST /api/analyze` 与 `POST /api/trait-matrix` 返回 501。
+`POST /api/simulate` 计算已装备配装。`POST /api/build` 从导出的卡池搜索配装，复用模拟的面板和事件回放，并返回所选卡片、容量、Forma 和评分。服务也提供 `GET /api/health` 和 `GET /api/catalog`。
 
-`--simulate-batch <JSON_PATH>` 和 `--build-batch <JSON_PATH>` 接受由 `{"id": "case", "body": {...}}` 条目组成的 JSON 数组。标准输出按输入顺序给出每项的 `id`、`status` 和 `response`。每个请求体与 HTTP 使用相同的 128 KiB 上限和校验。显赫武器的战甲联动配卡仍依赖战甲计算器。
+- `POST /api/analyze` 验证紫卡词条及卡面倾向，将数值投影到目标倾向，并通过相同事件回放搜索无紫卡基线与实卡配装。硬度校准使用无紫卡基线的身体命中事件，评分汇总三个加权硬度节点。响应包含固定配装消融、词条推荐和负面评估。分析指纹来自本服务的健康端点，`contextHash` 按 Python 的规范 JSON 和 SHA-256 生成。
+- `POST /api/trait-matrix` 使用配卡搜索的参考配装，按 Forma 槽位回放基线和逐槽消融，分别运行弱点和元素试算。进程缓存保留完整矩阵，`roll` 接受 `3+1-`、`2+1-` 或 `both`。
+
+`--simulate-batch <JSON_PATH>` 和 `--build-batch <JSON_PATH>` 接受由 `{"id": "case", "body": {...}}` 条目组成的 JSON 数组。`--request-batch <JSON_PATH>` 每条另带 `method` 与 `path`，可在一个批次调用六个端点。GET 条目省略 `body`。标准输出按输入顺序给出每项的 `id`、`status` 和 `response`。每个请求体与 HTTP 使用相同的 128 KiB 上限和校验。显赫武器的战甲联动配卡仍依赖战甲计算器。
 
 ## 冻结的目录兼容规则
 
@@ -22,6 +25,8 @@ Rust 在启动时应用快照修正、合并条目、计算公开标记并序列
 - `mod_rules.json`、`arcane_rules.json`、`riven_rules.json` 和 `factions.json` 保存 Python 规则的卡片修正、支持表、套装及词条映射、赋能控制和派系回退值。`display.json` 保存公开的外部增益与哨兵展示信息。两套目录在 Python 测试中按全部 JSON 字段对拍。
 
 配卡与模拟共享磁力破盾回放。`magnetic_weakness.json` 保留 WFSim `27f4b19fa3` 的原始武器弱点标量，来源与 Python 参考实现相同。更新快照或补丁时应重新对拍上述规则。
+
+`fire_rate_spool.json` 保留 Python 参考的射速预热档案及其来源标识。回放由共享的 `wfcore-lib` 执行。
 
 ## HTTP 传输
 

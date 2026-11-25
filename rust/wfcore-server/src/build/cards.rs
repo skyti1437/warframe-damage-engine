@@ -55,7 +55,7 @@ impl<'a> Card<'a> {
 }
 
 pub(super) fn candidates<'a>(data: &'a EngineData, catalog: &SimCatalog, req: &Request<'_>,
-    weapon_type: &str, route: Option<&str>, fixed_exilus: Option<&Card<'_>>) -> (Vec<Card<'a>>, usize) {
+    weapon_type: &str, route: Option<&str>, fixed_exilus: Option<&Card<'_>>, analysis: bool) -> (Vec<Card<'a>>, usize) {
     let mut pool = Vec::new();
     let mut rejected = 0;
     let tree = &data.mechanics["melee-mechanics"]["weapons"][req.weapon["meleePath"].as_str()
@@ -65,6 +65,8 @@ pub(super) fn candidates<'a>(data: &'a EngineData, catalog: &SimCatalog, req: &R
     let reserve_reach = weapon_type == "melee" && !truth(&req.weapon["isExalted"]) && route != Some("glaive") && !hammer;
     for raw in data.mods.values() {
         let path = text(&raw["path"]);
+        if analysis && matches!(path, "/Lotus/Upgrades/Mods/Rifle/Expert/SniperReloadDamageModExpert"
+            | "/Lotus/Upgrades/Mods/Melee/WeaponMeleeDamageOnHeavyKillMod") { continue; }
         if raw["selectable"] != true || !truth(&raw["compatibility"]) || !loadout::compatible(raw, req.weapon)
             || truth(&raw["catalogExclusion"])
             || (path.contains("/PvPMods/") &&
@@ -79,7 +81,7 @@ pub(super) fn candidates<'a>(data: &'a EngineData, catalog: &SimCatalog, req: &R
             });
         if !active { rejected += 1; }
         card.reserved = reserve_reach && raw["nameEn"] == "Primed Reach";
-        if (active || card.reserved) && catalog.mods.contains_key(path) && !catalog.utility.contains_key(path)
+        if (active || card.reserved) && (analysis || catalog.mods.contains_key(path) && !catalog.utility.contains_key(path))
             && fixed_exilus.is_none_or(|exilus| exilus.family != card.family) {
             pool.push(card);
         }
@@ -95,9 +97,14 @@ pub(super) struct Riven {
     pub skipped: Vec<String>,
     pub notes: Vec<String>,
     pub polarity: Value,
+    pub drain: i64,
 }
 
 impl Riven {
+    pub fn drain(&self) -> i64 {
+        self.drain
+    }
+
     pub fn parse(data: &EngineData, raw: &Value) -> SimResult<Option<Self>> {
         if raw.is_null() { return Ok(None); }
         if !raw.is_object() { return Err("riven must be an object".into()); }
@@ -144,7 +151,7 @@ impl Riven {
             "AP_ATTACK" | "AP_DEFENSE" | "AP_TACTIC" => raw["polarity"].clone(),
             _ => json!("AP_ATTACK"),
         };
-        Ok(Some(Self { raw: raw.clone(), lines, effects, skipped, notes, polarity }))
+        Ok(Some(Self { raw: raw.clone(), lines, effects, skipped, notes, polarity, drain: 18 }))
     }
 }
 

@@ -1,0 +1,114 @@
+{
+  "/Lotus/Weapons/Infested/InfestedLich/LongGuns/CodaBubonico/CodaBubonicoCannon": {
+    "directTotal": 41.0,
+    "referenceId": "coda_bubonico",
+    "referenceSource": "data/weapons/primary/coda_bubonico.yaml",
+    "referenceSha256": "51c8f67bd6678953d5636c186686c4c9ac769c13b844b0a4209da3296066c47e",
+    "fireRateSpool": {
+      "start": 0.30000001,
+      "end": 1.0,
+      "nativeMaxShots": 12,
+      "sourceRpm": 320.0,
+      "sourceRate": 5.333333
+    }
+  },
+  "/Lotus/Weapons/Tenno/Rifle/HeavyRifle": {
+    "directTotal": 25.0,
+    "referenceId": "gorgon",
+    "referenceSource": "data/weapons/primary/gorgon.yaml",
+    "referenceSha256": "e71249b9ef84ae2977c395cccfcd993ad0fd802ed42f736e971a97add249cfe7",
+    "fireRateSpool": {
+      "start": 0.2,
+      "end": 1.0,
+      "overShots": 7.5
+    }
+  },
+  "/Lotus/Weapons/Grineer/LongGuns/WraithGorgon/WraithGorgon": {
+    "directTotal": 27.0,
+    "referenceId": "gorgon_wraith",
+    "referenceSource": "data/weapons/primary/gorgon_wraith.yaml",
+    "referenceSha256": "56fbd57614df5395fe2bdce99e871dc5e970883a3a57a996a2c12e72fe8daf0c",
+    "fireRateSpool": {
+      "start": 0.2,
+      "end": 1.0,
+      "overShots": 5.0
+    }
+  },
+  "/Lotus/Weapons/Grineer/LongGuns/VoidTraderGorgon/VTGorgon": {
+    "directTotal": 23.0,
+    "referenceId": "prisma_gorgon",
+    "referenceSource": "data/weapons/primary/prisma_gorgon.yaml",
+    "referenceSha256": "cb29f52000f4b5092e74d79600138bf09482f601516d6ad54e0e4cbdec9b505e",
+    "fireRateSpool": {
+      "start": 0.2,
+      "end": 1.0,
+      "overShots": 6.0
+    }
+  },
+  "/Lotus/Weapons/Tenno/Rifle/TennoAR": {
+    "directTotal": 12.0,
+    "referenceId": "soma",
+    "referenceSource": "data/weapons/primary/soma.yaml",
+    "referenceSha256": "e0565854f7db45a898792bde9629c7fed2f12fd964d618a00936bcafa80d8350",
+    "fireRateSpool": {
+      "start": 0.25,
+      "end": 1.0,
+      "overShots": 5.0
+    }
+  },
+  "/Lotus/Weapons/Tenno/LongGuns/PrimeSoma/PrimeSomaRifle": {
+    "directTotal": 12.0,
+    "referenceId": "soma_prime",
+    "referenceSource": "data/weapons/primary/soma_prime.yaml",
+    "referenceSha256": "45b636dc0b1b47371770258bb5d055870b0383b33bdccc737f3ee3d3e575262c",
+    "fireRateSpool": {
+      "start": 0.25,
+      "end": 1.0,
+      "overShots": 2.5
+    }
+  },
+  "/Lotus/Weapons/ClanTech/Energy/CrpHeavyRifle": {
+    "directTotal": 40.0,
+    "referenceId": "supra",
+    "referenceSource": "data/weapons/primary/supra.yaml",
+    "referenceSha256": "0c58bdd81692baee67ce3a4becf6c786b8ad5c077e4713aee45e47603173392b",
+    "fireRateSpool": {
+      "start": 0.1,
+      "end": 1.0,
+      "overShots": 4.0
+    }
+  },
+  "/Lotus/Weapons/Corpus/LongGuns/Machinegun/SupraVandal": {
+    "directTotal": 40.0,
+    "referenceId": "supra_vandal",
+    "referenceSource": "data/weapons/primary/supra_vandal.yaml",
+    "referenceSha256": "8fbce17a41e381412417d1a0e44304c77c860bc6c03655f859507cc34bcea2fa",
+    "fireRateSpool": {
+      "start": 0.4,
+      "end": 1.0,
+      "overShots": 3.0
+    }
+  },
+  "/Lotus/Weapons/Tenno/LongGuns/TnBardRifle/TnBardRifle": {
+    "directTotal": 24.0,
+    "referenceId": "tenora",
+    "referenceSource": "data/weapons/primary/tenora.yaml",
+    "referenceSha256": "26b29d84013b59b8c93796ee05863a6535ad328abc1fc08edcb0b3d9d796d02f",
+    "fireRateSpool": {
+      "start": 0.4,
+      "end": 1.0,
+      "overShots": 8.0
+    }
+  },
+  "/Lotus/Weapons/Tenno/LongGuns/PrimeTenora/TenoraPrimeWeapon": {
+    "directTotal": 28.0,
+    "referenceId": "tenora_prime",
+    "referenceSource": "data/weapons/primary/tenora_prime.yaml",
+    "referenceSha256": "e9c03745b0180a8c563727afde4822702dfd29bf80a009790e54736519fac853",
+    "fireRateSpool": {
+      "start": 0.4,
+      "end": 1.0,
+      "overShots": 8.0
+    }
+  }
+}

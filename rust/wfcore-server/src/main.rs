@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use wfcore_server::data::{locate_data_root, EngineData, Result};
 use wfcore_server::http::Service;
 
-const HELP: &str = "用法：wfcore-server [--data-dir <PATH>] [--host <IP>] [--port <PORT>] [--probe | --dump-catalog | --simulate-batch <JSON_PATH> | --build-batch <JSON_PATH>]
+const HELP: &str = "用法：wfcore-server [--data-dir <PATH>] [--host <IP>] [--port <PORT>] [--probe | --dump-catalog | --simulate-batch <JSON_PATH> | --build-batch <JSON_PATH> | --request-batch <JSON_PATH>]
   --data-dir      指定项目根目录或 data 目录，默认从工作目录和可执行文件位置查找
   --host          监听 IP，默认 127.0.0.1
   --port          监听端口，默认 8765
@@ -15,10 +15,11 @@ const HELP: &str = "用法：wfcore-server [--data-dir <PATH>] [--host <IP>] [--
   --dump-catalog  输出与 GET /api/catalog 相同的 JSON 后退出
   --simulate-batch  读取 JSON 批次并逐条输出模拟状态与响应
   --build-batch     读取 JSON 批次并逐条输出配卡状态与响应
+  --request-batch   读取带 method 和 path 的 JSON 批次，逐条输出状态与响应
   WF_SERVER_THREADS 指定 HTTP 工作线程数，默认 2";
 
 #[derive(PartialEq, Eq)]
-enum Mode { Serve, Probe, Dump, SimulateBatch(PathBuf), BuildBatch(PathBuf) }
+enum Mode { Serve, Probe, Dump, SimulateBatch(PathBuf), BuildBatch(PathBuf), RequestBatch(PathBuf) }
 
 struct Options {
     directory: Option<PathBuf>,
@@ -38,14 +39,15 @@ impl Options {
                 Some("--data-dir") => options.directory = Some(PathBuf::from(argument()?)),
                 Some("--host") => options.host = utf8(argument()?)?.parse().map_err(|_| "--host 必须为有效 IP")?,
                 Some("--port") => options.port = utf8(argument()?)?.parse().map_err(|_| "--port 必须为 0–65535 的整数")?,
-                Some(flag @ ("--probe" | "--dump-catalog" | "--simulate-batch" | "--build-batch")) => {
+                Some(flag @ ("--probe" | "--dump-catalog" | "--simulate-batch" | "--build-batch" | "--request-batch")) => {
                     if options.mode != Mode::Serve {
-                        return Err("--probe、--dump-catalog、--simulate-batch 和 --build-batch 只能指定一个".into());
+                        return Err("--probe、--dump-catalog、--simulate-batch、--build-batch 和 --request-batch 只能指定一个".into());
                     }
                     options.mode = match flag {
                         "--probe" => Mode::Probe,
                         "--dump-catalog" => Mode::Dump,
                         "--build-batch" => Mode::BuildBatch(PathBuf::from(argument()?)),
+                        "--request-batch" => Mode::RequestBatch(PathBuf::from(argument()?)),
                         _ => Mode::SimulateBatch(PathBuf::from(argument()?)),
                     };
                 }
@@ -83,10 +85,11 @@ fn run() -> Result<()> {
         }
         Mode::Probe => service.health_json(),
         Mode::Dump => service.catalog_json(),
-        Mode::SimulateBatch(ref path) | Mode::BuildBatch(ref path) => {
+        Mode::SimulateBatch(ref path) | Mode::BuildBatch(ref path) | Mode::RequestBatch(ref path) => {
             let input = serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(path)?))?;
             let result = match options.mode {
                 Mode::BuildBatch(_) => service.build_batch(input)?,
+                Mode::RequestBatch(_) => service.request_batch(input)?,
                 _ => service.simulate_batch(input)?,
             };
             batch = serde_json::to_vec(&result)?;

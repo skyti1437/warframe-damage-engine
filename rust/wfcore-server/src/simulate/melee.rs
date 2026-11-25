@@ -348,6 +348,53 @@ pub(super) fn stance(data: &EngineData, catalog: &[Value], req: &Request<'_>) ->
 }
 
 impl Schedule {
+    pub fn context(&self) -> Value {
+        json!({"route":self.route, "label":self.label, "stance":self.stance, "combo":self.combo})
+    }
+
+    pub fn route_note(&self, stance: &Value) -> String {
+        let hits: Vec<_> = self.segments.iter().filter_map(|segment| segment.hit.as_ref()).collect();
+        let seconds: f64 = self.segments.iter().map(|segment| segment.fixed + segment.anim).sum();
+        if self.label == "heavy-attack" {
+            return format!("攻击路线：重击连段（{} 击，1.0 攻速下 {seconds:.2} 秒一轮），逐次计算重击蓄力、连击倍率和消耗", hits.len());
+        }
+        match self.route.as_str() {
+            "combo" => {
+                let name = self.stance.as_deref().filter(|path| stance["path"] == *path)
+                    .and_then(|_| stance["nameZh"].as_str().or_else(|| stance["nameEn"].as_str()))
+                    .or_else(|| self.stance.as_deref().map(|path| path.rsplit('/').next().unwrap_or(path)))
+                    .unwrap_or("无架势");
+                let combo = match self.combo.as_deref().unwrap_or("") {
+                    "CC_GROUND" => "中立", "CC_GROUND_BRANCH_A" => "前进",
+                    "CC_GROUND_BRANCH_B" => "前进格挡", "CC_GROUND_BRANCH_C" => "格挡",
+                    label => label,
+                };
+                let multiplier: f64 = hits.iter().map(|hit| hit.atten).sum();
+                format!("攻击路线：轻击连段（{name} · {combo}连段，{} 击 / 总倍率 {multiplier}，1.0 攻速下 {seconds:.2} 秒一轮）；逐次命中，连击数从初始连击逐击累加，嗜血类效果按实时档位", hits.len())
+            }
+            "slamContinuous" => format!("攻击路线：连续震地（最低跳跃高度、取消后摇，按 0.2 秒一次）；一次范围打击 ×{}（靶在最小范围中心），每击使用当时已恢复的连击并消耗；频率采用用户给定操作条件，不受攻击速度缩短", hits[0].atten),
+            "slam" | "slamBullet" => {
+                let slam = hits[0];
+                let (jump, height) = if self.route == "slam" { ("原地跳到最高点", 5) } else { ("垂直子弹跳", 10) };
+                let kind = if slam.heavy { "重击震地" } else { "震地" };
+                let damage = match slam.damage_type.as_deref().unwrap_or("") {
+                    "DT_EXPLOSION" => "爆炸", "DT_IMPACT" => "冲击", "DT_PUNCTURE" => "穿刺",
+                    "DT_SLASH" => "切割", "DT_FIRE" => "火焰", "DT_FREEZE" => "冰冻",
+                    "DT_ELECTRICITY" => "电击", "DT_POISON" => "毒素", "DT_RADIATION" => "辐射",
+                    "DT_GAS" => "毒气", "DT_MAGNETIC" => "磁力", "DT_VIRAL" => "病毒",
+                    "DT_CORROSIVE" => "腐蚀", "DT_RADIANT" => "虚空", kind => kind,
+                };
+                let consumption = if slam.heavy { "，按攻击时的连击倍率并消耗连击" } else { "" };
+                format!("攻击路线：{kind}（{jump}，{height} 米，1.0 攻速下 {seconds:.2} 秒一轮）；一次范围打击 ×{}（{damage}，可暴击，靶在中心）{consumption}", slam.atten)
+            }
+            "glaive" => {
+                let attenuation = |kind| hits.iter().find(|hit| hit.kind == kind).map_or(0.0, |hit| hit.atten);
+                format!("攻击路线：蓄力重投 + 立即引爆（1.0 攻速下 {seconds:.2} 秒一轮）；投掷直击 ×{:.2} + 引爆 ×{:.2}（重击，按攻击时的连击倍率并消耗连击，不吃异况超量）；易爆弹跳 / 易爆速返的弹跳爆炸 ×{:.2} 按弹跳爆炸几率", attenuation("glaiveDirect"), attenuation("glaiveExplosion"), attenuation("glaiveBounce"))
+            }
+            route => format!("攻击路线：{route}"),
+        }
+    }
+
     pub fn resolve(data: &EngineData, req: &Request<'_>, stance: &Value) -> SimResult<Option<Self>> {
         if !req.melee || (req.mode != 0 && !req.scenario.heavy) { return Ok(None); }
         let state = |key| req.scenario.state.and_then(|s| s.get(key)).unwrap_or(&Value::Null);

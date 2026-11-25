@@ -54,7 +54,7 @@ pub(super) fn stats(data: &EngineData) -> Value {
     Value::Object(types)
 }
 
-fn template<'a>(templates: &'a Value, kind: &str) -> &'a Value {
+pub(crate) fn template<'a>(templates: &'a Value, kind: &str) -> &'a Value {
     let mut candidates = array(&templates["templates"]).iter().filter(|template| template["weaponType"] == kind);
     let first = candidates.next();
     let preferred = match kind {

@@ -1,7 +1,15 @@
 use super::{num, SimResult};
 use super::evaluate::{Evaluation, Evaluator, Metric};
 use super::request::Scope;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use indexmap::IndexMap;
+
+#[derive(Default)]
+pub(super) struct BeamMemo {
+    scores: RefCell<IndexMap<String, Option<Evaluation>>>,
+    pub hits: Cell<usize>,
+}
 
 pub(super) struct Search<'a> {
     pub scope: &'a Scope,
@@ -41,16 +49,88 @@ impl<'a> Search<'a> {
         if self.scope.event { Metric::Events } else { Metric::Panel(&self.scope.metric) }
     }
 
-    fn element(&self) -> Option<&str> { self.scope.element["damageType"].as_str() }
+    pub fn element(&self) -> Option<&str> { self.scope.element["damageType"].as_str() }
 
-    fn in_bounds(&self, eval: &Evaluator<'_>, selected: &[usize]) -> bool {
+    pub fn element_trial(&self, eval: &Evaluator<'_>, seed: &[usize], width: usize,
+        shortlist: usize) -> SimResult<Option<Evaluation>> {
+        let settings = Beam { width, shortlist, niche: 0, profile: "fast",
+            metric: Metric::Events, element: self.element() };
+        self.beam(eval, &self.required, seed, &settings)
+    }
+
+    pub fn element_baseline(&self, eval: &Evaluator<'_>) -> SimResult<Option<Evaluation>> {
+        let settings = Beam { width: 12, shortlist: 32, niche: 0, profile: "fast",
+            metric: Metric::Events, element: self.element() };
+        if let Some(found) = self.beam(eval, &self.required, &[], &settings)? { return Ok(Some(found)); }
+        match self.element_fallback(eval, &[], &settings) {
+            Err(message) if message.starts_with("no capacity-valid build satisfies damage type ") => Ok(None),
+            result => result.map(Some),
+        }
+    }
+
+    pub fn in_bounds(&self, eval: &Evaluator<'_>, selected: &[usize]) -> bool {
         let total = selected.len() + usize::from(eval.riven.is_some());
         self.scope.min.is_none_or(|n| total >= n)
             && self.scope.max.is_none_or(|n| total <= n)
             && eval.can_equip(selected)
     }
 
+    pub fn analysis_candidates(&self, eval: &Evaluator<'_>, metric: Metric<'_>, ultra: bool,
+        route_sensitive: bool, provisional: bool) -> SimResult<Vec<Evaluation>> {
+        let profile = if ultra || provisional { "fast" } else { self.scope.profile };
+        let (width, shortlist) = match profile {
+            "fast" => (12, 32), "standard" => (24, 40), _ => (24, 56)
+        };
+        let mut candidates = Vec::new();
+        if !ultra || route_sensitive {
+            let settings = Beam { width, shortlist, niche: 0, profile, metric, element: self.element() };
+            let best = self.beam(eval, &self.required, &[], &settings)?
+                .map_or_else(|| self.element_fallback(eval, &[], &settings), Ok)?;
+            candidates.push(best);
+            if provisional || self.element().is_some() { return Ok(candidates); }
+        }
+        let targets = [None, Some("DT_VIRAL"), Some("DT_CORROSIVE")];
+        for element in targets.into_iter().filter(|element| self.element().is_none_or(|target| Some(target) == *element)) {
+            let mut required = self.required.clone();
+            let parts = match element {
+                Some("DT_VIRAL") => ["DT_FREEZE", "DT_POISON"].as_slice(),
+                Some("DT_CORROSIVE") => ["DT_ELECTRICITY", "DT_POISON"].as_slice(),
+                _ => &[],
+            };
+            for part in parts {
+                if let Some(card) = self.element_seed(eval, &required, part, Preference::Proxy) { required.push(card); }
+            }
+            required.sort_unstable();
+            let settings = Beam { width: 4, shortlist: 24, niche: 0, profile, metric: Metric::Proxy, element };
+            if let Ok(Some(found)) = self.beam(eval, &required, &[], &settings) {
+                let evaluation = if ultra && eval.riven.is_some() {
+                    eval.fixed(&found.cards, Some(found.cards.len()), metric, None)?
+                } else {
+                    eval.evaluate(&found.cards, metric, None, eval.fixed_exilus)?
+                };
+                if let Some(value) = evaluation { candidates.push(value); }
+            }
+        }
+        if candidates.is_empty() && self.element().is_some() {
+            let settings = Beam { width: 4, shortlist: 24, niche: 0, profile, metric: Metric::Proxy, element: None };
+            if let Some(found) = self.beam(eval, &self.required, &[], &settings)? {
+                if let Some(value) = eval.fixed(&found.cards, found.riven_slot, metric, None)? { candidates.push(value); }
+            }
+        }
+        if ultra && eval.riven.is_some() {
+            for value in &mut candidates {
+                if let Some(rescored) = eval.evaluate(&value.cards, metric, None, eval.fixed_exilus)? { *value = rescored; }
+            }
+        }
+        if candidates.is_empty() { return Err("no capacity-valid build found".into()); }
+        Ok(candidates)
+    }
+
     pub fn run(&self, eval: &Evaluator<'_>, seed: &[usize], scout: bool) -> SimResult<Evaluation> {
+        self.run_metric(eval, seed, scout, self.metric())
+    }
+
+    pub fn run_metric(&self, eval: &Evaluator<'_>, seed: &[usize], scout: bool, metric: Metric<'_>) -> SimResult<Evaluation> {
         let profile = if scout || self.scope.profile == "ultra" { "fast" } else { self.scope.profile };
         let (width, shortlist) = match (scout, profile) {
             (true, _) => (4, 16),
@@ -58,14 +138,29 @@ impl<'a> Search<'a> {
             (_, "standard") => (24, 40),
             _ => (24, 56),
         };
-        let metric = self.metric();
         let settings = Beam { width, shortlist, niche: 2, profile, metric, element: self.element() };
         let first = self.beam(eval, &self.required, seed, &settings)?;
-        let mut best = match first {
+        let best = match first {
             Some(value) => value,
             None => self.element_fallback(eval, seed, &settings)?,
         };
         if !self.scope.event { return Ok(best); }
+        self.proxy_seeds_profile(eval, best, metric, profile)
+    }
+
+    pub fn primary_beam(&self, eval: &Evaluator<'_>, metric: Metric<'_>, niches: usize) -> SimResult<Evaluation> {
+        let profile = self.scope.profile;
+        let settings = Beam { width: 24, shortlist: if profile == "deep" { 56 } else { 40 },
+            niche: niches, profile, metric, element: self.element() };
+        self.beam(eval, &self.required, &[], &settings)?.ok_or_else(|| "no capacity-valid build found".into())
+    }
+
+    pub fn proxy_seeds(&self, eval: &Evaluator<'_>, best: Evaluation, metric: Metric<'_>) -> SimResult<Evaluation> {
+        let profile = if self.scope.profile == "ultra" { "fast" } else { self.scope.profile };
+        self.proxy_seeds_profile(eval, best, metric, profile)
+    }
+
+    fn proxy_seeds_profile(&self, eval: &Evaluator<'_>, mut best: Evaluation, metric: Metric<'_>, profile: &str) -> SimResult<Evaluation> {
         let targets = match self.element() {
             Some(element) => vec![Some(element)],
             None => vec![None, Some("DT_VIRAL"), Some("DT_CORROSIVE")],
@@ -90,6 +185,11 @@ impl<'a> Search<'a> {
             }
         }
         Ok(best)
+    }
+
+    pub fn fixed_seed(&self, eval: &Evaluator<'_>, seed: &[usize], metric: Metric<'_>) -> SimResult<Evaluation> {
+        let settings = Beam { width: 12, shortlist: 32, niche: 0, profile: "fast", metric, element: None };
+        self.beam(eval, &self.required, seed, &settings)?.ok_or_else(|| "no capacity-valid build found".into())
     }
 
     fn element_seed(&self, eval: &Evaluator<'_>, required: &[usize], part: &str, prefer: Preference) -> Option<usize> {
@@ -135,6 +235,31 @@ impl<'a> Search<'a> {
     }
 
     fn beam(&self, eval: &Evaluator<'_>, required: &[usize], seed: &[usize], settings: &Beam<'_>) -> SimResult<Option<Evaluation>> {
+        let kind = match settings.metric { Metric::Events => "killsPerMinute", Metric::WindowDps => "windowedDps",
+            Metric::Proxy => "statusSustainedDps", Metric::Panel(key) => key };
+        if let Some(memo) = eval.replay_options.memo {
+            let key = super::json!([kind, settings.profile, settings.width, settings.shortlist, settings.niche,
+                settings.element, required, seed, eval.riven.map(|riven| &riven.lines)]).to_string();
+            {
+                let mut cache = memo.scores.borrow_mut();
+                if let Some(value) = cache.shift_remove(&key) {
+                    cache.insert(key, value.clone());
+                    memo.hits.set(memo.hits.get() + 1);
+                    return Ok(value);
+                }
+            }
+            let value = self.beam_inner(eval, required, seed, settings)?;
+            let mut cache = memo.scores.borrow_mut();
+            cache.insert(key, value.clone());
+            if cache.len() > 256 { cache.shift_remove_index(0); }
+            Ok(value)
+        } else {
+            self.beam_inner(eval, required, seed, settings)
+        }
+    }
+
+    fn beam_inner(&self, eval: &Evaluator<'_>, required: &[usize], seed: &[usize], settings: &Beam<'_>) -> SimResult<Option<Evaluation>> {
+        let deadline = eval.replay_options.phase_deadline(self.scope.profile);
         let riven_count = usize::from(eval.riven.is_some());
         let limit = self.scope.max.unwrap_or(eval.req.slot_count).min(eval.req.slot_count);
         let base_fill = required.len() + riven_count;
@@ -151,11 +276,9 @@ impl<'a> Search<'a> {
             }
             Ok(true)
         };
-        let mut best = score(required)?.filter(|_| settings.element.is_none());
-        if settings.element.is_some() {
-            if let Some(value) = score(required)? {
-                if eligible(&value)? { best = Some(value); }
-            }
+        let mut best = score(required)?;
+        if let Some(value) = &best {
+            if !eligible(value)? { best = None; }
         }
         if slots == 0 {
             if best.as_ref().is_some_and(|v| !self.in_bounds(eval, &v.cards)) { return Ok(None); }
@@ -172,7 +295,7 @@ impl<'a> Search<'a> {
             }
             let mut selected = required.to_vec();
             selected.push(i);
-            if let Some(value) = score(&selected)? { ranked.push((i, value.score)); }
+            if let Some(value) = eval.rank(&selected, settings.metric)? { ranked.push((i, value.score)); }
         }
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         let mut families = HashSet::new();
@@ -212,9 +335,10 @@ impl<'a> Search<'a> {
 
         let mut beam = vec![Vec::new()];
         for _ in 0..slots {
+            if eval.replay_options.expired(deadline) { break; }
             let mut cache = HashMap::new();
             let mut scored = Vec::new();
-            for selection in &beam {
+            'layer: for selection in &beam {
                 for &card in &pool {
                     if selection.contains(&card) { continue; }
                     let mut candidate = selection.clone();
@@ -224,6 +348,7 @@ impl<'a> Search<'a> {
                     let value = match cache.get(&key) {
                         Some(value) => *value,
                         None => {
+                            if eval.replay_options.expired(deadline) { break 'layer; }
                             let cards: Vec<_> = required.iter().chain(&candidate).copied().collect();
                             let value = score(&cards)?.map(|v| v.score);
                             cache.insert(key, value);
@@ -275,9 +400,12 @@ impl<'a> Search<'a> {
         let rounds = match settings.profile { "standard" => 3, "deep" => 12, _ => 0 };
         let mut seen = HashSet::from([best.cards.clone()]);
         for _ in 0..rounds {
+            if eval.replay_options.expired(deadline) { break; }
             let base = best.cards.clone();
             let optional: Vec<_> = base.iter().enumerate().filter(|(_, i)| !required.contains(i)).collect();
             let mut improved = false;
+            let mut chosen_swap = None;
+            let mut last_swap = None;
             for &(slot, _) in &optional {
                 for &card in &pool {
                     if base.contains(&card) { continue; }
@@ -285,8 +413,19 @@ impl<'a> Search<'a> {
                     cards[slot] = card;
                     if !self.in_bounds(eval, &cards) || !seen.insert(cards.clone()) { continue; }
                     if let Some(value) = score(&cards)? {
-                        if value.score > best.score + 1e-9 && eligible(&value)? { best = value; improved = true; }
+                        if value.score > best.score + 1e-9 && eligible(&value)? {
+                            best = value;
+                            improved = true;
+                            chosen_swap = Some(cards.clone());
+                        }
+                        last_swap = Some(cards);
                     }
+                }
+            }
+            if eval.replay_options.evaluations.is_some() {
+                if let Some(cards) = chosen_swap.filter(|cards| Some(cards) != last_swap.as_ref()) {
+                    // A committed swap carries its own evaluated order after the rest of the round has run.
+                    if let Some(value) = score(&cards)? { best = value; }
                 }
             }
             if best.cards.len() + riven_count < limit {
@@ -339,6 +478,9 @@ impl<'a> Search<'a> {
         if self.scope.min.is_none() && self.scope.max.is_none() {
             for &card in &pool {
                 if best.cards.len() + riven_count >= limit { break; }
+                if best.cards.iter().any(|&index| eval.cards[index].family == eval.cards[card].family) {
+                    continue;
+                }
                 let mut cards = best.cards.clone();
                 cards.push(card);
                 if let Some(value) = score(&cards)? {
@@ -349,8 +491,12 @@ impl<'a> Search<'a> {
         Ok(self.in_bounds(eval, &best.cards).then_some(best))
     }
 
-    pub fn refine(&self, eval: &Evaluator<'_>, mut best: Evaluation) -> SimResult<Evaluation> {
+    pub fn refine(&self, eval: &Evaluator<'_>, best: Evaluation) -> SimResult<Evaluation> {
         if !self.scope.event { return Ok(best); }
+        self.refine_scored(eval, best, self.metric())
+    }
+
+    pub fn refine_scored(&self, eval: &Evaluator<'_>, mut best: Evaluation, metric: Metric<'_>) -> SimResult<Evaluation> {
         let fast = matches!(self.scope.profile, "fast" | "ultra");
         let rounds = if fast { 1 } else if self.scope.profile == "deep" { 4 } else { 2 };
         let mut seen = HashSet::from([best.cards.clone()]);
@@ -360,7 +506,7 @@ impl<'a> Search<'a> {
             let mut alternatives = vec![Vec::new(); base.len()];
             let mut visit = |cards: Vec<usize>| -> SimResult<Option<f64>> {
                 if !self.in_bounds(eval, &cards) || !seen.insert(cards.clone()) { return Ok(None); }
-                let value = eval.evaluate(&cards, self.metric(), self.element(), eval.fixed_exilus)?;
+                let value = eval.evaluate(&cards, metric, self.element(), eval.fixed_exilus)?;
                 Ok(value.map(|value| {
                     let score = value.score;
                     if score > best.score + 1e-9 { best = value; }
@@ -411,7 +557,7 @@ impl<'a> Search<'a> {
                 pairs.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
                 for (cards, _) in pairs.into_iter().take(256) {
                     if seen.insert(cards.clone()) {
-                        if let Some(value) = eval.evaluate(&cards, self.metric(), self.element(), eval.fixed_exilus)? {
+                        if let Some(value) = eval.evaluate(&cards, metric, self.element(), eval.fixed_exilus)? {
                             if value.score > best.score + 1e-9 { best = value; }
                         }
                     }

@@ -9,7 +9,7 @@ fn distinct(notes: Vec<String>) -> Vec<String> {
 
 pub(super) fn payload(eval: &Evaluator<'_>, search: &Search<'_>, best: &Evaluation, special: Option<&Card<'_>>,
     exilus: Value, report: Value, capacity_limit: i64, rejected: usize, weapon_meta: &Value,
-    selected_target: Option<&Value>, catalog: &super::SimCatalog) -> SimResult<Value> {
+    selected_target: Option<&Value>, catalog: &super::SimCatalog, analysis: bool) -> SimResult<Value> {
     let req = eval.req;
     let scenario = &req.scenario;
     let stance_damage = eval.stance["dpsMultiplier"].as_f64().unwrap_or(1.0);
@@ -72,7 +72,8 @@ pub(super) fn payload(eval: &Evaluator<'_>, search: &Search<'_>, best: &Evaluati
     }).collect();
     let forma = forma::summary(eval, best, &exilus);
     let heavy_metrics = metrics(&heavy.wire, &heavy.heavy);
-    let mut build = metrics(&panel.wire, &panel.heavy);
+    let mut build = if analysis { projectiles::metrics(&normal.wire, &normal.heavy, &projectile_preview) }
+        else { metrics(&panel.wire, &panel.heavy) };
     build.as_object_mut().unwrap().extend(json!({
         "mods":mods, "includesRiven":eval.riven.is_some(), "victimStatusCount":panel.count,
         "heavyDamage":heavy_metrics["heavyDamage"], "heavyAttackDps":heavy_metrics["heavyDamage"],
@@ -251,16 +252,19 @@ fn notes(eval: &Evaluator<'_>, search: &Search<'_>, capacity: i64, rejected: usi
 }
 
 // Python's general format uses six significant digits and drops trailing zeros.
-fn general_seconds(value: f64) -> String {
-    let rounded = format!("{value:.5e}");
+fn general_seconds(value: f64) -> String { general_number(value, 6) }
+
+pub(super) fn general_number(value: f64, significant: usize) -> String {
+    let decimals = significant - 1;
+    let rounded = format!("{value:.decimals$e}");
     let (mantissa, exponent) = rounded.split_once('e').expect("scientific notation has an exponent");
     let exponent: i32 = exponent.parse().expect("valid exponent");
     let trim = |mut output: String| {
         if output.contains('.') { output.truncate(output.trim_end_matches('0').trim_end_matches('.').len()); }
         output
     };
-    if (-4..6).contains(&exponent) {
-        trim(format!("{value:.places$}", places = (5 - exponent) as usize))
+    if (-4..significant as i32).contains(&exponent) {
+        trim(format!("{value:.places$}", places = (decimals as i32 - exponent) as usize))
     } else {
         format!("{}e{exponent:+03}", trim(mantissa.to_owned()))
     }
